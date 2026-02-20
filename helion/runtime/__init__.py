@@ -128,6 +128,18 @@ def default_launcher(
     )
 
 
+def default_nki_launcher(
+    nki_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    """Stub launcher for NKI kernels (Trainium). Raise until implemented."""
+    raise NotImplementedError(
+        "default_nki_launcher is not implemented; NKI kernel execution requires Trainium runtime."
+    )
+
+
 _PALLAS_ALIGNMENT = 128
 
 

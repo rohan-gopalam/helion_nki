@@ -630,6 +630,353 @@ class TileIRBackend(TritonBackend):
         }
 
 
+class NKIOpOverrides:
+    """NKI op overrides for Inductor codegen (elementwise ops).
+    When _codegen_state is set, emits nisa.tensor_tensor(dst, data1, data2, op);
+    otherwise falls back to (a + b) etc. and relies on nl/language support.
+    """
+
+    @staticmethod
+    def _nki_tensor_tensor(a: object, b: object, op: str, prefix: str) -> str:
+        from .ast_extension import statement_from_string
+
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            return ""
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return ""
+        result_var = state.device_function.new_var(prefix, dce=True)
+        # Allocate dst SBUF tile (same shape as inputs); NKI has no implicit allocation.
+        grid = state.codegen.current_grid_state
+        if grid is not None and grid.block_ids:
+            shape_parts = [
+                str(int(env.block_sizes[bid].from_config_assert(state.config)))
+                for bid in grid.block_ids
+            ]
+            shape_str = ", ".join(shape_parts)
+        else:
+            shape_str = "128"
+        state.add_statement(
+            statement_from_string(
+                f"{result_var} = nl.ndarray([{shape_str}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            f"nisa.tensor_tensor(dst={result_var}, data1={a}, data2={b}, op={op})"
+        )
+        return result_var
+
+    def add(self, a: object, b: object) -> str:
+        out = self._nki_tensor_tensor(a, b, "nl.add", "nki_add")
+        return out
+
+    def sub(self, a: object, b: object) -> str:
+        out = self._nki_tensor_tensor(a, b, "nl.sub", "nki_sub")
+        return out
+
+    def mul(self, a: object, b: object) -> str:
+        out = self._nki_tensor_tensor(a, b, "nl.mul", "nki_mul")
+        return out
+
+
+def _validate_nki_tensor_shape(shape: tuple, name: str, env: object) -> None:
+    """Check partition dim (0) % 128 and free dim (1) % 512. Raise clear error if not."""
+    if not shape:
+        return
+    # Partition dimension (axis 0) must be a multiple of 128
+    s0 = shape[0]
+    try:
+        v0 = env.size_hint(s0) if isinstance(s0, (int, torch.SymInt)) else int(env.shape_env.size_hint(s0))
+    except Exception:
+        raise exc.BackendUnsupported(
+            "nki",
+            f"Tensor {name!r}: partition dimension (axis 0) must be a multiple of 128; "
+            "could not resolve shape to an integer.",
+        )
+    if v0 % 128 != 0:
+        raise exc.BackendUnsupported(
+            "nki",
+            f"Tensor {name!r}: partition dimension (axis 0) has size {v0}, "
+            "which is not a multiple of 128. NKI requires exact-multiple tile shapes.",
+        )
+    # Free dimension (axis 1, if present) must be a multiple of 512
+    if len(shape) < 2:
+        return
+    s1 = shape[1]
+    try:
+        v1 = env.size_hint(s1) if isinstance(s1, (int, torch.SymInt)) else int(env.shape_env.size_hint(s1))
+    except Exception:
+        raise exc.BackendUnsupported(
+            "nki",
+            f"Tensor {name!r}: free dimension (axis 1) must be a multiple of 512; "
+            "could not resolve shape to an integer.",
+        )
+    if v1 % 512 != 0:
+        raise exc.BackendUnsupported(
+            "nki",
+            f"Tensor {name!r}: free dimension (axis 1) has size {v1}, "
+            "which is not a multiple of 512. NKI requires exact-multiple tile shapes.",
+        )
+
+
+class NKIBackend(Backend):
+    """NKI (Neural Kernel Interface) code generation backend for Trainium."""
+
+    def validate_nki_tensor_shapes(self, graph: torch.fx.Graph) -> None:
+        """Run before NKI codegen: require partition dim % 128, free dim % 512."""
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        for node in graph.nodes:
+            if node.op == "placeholder" and "val" in node.meta:
+                val = node.meta["val"]
+                if isinstance(val, torch.Tensor):
+                    _validate_nki_tensor_shape(
+                        tuple(val.shape), node.name or "input", env
+                    )
+        # Output: graph.output(result) — result is the single arg to the output node
+        for node in graph.nodes:
+            if node.op == "output":
+                out_val = node.args[0]
+                if isinstance(out_val, torch.fx.Node) and "val" in out_val.meta:
+                    val = out_val.meta["val"]
+                    if isinstance(val, torch.Tensor):
+                        _validate_nki_tensor_shape(
+                            tuple(val.shape), "output", env
+                        )
+                    elif isinstance(val, (list, tuple)):
+                        for i, t in enumerate(val):
+                            if isinstance(t, torch.Tensor):
+                                _validate_nki_tensor_shape(
+                                    tuple(t.shape), f"output[{i}]", env
+                                )
+                break
+
+    def create_loop_strategy(
+        self, fn: DeviceFunction, block_ids: list[int], config: Config
+    ) -> TileStrategy:
+        """NKI uses slice-based tiles; always use NDTileStrategy so pid/offset are emitted."""
+        from .compile_environment import CompileEnvironment
+        from .tile_strategy import NDTileStrategy
+
+        env = CompileEnvironment.current()
+        block_size_infos = [env.block_sizes[i] for i in block_ids]
+        loop_order = env.config_spec.loop_orders.config_get(
+            config.loop_orders, block_ids[0]
+        ) or [*range(len(block_ids))]
+        l2_grouping = env.config_spec.l2_groupings.config_get(
+            config.l2_groupings, block_ids[0], 1
+        )
+        return NDTileStrategy(
+            fn,
+            block_ids,
+            block_size=[bs.from_config_assert(config) for bs in block_size_infos],
+            loop_order=loop_order,
+            l2_grouping=l2_grouping,
+        )
+
+    @property
+    def name(self) -> str:
+        return "nki"
+
+    @property
+    def codegen_name(self) -> str:
+        return "nki"
+
+    def dtype_str(self, dtype: torch.dtype) -> str:
+        _DTYPE_MAP = {
+            torch.float16: "nl.float16",
+            torch.bfloat16: "nl.bfloat16",
+            torch.float32: "nl.float32",
+            torch.int8: "nl.int8",
+            torch.int16: "nl.int16",
+            torch.int32: "nl.int32",
+            torch.int64: "nl.int64",
+            torch.uint8: "nl.uint8",
+            torch.bool: "nl.bool_",
+        }
+        if dtype not in _DTYPE_MAP:
+            raise exc.BackendUnsupported(self.name, f"dtype {dtype}")
+        return _DTYPE_MAP[dtype]
+
+    def acc_type(self, dtype: torch.dtype) -> str:
+        if dtype in (torch.float16, torch.bfloat16):
+            return "nl.float32"
+        return self.dtype_str(dtype)
+
+    @property
+    def function_decorator(self) -> str:
+        return "nki.jit"
+
+    @property
+    def constexpr_type(self) -> str:
+        return "int"
+
+    @property
+    def default_launcher_name(self) -> str:
+        return "_default_nki_launcher"
+
+    @property
+    def library_imports(self) -> dict[str, str]:
+        return {
+            "math": "import math",
+            "torch": "import torch",
+            "helion": "import helion",
+            "hl": "import helion.language as hl",
+            "nki": "import nki",
+            "nl": "import nki.language as nl",
+            "nisa": "import nki.isa as nisa",
+            "_default_nki_launcher": "from helion.runtime import default_nki_launcher as _default_nki_launcher",
+        }
+
+    def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
+        if index_dtype != "nl.int32":
+            return f"nl.program_id({dim}).to({index_dtype})"
+        return f"nl.program_id({dim})"
+
+    def arange_expr(
+        self,
+        offsets_var: str,
+        lid: str,
+        block_size_var: str,
+        dtype: str,
+        *,
+        axis: int = 0,
+    ) -> str:
+        # NKI Beta 2: arange removed; use slicing or access patterns (.ap()).
+        raise exc.BackendUnsupported(
+            self.name,
+            "arange is removed in NKI Beta 2; use Python slicing or access patterns",
+        )
+
+    def grid_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        if block_size_var == "1":
+            return f"{offset_var} + nl.zeros([1], {dtype})"
+        # Slice-based tile model: index is the scalar tile start offset.
+        return offset_var
+
+    def loop_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
+    ) -> str:
+        if block_size_var == "1":
+            return f"{offset_var} + nl.zeros([1], {dtype})"
+        # Slice-based tile model: index is the scalar tile start offset.
+        return offset_var
+
+    def cast_expr(self, expr_str: str, dtype_str: str) -> str:
+        return f"({expr_str}).to({dtype_str})"
+
+    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
+        return expr_from_string(
+            self.cast_expr("{x}", self.dtype_str(target_dtype)),
+            x=x,
+        )
+
+    def _nki_codegen_state(self) -> object | None:
+        """Return current codegen state when set (Option B, NKI statement-based codegen)."""
+        if self.name != "nki":
+            return None
+        from .compile_environment import CompileEnvironment
+
+        return getattr(CompileEnvironment.current(), "_codegen_state", None)
+
+    def full_expr(
+        self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
+    ) -> str:
+        # No nisa.* API for full is documented in NKI; add statement-based path when available.
+        raise exc.BackendUnsupported(
+            self.name, "nl.full does not exist in nki.*"
+        )
+
+    def reshape_expr(self, expr: str, shape: str) -> str:
+        return f"({expr}).reshape({shape})"
+
+    def scalar_load_expr(self, tensor_name: str) -> str:
+        raise exc.BackendUnsupported(
+            self.name,
+            "scalar tensor loads (nl.load removed; use dma_copy codegen path)",
+        )
+
+    def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
+        raise exc.BackendUnsupported(
+            self.name,
+            "tile boundary masking should not occur with exact-multiple shapes — "
+            "if you need causal masking that is not yet implemented.",
+        )
+
+    def broadcast_to_expr(self, expr: str, shape: str) -> str:
+        # No nisa.* API for broadcast_to is documented in NKI; add statement-based path when available.
+        raise exc.BackendUnsupported(
+            self.name, "nl.broadcast_to does not exist in nki.*"
+        )
+
+    def minimum_expr(self, a: str, b: str) -> str:
+        state = self._nki_codegen_state()
+        if state is not None:
+            # nisa.tensor_tensor(dst, data1, data2, op) is used in this codebase; op name per NKI docs.
+            result_var = state.device_function.new_var("nki_minimum", dce=True)
+            state.add_statement(
+                f"nisa.tensor_tensor(dst={result_var}, data1={a}, data2={b}, op=nl.minimum)"
+            )
+            return result_var
+        raise exc.BackendUnsupported(
+            self.name, "nl.minimum does not exist in nki.*"
+        )
+
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+    ) -> str:
+        state = self._nki_codegen_state()
+        if state is not None:
+            _NKI_REDUCTION_OPS = {
+                "sum": "nl.add",
+                "max": "nl.max",
+                "min": "nl.min",
+                "prod": "nl.mul",
+            }
+            op = _NKI_REDUCTION_OPS.get(reduction_type)
+            if op is None:
+                raise exc.BackendUnsupported(
+                    self.name, f"reduction {reduction_type!r} not mapped to NKI op"
+                )
+            result_var = state.device_function.new_var("nki_reduce", dce=True)
+            # Allocate scalar output (partial reduction may need shape from caller)
+            state.add_statement(
+                f"{result_var} = nl.zeros(())  # TODO: use correct shape for partial reduction"
+            )
+            state.add_statement(
+                f"nisa.tensor_reduce(dst={result_var}, src={input_name}, op={op}, axis={dim})"
+            )
+            return result_var
+        raise exc.BackendUnsupported(
+            self.name,
+            f"reduction {reduction_type!r} (use nisa.tensor_reduce, requires dst)",
+        )
+
+    def reduction_index_expr(
+        self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
+    ) -> str:
+        raise exc.BackendUnsupported(
+            self.name, "nl.arange removed in nki.*"
+        )
+
+    def reduction_index_zero_expr(self, dtype: str) -> str:
+        return f"nl.zeros([0], {dtype})"
+
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        return NKIOpOverrides()
+
+
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")
 _TORCH_TO_JAX_DTYPE: dict[str, str] = {
     "torch.float16": "jnp.float16",

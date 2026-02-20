@@ -8,6 +8,7 @@ import threading
 import types
 import typing
 from typing import TYPE_CHECKING
+from typing import Iterator
 from typing import Protocol
 
 import sympy
@@ -28,6 +29,7 @@ from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import Backend
 from .backend import CuteBackend
+from .backend import NKIBackend
 from .backend import PallasBackend
 from .backend import TileIRBackend
 from .backend import TritonBackend
@@ -96,7 +98,10 @@ class CompileEnvironment:
     Global state for the duration of a compilation.
     There is a 1:1 mapping between this and a BoundKernel,
     and a single CompileEnvironment will be used for multiple Configs.
-    No config or codegen specific state should be stored here.
+    No config or codegen specific state should be stored here, except
+    _codegen_state (Option B in NKI_STATEMENT_BASED_CODEGEN.md): set during
+    codegen so statement-based backends (e.g. NKI) can emit statements and
+    return the result variable name.
     """
 
     def __init__(
@@ -120,6 +125,7 @@ class CompileEnvironment:
             "pallas": PallasBackend,
             "cute": CuteBackend,
             "tileir": TileIRBackend,
+            "nki": NKIBackend,
         }
         self._backend = backend_factory[settings.backend]()
         if settings.backend in ("pallas", "cute"):
@@ -154,6 +160,18 @@ class CompileEnvironment:
             for pid_type in ("flat", "xyz"):
                 self.config_spec.disallow_pid_type(pid_type)
         self.has_barrier: bool = False
+        # Set during codegen so backends (e.g. NKI) can emit statements; see NKI_STATEMENT_BASED_CODEGEN.md Option B.
+        self._codegen_state: object | None = None
+
+    @contextlib.contextmanager
+    def set_codegen_state(self, state: object | None) -> Iterator[None]:
+        """Temporarily set _codegen_state so backends can emit statements (e.g. NKI nisa.*)."""
+        old = self._codegen_state
+        self._codegen_state = state
+        try:
+            yield
+        finally:
+            self._codegen_state = old
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""

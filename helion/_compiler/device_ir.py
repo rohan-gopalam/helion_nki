@@ -271,7 +271,8 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[-1]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
-        with state.codegen.add_device_loop(
+        env = CompileEnvironment.current()
+        with env.set_codegen_state(state), state.codegen.add_device_loop(
             state.device_function.tile_strategy.codegen_device_loop(
                 state, self.block_ids
             )
@@ -301,7 +302,8 @@ class IfGraphInfo(NodeArgsGraphInfo):
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
         state.add_statement(create(ast.If, test=test, body=(body := []), orelse=[]))
-        with state.codegen.set_statements(body):
+        env = CompileEnvironment.current()
+        with env.set_codegen_state(state), state.codegen.set_statements(body):
             return codegen_call_with_graph(state.codegen, self.graph, args)
 
 
@@ -337,11 +339,14 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[2]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
+        env = CompileEnvironment.current()
 
         def emit_condition(
             target_statements: list[ast.AST],
         ) -> ast.expr:
-            with state.codegen.set_statements(target_statements):
+            with env.set_codegen_state(state), state.codegen.set_statements(
+                target_statements
+            ):
                 cond_outputs = codegen_call_with_graph(
                     state.codegen,
                     cond_info.graph,
@@ -379,7 +384,9 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
         )
 
         body_statements: list[ast.AST] = []
-        with state.codegen.set_statements(body_statements):
+        with env.set_codegen_state(state), state.codegen.set_statements(
+            body_statements
+        ):
             outputs = codegen_call_with_graph(state.codegen, self.graph, args)
         loop_condition_update: list[ast.AST] = []
         cond_expr_loop = emit_condition(loop_condition_update)
@@ -1598,7 +1605,9 @@ class HelperFunctionGraphInfo(NodeArgsGraphInfo):
     def codegen(self, state: CodegenState) -> list[object]:
         from .helper_function import codegen_helper_function_graph_info
 
-        return codegen_helper_function_graph_info(self, state)
+        env = CompileEnvironment.current()
+        with env.set_codegen_state(state):
+            return codegen_helper_function_graph_info(self, state)
 
 
 def validate_host_tensor_usage(graph: torch.fx.Graph) -> None:

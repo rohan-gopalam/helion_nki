@@ -336,9 +336,20 @@ class TileStrategy:
         return block_id_to_info
 
     def _setup_block_size_constexpr(
-        self, state: CodegenState, block_size_var: str, block_size: SymIntLike
+        self,
+        state: CodegenState,
+        block_size_var: str,
+        block_size: SymIntLike,
+        block_idx: int | None = None,
     ) -> None:
-        """Helper to setup constexpr block size variable on host."""
+        """Helper to setup constexpr block size variable on host.
+        For NKI, block sizes are inlined as literals (no kernel params); block_idx required.
+        """
+        env = CompileEnvironment.current()
+        if env.backend.name == "nki" and block_idx is not None:
+            literal = env.block_sizes[block_idx].from_config_assert(state.config)
+            state.device_function.block_size_var_cache[(block_idx,)] = str(int(literal))
+            return
         state.device_function.constexpr_arg_with_host_def(block_size_var, block_size)
 
 
@@ -858,9 +869,17 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 )
 
             if block_size != 1:
+                # NKI: set cache to literal first so device and launcher grid use literal
+                block_size_var_for_constexpr = self.block_size_var(block_idx)
+                assert block_size_var_for_constexpr is not None
+                self._setup_block_size_constexpr(
+                    state,
+                    block_size_var_for_constexpr,
+                    block_size,
+                    block_idx=block_idx,
+                )
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
                 )
@@ -953,7 +972,9 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
+                self._setup_block_size_constexpr(
+                    state, block_size_var, block_size, block_idx=block_idx
+                )
             else:
                 block_size_var = "1"
             end_var_name = state.codegen.lift(
@@ -1207,7 +1228,9 @@ class CuteNDTileStrategy(NDTileStrategy):
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
+                self._setup_block_size_constexpr(
+                    state, block_size_var, block_size, block_idx=block_idx
+                )
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
                 )
@@ -1305,7 +1328,9 @@ class CuteNDTileStrategy(NDTileStrategy):
             if block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
+                self._setup_block_size_constexpr(
+                    state, block_size_var, block_size, block_idx=block_idx
+                )
             else:
                 block_size_var = "1"
             end_var_name = state.codegen.lift(

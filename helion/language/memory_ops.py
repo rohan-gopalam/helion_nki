@@ -506,6 +506,113 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 
+@_decorators.codegen(load, "nki")
+def _(state: CodegenState) -> ast.AST:
+    from .._compiler.ast_extension import statement_from_string
+
+    tensor = state.proxy_arg(0)
+    subscript = state.proxy_arg(1)
+    assert isinstance(tensor, torch.Tensor)
+    assert isinstance(subscript, (list, tuple))
+    name = state.device_function.tensor_arg(tensor).name
+    device_fn = state.device_function
+    device_fn.device_load_index += 1
+    device_fn.device_memory_op_index += 1
+    env = CompileEnvironment.current()
+    backend = env.backend
+    sbuf_name = f"_nki_sbuf_{device_fn.device_load_index}"
+    output_shape = SubscriptIndexing.compute_shape(tensor, [*subscript], state)
+
+    def _shape_dim_str(s: int | torch.SymInt) -> str:
+        if isinstance(s, int):
+            return str(s)
+        return state.sympy_expr(s._sympy_())
+
+    shape_str = ", ".join(_shape_dim_str(s) for s in output_shape)
+    dtype_str = backend.dtype_str(tensor.dtype)
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{sbuf_name} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+        )
+    )
+    # Slice-based tile model: one slice per dimension from offset vars and block sizes.
+    # Use active grid block_id when get_block_id(size) is None (e.g. concrete shape 1024).
+    def _block_id_for_dim(dim: int):
+        bid = env.get_block_id(tensor.size(dim))
+        if bid is not None:
+            return bid
+        grid = state.codegen.current_grid_state
+        if grid is not None and dim < len(grid.block_ids):
+            return grid.block_ids[dim]
+        return None
+
+    slice_parts: list[str] = []
+    for i in range(tensor.dim()):
+        size_i = tensor.size(i)
+        block_id = _block_id_for_dim(i)
+        if block_id is not None:
+            offset_var = state.codegen.offset_var(block_id)
+            block_size = env.block_sizes[block_id].from_config_assert(state.config)
+            slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
+        else:
+            size_str = (
+                state.sympy_expr(size_i._sympy_())
+                if isinstance(size_i, torch.SymInt)
+                else str(size_i)
+            )
+            slice_parts.append(f"0 : {size_str}")
+    slice_str = ", ".join(slice_parts)
+    state.codegen.add_statement(
+        statement_from_string(f"nisa.dma_copy(dst={sbuf_name}, src={name}[{slice_str}])")
+    )
+    return expr_from_string(sbuf_name)
+
+
+@_decorators.codegen(store, "nki")
+def _(state: CodegenState) -> None:
+    from .._compiler.ast_extension import statement_from_string
+
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    name = state.device_function.tensor_arg(tensor).name
+    value = state.ast_arg(2)
+    device_fn = state.device_function
+    device_fn.device_store_index += 1
+    device_fn.device_memory_op_index += 1
+    env = CompileEnvironment.current()
+    # Slice-based tile model: same slice notation as load; use grid block_id when needed.
+    def _block_id_for_dim(dim: int):
+        bid = env.get_block_id(tensor.size(dim))
+        if bid is not None:
+            return bid
+        grid = state.codegen.current_grid_state
+        if grid is not None and dim < len(grid.block_ids):
+            return grid.block_ids[dim]
+        return None
+
+    slice_parts: list[str] = []
+    for i in range(tensor.dim()):
+        size_i = tensor.size(i)
+        block_id = _block_id_for_dim(i)
+        if block_id is not None:
+            offset_var = state.codegen.offset_var(block_id)
+            block_size = env.block_sizes[block_id].from_config_assert(state.config)
+            slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
+        else:
+            size_str = (
+                state.sympy_expr(size_i._sympy_())
+                if isinstance(size_i, torch.SymInt)
+                else str(size_i)
+            )
+            slice_parts.append(f"0 : {size_str}")
+    slice_str = ", ".join(slice_parts)
+    state.codegen.add_statement(
+        statement_from_string(
+            f"nisa.dma_copy(dst={name}[{slice_str}], src={{value}})", value=value
+        )
+    )
+
+
 @_decorators.get_masked_value(load)
 def _(node: torch.fx.Node) -> int:
     return 0  # loads are always masked to 0

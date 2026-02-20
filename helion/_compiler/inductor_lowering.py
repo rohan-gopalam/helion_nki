@@ -693,14 +693,16 @@ class ReductionLowering(InductorLowering):
             # TODO(jansel): support multiple reduction dims
             raise exc.MultipleReductionDims
 
-        result_ast = strategy.codegen_reduction(
-            state,
-            output_name,
-            reduction.reduction_type,
-            dims[0],
-            repr_input,
-            node.meta["val"],
-        )
+        env = CompileEnvironment.current()
+        with env.set_codegen_state(state):
+            result_ast = strategy.codegen_reduction(
+                state,
+                output_name,
+                reduction.reduction_type,
+                dims[0],
+                repr_input,
+                node.meta["val"],
+            )
         # For looped reductions, the actual value is assigned after the loop in
         # the strategy's outer_suffix. Casting at this point would reference the
         # result before it is defined. The strategy is responsible for casting

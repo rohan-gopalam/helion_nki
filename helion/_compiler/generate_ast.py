@@ -325,16 +325,22 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     self.host_function.device_ir.root_ids[node._root_id],
                 )
                 grid_state = self.current_grid_state
-                if (
-                    isinstance(grid_state, DeviceGridState)
-                    and grid_state.has_lane_loops()
-                ):
-                    wrapped_body: list[ast.AST] = []
-                    with self.set_statements(wrapped_body):
+                env = CompileEnvironment.current()
+                if env.backend.name == "nki":
+                    env.backend.validate_nki_tensor_shapes(root)
+                with env.set_codegen_state(state):
+                    if (
+                        isinstance(grid_state, DeviceGridState)
+                        and grid_state.has_lane_loops()
+                    ):
+                        wrapped_body: list[ast.AST] = []
+                        with self.set_statements(wrapped_body):
+                            codegen_call_with_graph(self, root, [])
+                        self.statements_stack[-1].extend(
+                            grid_state.wrap_body(wrapped_body)
+                        )
+                    else:
                         codegen_call_with_graph(self, root, [])
-                    self.statements_stack[-1].extend(grid_state.wrap_body(wrapped_body))
-                else:
-                    codegen_call_with_graph(self, root, [])
 
                 # Flush deferred RDIM definitions now that block sizes are determined
                 # This ensures block size and rdim vars are defined in the correct order

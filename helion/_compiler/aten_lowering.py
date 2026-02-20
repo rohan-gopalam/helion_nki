@@ -576,6 +576,97 @@ def codegen_baddbmm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
     return _pallas_dot(ctx, node, True)
 
 
+def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
+    """Generate nisa.nc_matmul for NKI backend.
+
+    Assumptions:
+    - LHS (stationary) is pre-transposed by the caller: shape [K, M], K is partition dim
+    - RHS (moving) shape [K, N], K is partition dim
+    - Output goes to PSUM as float32, shape [M, N]
+    - with_acc=True: adds bias (from SBUF) to the PSUM result
+    """
+    env = CompileEnvironment.current()
+    state = getattr(env, "_codegen_state", None)
+    if state is None:
+        raise exc.BackendUnsupported(
+            "nki", "nc_matmul requires active codegen state"
+        )
+
+    if with_acc:
+        acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert isinstance(acc, ast.AST)
+        acc_node = node.args[0]
+        lhs_node = node.args[1]
+        rhs_node = node.args[2]
+    else:
+        lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        lhs_node = node.args[0]
+        rhs_node = node.args[1]
+        acc = None
+
+    assert isinstance(lhs, ast.AST)
+    assert isinstance(rhs, ast.AST)
+
+    lhs_shape = list(lhs_node.meta["val"].size())  # [K, M] — pre-transposed
+    rhs_shape = list(rhs_node.meta["val"].size())  # [K, N]
+    M = lhs_shape[-1]  # free dim of stationary
+    N = rhs_shape[-1]  # free dim of moving
+
+    def _shape_val_str(s: int | torch.SymInt) -> str:
+        if isinstance(s, int):
+            return str(s)
+        return state.sympy_expr(s._sympy_())
+
+    M_str = _shape_val_str(M)
+    N_str = _shape_val_str(N)
+
+    # Allocate PSUM tile for matmul result — always float32, shape [M, N]
+    mm_result = state.device_function.new_var("_nki_mm_psum")
+    state.add_statement(
+        statement_from_string(
+            f"{mm_result} = nl.ndarray([{M_str}, {N_str}], nl.float32, buffer=nl.psum)"
+        )
+    )
+    # Emit nc_matmul — result lands in PSUM
+    state.add_statement(
+        statement_from_string(
+            f"nisa.nc_matmul(dst={mm_result}, stationary={{lhs}}, moving={{rhs}})",
+            lhs=lhs,
+            rhs=rhs,
+        )
+    )
+
+    if not with_acc:
+        return expr_from_string(mm_result)
+
+    # with_acc: add bias (SBUF) to PSUM result → write to SBUF
+    # nisa.tensor_tensor can read PSUM + SBUF and write SBUF
+    assert acc is not None
+    out_result = state.device_function.new_var("_nki_addmm_result")
+    state.add_statement(
+        statement_from_string(
+            f"{out_result} = nl.ndarray([{M_str}, {N_str}], nl.float32, buffer=nl.sbuf)"
+        )
+    )
+    state.add_statement(
+        statement_from_string(
+            f"nisa.tensor_tensor(dst={out_result}, data1={mm_result}, data2={{acc}}, op=nl.add)",
+            acc=acc,
+        )
+    )
+    return expr_from_string(out_result)
+
+
+@mm_lowering.register_codegen("nki")
+def codegen_mm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, False)
+
+
+@addmm_lowering.register_codegen("nki")
+def codegen_addmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, True)
+
+
 iota_lowering = register_lowering(torch.ops.prims.iota.default)
 
 

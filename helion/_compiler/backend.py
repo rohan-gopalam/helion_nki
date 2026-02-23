@@ -674,11 +674,11 @@ class NKIOpOverrides:
         return out
 
     def sub(self, a: object, b: object) -> str:
-        out = self._nki_tensor_tensor(a, b, "nl.sub", "nki_sub")
+        out = self._nki_tensor_tensor(a, b, "nl.subtract", "nki_sub")
         return out
 
     def mul(self, a: object, b: object) -> str:
-        out = self._nki_tensor_tensor(a, b, "nl.mul", "nki_mul")
+        out = self._nki_tensor_tensor(a, b, "nl.multiply", "nki_mul")
         return out
 
 
@@ -786,6 +786,17 @@ class NKIBackend(Backend):
     def codegen_name(self) -> str:
         return "nki"
 
+    def range_str(
+        self,
+        begin: str | None,
+        end: str,
+        step: str | None,
+    ) -> str | None:
+        """NKI: use nl.sequential_range with literal step (no tl.range / constexpr)."""
+        begin_part = begin if begin is not None else "0"
+        step_part = step if step is not None else "1"
+        return f"nl.sequential_range({begin_part}, {{end}}, {step_part})"
+
     def dtype_str(self, dtype: torch.dtype) -> str:
         _DTYPE_MAP = {
             torch.float16: "nl.float16",
@@ -888,10 +899,10 @@ class NKIBackend(Backend):
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
-        # No nisa.* API for full is documented in NKI; add statement-based path when available.
-        raise exc.BackendUnsupported(
-            self.name, "nl.full does not exist in nki.*"
-        )
+        # NKI: use nl.zeros(shape, dtype) for zero-filled tiles (e.g. matmul accumulator).
+        shape_str = ", ".join(shape_dims)
+        dtype_str = self.dtype_str(dtype)
+        return f"nl.zeros([{shape_str}], {dtype_str})"
 
     def reshape_expr(self, expr: str, shape: str) -> str:
         return f"({expr}).reshape({shape})"
@@ -949,14 +960,18 @@ class NKIBackend(Backend):
                 raise exc.BackendUnsupported(
                     self.name, f"reduction {reduction_type!r} not mapped to NKI op"
                 )
+            # nisa.tensor_reduce writes to PSUM; allocate PSUM dst, then copy to SBUF.
+            psum_var = state.device_function.new_var("nki_reduce_psum", dce=True)
+            state.add_statement(
+                f"{psum_var} = nl.zeros(())  # PSUM destination for tensor_reduce"
+            )
+            state.add_statement(
+                f"nisa.tensor_reduce(dst={psum_var}, src={input_name}, op={op}, axis={dim})"
+            )
+            # Copy PSUM → SBUF so downstream ops see SBUF
             result_var = state.device_function.new_var("nki_reduce", dce=True)
-            # Allocate scalar output (partial reduction may need shape from caller)
-            state.add_statement(
-                f"{result_var} = nl.zeros(())  # TODO: use correct shape for partial reduction"
-            )
-            state.add_statement(
-                f"nisa.tensor_reduce(dst={result_var}, src={input_name}, op={op}, axis={dim})"
-            )
+            state.add_statement(f"{result_var} = nl.ndarray((), nl.float32, buffer=nl.sbuf)")
+            state.add_statement(f"nisa.tensor_copy(dst={result_var}, src={psum_var})")
             return result_var
         raise exc.BackendUnsupported(
             self.name,

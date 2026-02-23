@@ -576,14 +576,45 @@ def codegen_baddbmm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
     return _pallas_dot(ctx, node, True)
 
 
+def _nki_copy_psum_to_sbuf(
+    state: object,
+    psum_var: str,
+    shape_str: str,
+    dtype_str: str,
+    *,
+    prefix: str = "_nki_psum_copy",
+) -> str:
+    """Allocate an SBUF tile and copy a PSUM tile into it via nisa.tensor_copy.
+
+    NKI Tensor Engine ops (nc_transpose, nc_matmul) write to PSUM.
+    All subsequent Vector Engine / ISA ops expect SBUF inputs, so every
+    PSUM result must be copied back to SBUF before further use.
+    """
+    sbuf_var = state.device_function.new_var(prefix)
+    state.add_statement(
+        statement_from_string(
+            f"{sbuf_var} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+        )
+    )
+    state.add_statement(
+        statement_from_string(f"nisa.tensor_copy(dst={sbuf_var}, src={psum_var})")
+    )
+    return sbuf_var
+
+
 def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     """Generate nisa.nc_matmul for NKI backend.
 
-    Assumptions:
-    - LHS (stationary) is pre-transposed by the caller: shape [K, M], K is partition dim
-    - RHS (moving) shape [K, N], K is partition dim
-    - Output goes to PSUM as float32, shape [M, N]
-    - with_acc=True: adds bias (from SBUF) to the PSUM result
+    Memory layout rules enforced here:
+      - nc_matmul: stationary=SBUF, moving=SBUF, dst=PSUM
+      - nc_transpose: data=SBUF, dst=PSUM
+    After every Tensor Engine op that writes to PSUM we immediately copy
+    the result back to SBUF with nl.copy so that all downstream ops see SBUF.
+
+    Flow:
+      LHS (SBUF, [M,K]) --nc_transpose--> PSUM --nisa.tensor_copy--> SBUF [K,M]
+      RHS (SBUF, [K,N])
+      SBUF[K,M] + SBUF[K,N] --nc_matmul--> PSUM[M,N] --nisa.tensor_copy--> SBUF[M,N]
     """
     env = CompileEnvironment.current()
     state = getattr(env, "_codegen_state", None)
@@ -595,7 +626,6 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     if with_acc:
         acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
         assert isinstance(acc, ast.AST)
-        acc_node = node.args[0]
         lhs_node = node.args[1]
         rhs_node = node.args[2]
     else:
@@ -607,10 +637,12 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
 
-    lhs_shape = list(lhs_node.meta["val"].size())  # [K, M] — pre-transposed
+    # LHS loaded as [M, K]; nc_matmul stationary must be [K, M] (K = partition dim)
+    lhs_shape = list(lhs_node.meta["val"].size())  # [M, K]
     rhs_shape = list(rhs_node.meta["val"].size())  # [K, N]
-    M = lhs_shape[-1]  # free dim of stationary
-    N = rhs_shape[-1]  # free dim of moving
+    M = lhs_shape[0]
+    K = lhs_shape[1]
+    N = rhs_shape[-1]
 
     def _shape_val_str(s: int | torch.SymInt) -> str:
         if isinstance(s, int):
@@ -618,29 +650,50 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         return state.sympy_expr(s._sympy_())
 
     M_str = _shape_val_str(M)
+    K_str = _shape_val_str(K)
     N_str = _shape_val_str(N)
 
-    # Allocate PSUM tile for matmul result — always float32, shape [M, N]
-    mm_result = state.device_function.new_var("_nki_mm_psum")
+    # --- Step 1: transpose LHS [M,K] → [K,M] ---
+    # nc_transpose: data=SBUF → dst=PSUM
+    lhs_t_psum = state.device_function.new_var("_nki_lhs_t_psum")
     state.add_statement(
         statement_from_string(
-            f"{mm_result} = nl.ndarray([{M_str}, {N_str}], nl.float32, buffer=nl.psum)"
+            f"{lhs_t_psum} = nl.ndarray([{K_str}, {M_str}], nl.float32, buffer=nl.psum)"
         )
     )
-    # Emit nc_matmul — result lands in PSUM
     state.add_statement(
         statement_from_string(
-            f"nisa.nc_matmul(dst={mm_result}, stationary={{lhs}}, moving={{rhs}})",
+            f"nisa.nc_transpose(dst={lhs_t_psum}, data={{lhs}})",
             lhs=lhs,
+        )
+    )
+    # Copy PSUM → SBUF so nc_matmul can use it as stationary (requires SBUF)
+    lhs_stationary = _nki_copy_psum_to_sbuf(
+        state, lhs_t_psum, f"{K_str}, {M_str}", "nl.float32", prefix="_nki_lhs_t_sbuf"
+    )
+
+    # --- Step 2: nc_matmul stationary=SBUF, moving=SBUF → PSUM ---
+    mm_psum = state.device_function.new_var("_nki_mm_psum")
+    state.add_statement(
+        statement_from_string(
+            f"{mm_psum} = nl.ndarray([{M_str}, {N_str}], nl.float32, buffer=nl.psum)"
+        )
+    )
+    state.add_statement(
+        statement_from_string(
+            f"nisa.nc_matmul(dst={mm_psum}, stationary={lhs_stationary}, moving={{rhs}})",
             rhs=rhs,
         )
     )
+    # Copy PSUM → SBUF so all downstream ops see SBUF
+    mm_sbuf = _nki_copy_psum_to_sbuf(
+        state, mm_psum, f"{M_str}, {N_str}", "nl.float32", prefix="_nki_mm_sbuf"
+    )
 
     if not with_acc:
-        return expr_from_string(mm_result)
+        return expr_from_string(mm_sbuf)
 
-    # with_acc: add bias (SBUF) to PSUM result → write to SBUF
-    # nisa.tensor_tensor can read PSUM + SBUF and write SBUF
+    # --- Step 3 (addmm): add bias (SBUF) + mm result (SBUF) → SBUF ---
     assert acc is not None
     out_result = state.device_function.new_var("_nki_addmm_result")
     state.add_statement(
@@ -650,7 +703,7 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     )
     state.add_statement(
         statement_from_string(
-            f"nisa.tensor_tensor(dst={out_result}, data1={mm_result}, data2={{acc}}, op=nl.add)",
+            f"nisa.tensor_tensor(dst={out_result}, data1={mm_sbuf}, data2={{acc}}, op=nl.add)",
             acc=acc,
         )
     )

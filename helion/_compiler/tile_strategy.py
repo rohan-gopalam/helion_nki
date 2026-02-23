@@ -961,6 +961,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         assert isinstance(begins, list)
         assert isinstance(ends, list)
         assert isinstance(proxy_ends, list)
+        # For NKI device loops, use dimension size as loop end (e.g. x.shape[1] for K)
+        # so the range is 0..dim_size with step block_size, not 0..128.
+        if env.backend.name == "nki":
+            ends = list(ends)
+            proxy_ends = list(proxy_ends)
+            for i, block_idx in enumerate(block_ids):
+                bs_info = env.block_sizes[block_idx]
+                if isinstance(bs_info.size, (int, torch.SymInt)):
+                    ends[i] = bs_info.size
+                    proxy_ends[i] = bs_info.size
         block_id_to_info = {}
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
@@ -970,11 +980,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             if block_size != 1:
+                block_size_var_for_constexpr = self.block_size_var(block_idx)
+                assert block_size_var_for_constexpr is not None
+                self._setup_block_size_constexpr(
+                    state,
+                    block_size_var_for_constexpr,
+                    block_size,
+                    block_idx=block_idx,
+                )
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(
-                    state, block_size_var, block_size, block_idx=block_idx
-                )
             else:
                 block_size_var = "1"
             end_var_name = state.codegen.lift(
@@ -1326,11 +1341,16 @@ class CuteNDTileStrategy(NDTileStrategy):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
             if block_size != 1:
+                block_size_var_for_constexpr = self.block_size_var(block_idx)
+                assert block_size_var_for_constexpr is not None
+                self._setup_block_size_constexpr(
+                    state,
+                    block_size_var_for_constexpr,
+                    block_size,
+                    block_idx=block_idx,
+                )
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(
-                    state, block_size_var, block_size, block_idx=block_idx
-                )
             else:
                 block_size_var = "1"
             end_var_name = state.codegen.lift(

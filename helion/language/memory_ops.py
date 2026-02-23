@@ -536,11 +536,35 @@ def _(state: CodegenState) -> ast.AST:
         )
     )
     # Slice-based tile model: one slice per dimension from offset vars and block sizes.
-    # Use active grid block_id when get_block_id(size) is None (e.g. concrete shape 1024).
+    # Resolve block_id by size (grid + loop dims) so e.g. K dimension uses offset_2.
     def _block_id_for_dim(dim: int):
-        bid = env.get_block_id(tensor.size(dim))
+        size_i = tensor.size(dim)
+        bid = env.get_block_id(size_i)
         if bid is not None:
             return bid
+        bid = env.resolve_block_id(size_i)
+        if bid is not None:
+            return bid
+        # Match by extent: which active block has numel == this dimension's size?
+        try:
+            import sympy
+            size_sym = (
+                size_i._sympy_()
+                if isinstance(size_i, torch.SymInt)
+                else (sympy.Integer(size_i) if isinstance(size_i, int) else None)
+            )
+            if size_sym is not None:
+                for active_bid in sorted(state.codegen.active_device_loops.keys()):
+                    if active_bid >= len(env.block_sizes):
+                        continue
+                    info = env.block_sizes[active_bid]
+                    if info.numel is None:
+                        continue
+                    if info.numel == size_sym:
+                        return active_bid
+        except Exception:
+            pass
+        # Fallback: grid dims only (wrong for loop dims like K)
         grid = state.codegen.current_grid_state
         if grid is not None and dim < len(grid.block_ids):
             return grid.block_ids[dim]
@@ -580,11 +604,33 @@ def _(state: CodegenState) -> None:
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
     env = CompileEnvironment.current()
-    # Slice-based tile model: same slice notation as load; use grid block_id when needed.
+    # Same block_id resolution as load (grid + loop dims by size).
     def _block_id_for_dim(dim: int):
-        bid = env.get_block_id(tensor.size(dim))
+        size_i = tensor.size(dim)
+        bid = env.get_block_id(size_i)
         if bid is not None:
             return bid
+        bid = env.resolve_block_id(size_i)
+        if bid is not None:
+            return bid
+        try:
+            import sympy
+            size_sym = (
+                size_i._sympy_()
+                if isinstance(size_i, torch.SymInt)
+                else (sympy.Integer(size_i) if isinstance(size_i, int) else None)
+            )
+            if size_sym is not None:
+                for active_bid in sorted(state.codegen.active_device_loops.keys()):
+                    if active_bid >= len(env.block_sizes):
+                        continue
+                    info = env.block_sizes[active_bid]
+                    if info.numel is None:
+                        continue
+                    if info.numel == size_sym:
+                        return active_bid
+        except Exception:
+            pass
         grid = state.codegen.current_grid_state
         if grid is not None and dim < len(grid.block_ids):
             return grid.block_ids[dim]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import ast
 import functools
 import operator
 from typing import TYPE_CHECKING
@@ -638,6 +639,7 @@ class NKIOpOverrides:
 
     @staticmethod
     def _nki_tensor_tensor(a: object, b: object, op: str, prefix: str) -> str:
+        from .ast_extension import statement_from_string
         from .compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
@@ -646,13 +648,23 @@ class NKIOpOverrides:
         state = getattr(env, "_codegen_state", None)
         if state is None:
             return ""
-        # Write result into the first operand's buffer (in-place accumulation).
-        # This avoids allocating a new buffer each iteration and prevents the
-        # phi-node rebinding that breaks NKI's tracing.
+
         dst = str(a)
-        state.add_statement(
-            f"nisa.tensor_tensor(dst={dst}, data1={a}, data2={b}, op={op})"
-        )
+        dst_tile_vars = state.device_function.get_tile_list_vars(dst)
+        b_tile_vars = state.device_function.get_tile_list_vars(str(b))
+
+        if dst_tile_vars is not None:
+            for i, dv in enumerate(dst_tile_vars):
+                bv = b_tile_vars[i] if b_tile_vars else str(b)
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.tensor_tensor(dst={dv}, data1={dv}, data2={bv}, op={op})"
+                    )
+                )
+        else:
+            state.add_statement(
+                f"nisa.tensor_tensor(dst={dst}, data1={a}, data2={b}, op={op})"
+            )
         return dst
 
     def add(self, a: object, b: object) -> str:

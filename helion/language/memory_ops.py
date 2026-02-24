@@ -508,7 +508,10 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(load, "nki")
 def _(state: CodegenState) -> ast.AST:
+    from .._compiler.ast_extension import create
     from .._compiler.ast_extension import statement_from_string
+
+    NKI_PARTITION_MAX = 128
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -523,28 +526,30 @@ def _(state: CodegenState) -> ast.AST:
     sbuf_name = f"_nki_sbuf_{device_fn.device_load_index}"
     output_shape = SubscriptIndexing.compute_shape(tensor, [*subscript], state)
 
-    def _shape_dim_str(s: int | torch.SymInt) -> str:
-        if isinstance(s, int):
-            return str(s)
-        return state.sympy_expr(s._sympy_())
+    import sympy as _sympy
 
-    shape_str = ", ".join(_shape_dim_str(s) for s in output_shape)
+    _bs_subs: dict[_sympy.Symbol, int] = {}
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+    def _resolve_dim(s: int | torch.SymInt) -> int:
+        if isinstance(s, int):
+            return s
+        return int(s._sympy_().subs(_bs_subs))
+
+    partition_dim = _resolve_dim(output_shape[0])
+    free_dims = [_resolve_dim(s) for s in output_shape[1:]]
     dtype_str = backend.dtype_str(tensor.dtype)
-    state.codegen.add_statement(
-        statement_from_string(
-            f"{sbuf_name} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
-        )
-    )
-    # Build slices from the subscript list.  Each subscript element is a SymInt
-    # that originated from block_sizes[block_id].var (set by tiles_as_sizes in
-    # prepare_args).  We recover the block_id via env.get_block_id() on the FX
-    # node's meta["val"], which retains the unique symbol identity.
+
+    # Build slices from the subscript list.
     fx_subscript = (
         state.fx_node.args[1]
         if state.fx_node is not None and len(state.fx_node.args) >= 2
         else None
     )
     slice_parts: list[str] = []
+    partition_offset_var: str | None = None
     for i, sub_val in enumerate(subscript):
         block_id = None
         if fx_subscript is not None and i < len(fx_subscript):
@@ -556,6 +561,8 @@ def _(state: CodegenState) -> ast.AST:
         if block_id is not None:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
+            if i == 0:
+                partition_offset_var = offset_var
             slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
         else:
             size_i = tensor.size(i) if i < tensor.dim() else sub_val
@@ -565,16 +572,62 @@ def _(state: CodegenState) -> ast.AST:
                 else str(size_i)
             )
             slice_parts.append(f"0 : {size_str}")
-    slice_str = ", ".join(slice_parts)
-    state.codegen.add_statement(
-        statement_from_string(f"nisa.dma_copy(dst={sbuf_name}, src={name}[{slice_str}])")
-    )
+
+    if partition_dim > NKI_PARTITION_MAX:
+        n_partitions = partition_dim // NKI_PARTITION_MAX
+        assert partition_dim % NKI_PARTITION_MAX == 0
+        free_str = ", ".join(str(d) for d in free_dims)
+        # Fully unroll: N individual named variables + N explicit dma_copy statements
+        tile_vars: list[str] = []
+        for i in range(n_partitions):
+            tile_var = f"{sbuf_name}_{i}"
+            tile_vars.append(tile_var)
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"{tile_var} = nl.ndarray([{NKI_PARTITION_MAX}, {free_str}], "
+                    f"{dtype_str}, buffer=nl.sbuf)"
+                )
+            )
+        for i, tile_var in enumerate(tile_vars):
+            part_slice_parts = list(slice_parts)
+            if partition_offset_var is not None:
+                part_slice_parts[0] = (
+                    f"{partition_offset_var}+{i}*{NKI_PARTITION_MAX} : "
+                    f"{partition_offset_var}+{i + 1}*{NKI_PARTITION_MAX}"
+                )
+            else:
+                part_slice_parts[0] = (
+                    f"{i}*{NKI_PARTITION_MAX} : {i + 1}*{NKI_PARTITION_MAX}"
+                )
+            part_slice_str = ", ".join(part_slice_parts)
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"nisa.dma_copy(dst={tile_var}, src={name}[{part_slice_str}])"
+                )
+            )
+        device_fn.register_tile_list(sbuf_name, tile_vars)
+    else:
+        shape_str = f"{partition_dim}, " + ", ".join(str(d) for d in free_dims)
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{sbuf_name} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        slice_str = ", ".join(slice_parts)
+        state.codegen.add_statement(
+            statement_from_string(
+                f"nisa.dma_copy(dst={sbuf_name}, src={name}[{slice_str}])"
+            )
+        )
     return expr_from_string(sbuf_name)
 
 
 @_decorators.codegen(store, "nki")
 def _(state: CodegenState) -> None:
+    from .._compiler.ast_extension import create
     from .._compiler.ast_extension import statement_from_string
+
+    NKI_PARTITION_MAX = 128
 
     tensor = state.proxy_arg(0)
     assert isinstance(tensor, torch.Tensor)
@@ -586,13 +639,13 @@ def _(state: CodegenState) -> None:
     env = CompileEnvironment.current()
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
-    # Same approach as load: recover block_id from subscript FX node metadata.
     fx_subscript = (
         state.fx_node.args[1]
         if state.fx_node is not None and len(state.fx_node.args) >= 2
         else None
     )
     slice_parts: list[str] = []
+    partition_offset_var: str | None = None
     for i, sub_val in enumerate(subscript):
         block_id = None
         if fx_subscript is not None and i < len(fx_subscript):
@@ -604,6 +657,8 @@ def _(state: CodegenState) -> None:
         if block_id is not None:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
+            if i == 0:
+                partition_offset_var = offset_var
             slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
         else:
             size_i = tensor.size(i) if i < tensor.dim() else sub_val
@@ -613,12 +668,36 @@ def _(state: CodegenState) -> None:
                 else str(size_i)
             )
             slice_parts.append(f"0 : {size_str}")
-    slice_str = ", ".join(slice_parts)
-    state.codegen.add_statement(
-        statement_from_string(
-            f"nisa.dma_copy(dst={name}[{slice_str}], src={{value}})", value=value
+
+    value_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
+    tile_vars = device_fn.get_tile_list_vars(value_name)
+
+    if tile_vars:
+        # Fully unroll: N explicit dma_copy statements, one per partition tile
+        for i, tile_var in enumerate(tile_vars):
+            part_slice_parts = list(slice_parts)
+            if partition_offset_var is not None:
+                part_slice_parts[0] = (
+                    f"{partition_offset_var}+{i}*{NKI_PARTITION_MAX} : "
+                    f"{partition_offset_var}+{i + 1}*{NKI_PARTITION_MAX}"
+                )
+            else:
+                part_slice_parts[0] = (
+                    f"{i}*{NKI_PARTITION_MAX} : {i + 1}*{NKI_PARTITION_MAX}"
+                )
+            part_slice_str = ", ".join(part_slice_parts)
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"nisa.dma_copy(dst={name}[{part_slice_str}], src={tile_var})"
+                )
+            )
+    else:
+        slice_str = ", ".join(slice_parts)
+        state.codegen.add_statement(
+            statement_from_string(
+                f"nisa.dma_copy(dst={name}[{slice_str}], src={{value}})", value=value
+            )
         )
-    )
 
 
 @_decorators.get_masked_value(load)

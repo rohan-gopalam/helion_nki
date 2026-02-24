@@ -1188,9 +1188,13 @@ def codegen_call_with_graph(
                 # Phi nodes will merge variable names from outside the loop, but the old value
                 # of those variables could have usages.
                 copy_name = cg.device_function.new_var(arg.id + "_copy")
-                cg.add_statement(
-                    statement_from_string(f"{copy_name} = {{arg}}", arg=arg)
-                )
+                tile_vars = cg.device_function.get_tile_list_vars(arg.id)
+                if tile_vars is not None:
+                    cg.device_function.register_tile_list(copy_name, tile_vars)
+                else:
+                    cg.add_statement(
+                        statement_from_string(f"{copy_name} = {{arg}}", arg=arg)
+                    )
                 new_args.append(expr_from_string(copy_name))
             else:
                 new_args.append(cg.lift(arg))

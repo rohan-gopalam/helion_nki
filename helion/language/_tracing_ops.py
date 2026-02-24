@@ -489,6 +489,11 @@ def _(state: CodegenState) -> ast.AST:
     varname = state.codegen.tmpvar(
         prefix=value.id if isinstance(value, ast.Name) else "new_var"
     )
+    if isinstance(value, ast.Name):
+        tile_vars = state.device_function.get_tile_list_vars(value.id)
+        if tile_vars is not None:
+            state.device_function.register_tile_list(varname, tile_vars)
+            return create(ast.Name, id=varname, ctx=ast.Load())
     state.add_statement(statement_from_string(f"{varname} = {{expr}}", expr=value))
     return create(ast.Name, id=varname, ctx=ast.Load())
 

@@ -263,6 +263,7 @@ class DeviceFunction:
             ]
         )
         self._variable_renames: dict[str, list[str]] = {}
+        self._nki_tile_lists: dict[str, list[str]] = {}  # var → [var_0, var_1, ...]
         self.dce_vars: list[str] = []
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
@@ -394,6 +395,14 @@ class DeviceFunction:
         ]
         for n in name_group:
             self._variable_renames[n] = name_group
+        tile_vars: list[str] | None = None
+        for n in name_group:
+            if n in self._nki_tile_lists:
+                tile_vars = self._nki_tile_lists[n]
+                break
+        if tile_vars is not None:
+            for n in name_group:
+                self._nki_tile_lists[n] = tile_vars
 
     def set_pid(self, pid: ProgramIDs) -> None:
         assert self.pid is None, "pid already set"
@@ -475,6 +484,38 @@ class DeviceFunction:
         if dce:
             self.dce_vars.append(name)
         return name
+
+    def register_tile_list(self, var_name: str, tile_vars: list[str]) -> None:
+        """Register var_name as a tile list backed by the given individual variables."""
+        if len(tile_vars) > 1:
+            self._nki_tile_lists[var_name] = tile_vars
+
+    def get_tile_list_vars(self, var_name: str) -> list[str] | None:
+        """Return individual tile variable names if var_name is a tile list, else None.
+
+        Also searches through the variable rename chain in case var_name is an
+        alias (e.g. phi-merged name) that hasn't been registered directly.
+        """
+        result = self._nki_tile_lists.get(var_name)
+        if result is not None:
+            return result
+        rename_group = self._variable_renames.get(var_name)
+        if rename_group:
+            for alias in rename_group:
+                result = self._nki_tile_lists.get(alias)
+                if result is not None:
+                    self._nki_tile_lists[var_name] = result
+                    return result
+        return None
+
+    def get_tile_list_count(self, var_name: str) -> int:
+        tile_vars = self._nki_tile_lists.get(var_name)
+        return len(tile_vars) if tile_vars else 1
+
+    def propagate_tile_list(self, src: str, dst: str) -> None:
+        tile_vars = self._nki_tile_lists.get(src)
+        if tile_vars:
+            self._nki_tile_lists[dst] = tile_vars
 
     def tensor_arg(
         self, fake_value: torch.Tensor, prefer_name: str | None = None

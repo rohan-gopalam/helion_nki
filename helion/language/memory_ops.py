@@ -535,50 +535,30 @@ def _(state: CodegenState) -> ast.AST:
             f"{sbuf_name} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
         )
     )
-    # Slice-based tile model: one slice per dimension from offset vars and block sizes.
-    # Resolve block_id by size (grid + loop dims) so e.g. K dimension uses offset_2.
-    def _block_id_for_dim(dim: int):
-        size_i = tensor.size(dim)
-        bid = env.get_block_id(size_i)
-        if bid is not None:
-            return bid
-        bid = env.resolve_block_id(size_i)
-        if bid is not None:
-            return bid
-        # Match by extent: which active block has numel == this dimension's size?
-        try:
-            import sympy
-            size_sym = (
-                size_i._sympy_()
-                if isinstance(size_i, torch.SymInt)
-                else (sympy.Integer(size_i) if isinstance(size_i, int) else None)
-            )
-            if size_sym is not None:
-                for active_bid in sorted(state.codegen.active_device_loops.keys()):
-                    if active_bid >= len(env.block_sizes):
-                        continue
-                    info = env.block_sizes[active_bid]
-                    if info.numel is None:
-                        continue
-                    if info.numel == size_sym:
-                        return active_bid
-        except Exception:
-            pass
-        # Fallback: grid dims only (wrong for loop dims like K)
-        grid = state.codegen.current_grid_state
-        if grid is not None and dim < len(grid.block_ids):
-            return grid.block_ids[dim]
-        return None
-
+    # Build slices from the subscript list.  Each subscript element is a SymInt
+    # that originated from block_sizes[block_id].var (set by tiles_as_sizes in
+    # prepare_args).  We recover the block_id via env.get_block_id() on the FX
+    # node's meta["val"], which retains the unique symbol identity.
+    fx_subscript = (
+        state.fx_node.args[1]
+        if state.fx_node is not None and len(state.fx_node.args) >= 2
+        else None
+    )
     slice_parts: list[str] = []
-    for i in range(tensor.dim()):
-        size_i = tensor.size(i)
-        block_id = _block_id_for_dim(i)
+    for i, sub_val in enumerate(subscript):
+        block_id = None
+        if fx_subscript is not None and i < len(fx_subscript):
+            fx_node_i = fx_subscript[i]
+            if isinstance(fx_node_i, torch.fx.Node):
+                val = fx_node_i.meta.get("val")
+                if val is not None:
+                    block_id = env.get_block_id(val)
         if block_id is not None:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
             slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
         else:
+            size_i = tensor.size(i) if i < tensor.dim() else sub_val
             size_str = (
                 state.sympy_expr(size_i._sympy_())
                 if isinstance(size_i, torch.SymInt)
@@ -604,47 +584,29 @@ def _(state: CodegenState) -> None:
     device_fn.device_store_index += 1
     device_fn.device_memory_op_index += 1
     env = CompileEnvironment.current()
-    # Same block_id resolution as load (grid + loop dims by size).
-    def _block_id_for_dim(dim: int):
-        size_i = tensor.size(dim)
-        bid = env.get_block_id(size_i)
-        if bid is not None:
-            return bid
-        bid = env.resolve_block_id(size_i)
-        if bid is not None:
-            return bid
-        try:
-            import sympy
-            size_sym = (
-                size_i._sympy_()
-                if isinstance(size_i, torch.SymInt)
-                else (sympy.Integer(size_i) if isinstance(size_i, int) else None)
-            )
-            if size_sym is not None:
-                for active_bid in sorted(state.codegen.active_device_loops.keys()):
-                    if active_bid >= len(env.block_sizes):
-                        continue
-                    info = env.block_sizes[active_bid]
-                    if info.numel is None:
-                        continue
-                    if info.numel == size_sym:
-                        return active_bid
-        except Exception:
-            pass
-        grid = state.codegen.current_grid_state
-        if grid is not None and dim < len(grid.block_ids):
-            return grid.block_ids[dim]
-        return None
-
+    subscript = state.proxy_arg(1)
+    assert isinstance(subscript, (list, tuple))
+    # Same approach as load: recover block_id from subscript FX node metadata.
+    fx_subscript = (
+        state.fx_node.args[1]
+        if state.fx_node is not None and len(state.fx_node.args) >= 2
+        else None
+    )
     slice_parts: list[str] = []
-    for i in range(tensor.dim()):
-        size_i = tensor.size(i)
-        block_id = _block_id_for_dim(i)
+    for i, sub_val in enumerate(subscript):
+        block_id = None
+        if fx_subscript is not None and i < len(fx_subscript):
+            fx_node_i = fx_subscript[i]
+            if isinstance(fx_node_i, torch.fx.Node):
+                val = fx_node_i.meta.get("val")
+                if val is not None:
+                    block_id = env.get_block_id(val)
         if block_id is not None:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
             slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
         else:
+            size_i = tensor.size(i) if i < tensor.dim() else sub_val
             size_str = (
                 state.sympy_expr(size_i._sympy_())
                 if isinstance(size_i, torch.SymInt)

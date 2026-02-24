@@ -414,6 +414,16 @@ class CuteProgramIDs(FlatProgramIDs):
     """Flat PID strategy for CuTe pointwise kernels."""
 
 
+class NKIProgramIDs(ProgramIDs):
+    """NKI: grid is always (1,); tiling is done via nl.affine_range loops inside the kernel."""
+
+    def codegen(self, state: CodegenState) -> None:
+        pass
+
+    def codegen_grid(self) -> ast.AST:
+        return expr_from_string("(1,)")
+
+
 @dataclasses.dataclass
 class L2GroupingProgramIDs(ProgramIDs):
     """Used grouped iteration order to promote L2 cache reuse in matmuls"""

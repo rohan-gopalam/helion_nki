@@ -638,8 +638,6 @@ class NKIOpOverrides:
 
     @staticmethod
     def _nki_tensor_tensor(a: object, b: object, op: str, prefix: str) -> str:
-        from .ast_extension import statement_from_string
-
         from .compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
@@ -648,26 +646,14 @@ class NKIOpOverrides:
         state = getattr(env, "_codegen_state", None)
         if state is None:
             return ""
-        result_var = state.device_function.new_var(prefix, dce=True)
-        # Allocate dst SBUF tile (same shape as inputs); NKI has no implicit allocation.
-        grid = state.codegen.current_grid_state
-        if grid is not None and grid.block_ids:
-            shape_parts = [
-                str(int(env.block_sizes[bid].from_config_assert(state.config)))
-                for bid in grid.block_ids
-            ]
-            shape_str = ", ".join(shape_parts)
-        else:
-            shape_str = "128"
+        # Write result into the first operand's buffer (in-place accumulation).
+        # This avoids allocating a new buffer each iteration and prevents the
+        # phi-node rebinding that breaks NKI's tracing.
+        dst = str(a)
         state.add_statement(
-            statement_from_string(
-                f"{result_var} = nl.ndarray([{shape_str}], nl.float32, buffer=nl.sbuf)"
-            )
+            f"nisa.tensor_tensor(dst={dst}, data1={a}, data2={b}, op={op})"
         )
-        state.add_statement(
-            f"nisa.tensor_tensor(dst={result_var}, data1={a}, data2={b}, op={op})"
-        )
-        return result_var
+        return dst
 
     def add(self, a: object, b: object) -> str:
         out = self._nki_tensor_tensor(a, b, "nl.add", "nki_add")
@@ -899,10 +885,9 @@ class NKIBackend(Backend):
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
-        # NKI: use nl.zeros(shape, dtype) for zero-filled tiles (e.g. matmul accumulator).
         shape_str = ", ".join(shape_dims)
         dtype_str = self.dtype_str(dtype)
-        return f"nl.zeros([{shape_str}], {dtype_str})"
+        return f"nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
 
     def reshape_expr(self, expr: str, shape: str) -> str:
         return f"({expr}).reshape({shape})"

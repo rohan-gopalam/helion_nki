@@ -170,6 +170,26 @@ def codegen_full(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+@full_lowering.register_codegen("nki")
+def codegen_full_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    env = CompileEnvironment.current()
+    size = map_arg(node.args[0], lambda n: n.meta["val"])
+    dtype = node.kwargs.get("dtype", torch.get_default_dtype())
+    assert isinstance(dtype, torch.dtype)
+    value_ast = map_arg(node.args[1], lambda arg: _env_arg(ctx, arg))
+    if isinstance(value_ast, (int, float, bool)):
+        value_ast = expr_from_string(constant_repr(value_ast))
+    assert isinstance(value_ast, ast.AST), value_ast
+    shape_dims = ctx.cg.device_function.tile_strategy.shape_dims([*size])
+    ndarray_expr = env.backend.full_expr(shape_dims, "0", dtype)
+    var = ctx.cg.device_function.new_var("_nki_full", dce=True)
+    ctx.cg.add_statement(statement_from_string(f"{var} = {ndarray_expr}"))
+    ctx.cg.add_statement(
+        statement_from_string(f"nisa.memset({var}, value={{val}})", val=value_ast)
+    )
+    return expr_from_string(var)
+
+
 unsqueeze_lowering = register_lowering(
     torch.ops.aten.unsqueeze.default,
     masked_value_fn=passthrough_masked_value,

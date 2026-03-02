@@ -878,7 +878,8 @@ class NKIBackend(Backend):
         return offset_var
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
-        return f"({expr_str}).to({dtype_str})"
+        # NKI tracer does not support .to() on ndarray/tensor access; reduction result is already correct dtype.
+        return expr_str
 
     def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         return expr_from_string(
@@ -946,6 +947,13 @@ class NKIBackend(Backend):
     ) -> str:
         state = self._nki_codegen_state()
         if state is not None:
+            # NKI tensor_reduce only supports free-axis reduction (axis 1+). Dim 0 is partition axis.
+            if dim == 0:
+                raise exc.BackendUnsupported(
+                    self.name,
+                    "reduction over dim 0 not supported; NKI tensor_reduce requires free axis (dim >= 1). "
+                    "Transpose or use a different pattern.",
+                )
             _NKI_REDUCTION_OPS = {
                 "sum": "nl.add",
                 "max": "nl.max",
@@ -957,18 +965,16 @@ class NKIBackend(Backend):
                 raise exc.BackendUnsupported(
                     self.name, f"reduction {reduction_type!r} not mapped to NKI op"
                 )
-            # nisa.tensor_reduce writes to PSUM; allocate PSUM dst, then copy to SBUF.
-            psum_var = state.device_function.new_var("nki_reduce_psum", dce=True)
-            state.add_statement(
-                f"{psum_var} = nl.zeros(())  # PSUM destination for tensor_reduce"
-            )
-            state.add_statement(
-                f"nisa.tensor_reduce(dst={psum_var}, src={input_name}, op={op}, axis={dim})"
-            )
-            # Copy PSUM → SBUF so downstream ops see SBUF
+            # NKI tensor_reduce requires a concrete dst buffer; nl.zeros(()) is invalid.
+            # Use a single sbuf [1, 1] and keepdims=False (same as helion_reduce_return_kernel).
+            dtype_str = "nl.float32"  # accumulator type for reduction
             result_var = state.device_function.new_var("nki_reduce", dce=True)
-            state.add_statement(f"{result_var} = nl.ndarray((), nl.float32, buffer=nl.sbuf)")
-            state.add_statement(f"nisa.tensor_copy(dst={result_var}, src={psum_var})")
+            state.add_statement(
+                f"{result_var} = nl.ndarray([1, 1], {dtype_str}, buffer=nl.sbuf)"
+            )
+            state.add_statement(
+                f"nisa.tensor_reduce(dst={result_var}, op={op}, data={input_name}, axis={dim}, keepdims=False)"
+            )
             return result_var
         raise exc.BackendUnsupported(
             self.name,
@@ -978,9 +984,7 @@ class NKIBackend(Backend):
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
-        raise exc.BackendUnsupported(
-            self.name, "nl.arange removed in nki.*"
-        )
+        return f"0"
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
         return f"nl.zeros([0], {dtype})"

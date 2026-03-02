@@ -751,6 +751,11 @@ class DeviceFunction:
                         *scalar_preamble,
                         *self.preamble,
                         *self.body,
+                        *(
+                            [statement_from_string(f"return {self._nki_return_buffer_name}")]
+                            if getattr(self, "_nki_return_buffer_name", None) is not None
+                            else []
+                        ),
                     ],
                     decorator_list=[expr_from_string(backend.function_decorator)]
                     if backend.function_decorator
@@ -791,9 +796,13 @@ class DeviceFunction:
             config=self.config,
             has_barrier=env.has_barrier,
         )
+        return_host_var = getattr(self, "_nki_return_host_var", None)
+        call_str = f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})"
+        if return_host_var is not None:
+            call_str = f"{return_host_var} = " + call_str
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
-            f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})",
+            call_str,
             call_grid_expr=call_grid_expr,
         )
         assert isinstance(call_statement, ExtendedAST)

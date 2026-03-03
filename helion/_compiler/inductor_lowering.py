@@ -896,9 +896,54 @@ class GenerateASTFromInductor(DefaultHandler):
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
     ) -> str:
-        result_str = _unpack_opsvalue(
-            getattr(self.parent_handler, name)(*args, **kwargs)
-        )
+        try:
+            result_str = _unpack_opsvalue(
+                getattr(self.parent_handler, name)(*args, **kwargs)
+            )
+        except AttributeError as e:
+            backend = CompileEnvironment.current().backend
+            # NKI: fail fast for activation ops not explicitly mapped to
+            # nisa.activation in NKIOpOverrides.
+            if backend.codegen_name == "nki":
+                _NKI_ACTIVATION_NAMES = {
+                    "copy",
+                    "square",
+                    "sigmoid",
+                    "relu",
+                    "gelu",
+                    "gelu_dx",
+                    "gelu_apprx_tanh",
+                    "gelu_apprx_sigmoid",
+                    "gelu_apprx_sigmoid_dx",
+                    "silu",
+                    "silu_dx",
+                    "tanh",
+                    "softplus",
+                    "mish",
+                    "erf",
+                    "erf_dx",
+                    "exp",
+                    "log",
+                    "sin",
+                    "arctan",
+                    "sqrt",
+                    "rsqrt",
+                    "reciprocal",
+                    "sign",
+                    "abs",
+                    # Common unary op that users expect but NKI activation does not support.
+                    "cos",
+                }
+                if name in _NKI_ACTIVATION_NAMES:
+                    raise exc.BackendUnsupported(
+                        "nki",
+                        f"activation op {name!r} is not mapped for NKI codegen. "
+                        "Supported NKI activation codegen ops: "
+                        "copy, square, sigmoid, relu, gelu, gelu_apprx_tanh, "
+                        "gelu_apprx_sigmoid, silu, tanh, softplus, mish, erf, "
+                        "exp, log, sin, arctan, sqrt, rsqrt, reciprocal, sign, abs.",
+                    ) from e
+            raise
         return self._lift(expr_from_string(result_str))
 
     def to_dtype(

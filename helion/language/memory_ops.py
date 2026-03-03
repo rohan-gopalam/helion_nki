@@ -672,9 +672,43 @@ def _(state: CodegenState) -> None:
     value_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
     tile_vars = device_fn.get_tile_list_vars(value_name)
 
+    # NKI output tensors: use return buffer (allocate, write, return) instead of
+    # passed-in tensor; NKI does not propagate writes to passed tensors.
+    use_nki_return = False
+    ret_buf_name: str | None = None
+    try:
+        hf = HostFunction.current()
+        if hf is not None and tensor in hf.tensor_to_origin:
+            use_nki_return = True
+            origin = hf.tensor_to_origin[tensor]
+            return_host_var = origin.host_str()
+            ret_buf_name = getattr(device_fn, "_nki_return_buffer_name", None)
+            if ret_buf_name is None:
+                ret_buf_name = device_fn.new_var("nki_return_buf")
+                dtype_str = env.backend.dtype_str(tensor.dtype)
+                shape_parts = []
+                for i in range(tensor.dim()):
+                    size_i = tensor.size(i)
+                    size_str = (
+                        state.sympy_expr(size_i._sympy_())
+                        if isinstance(size_i, torch.SymInt)
+                        else str(size_i)
+                    )
+                    shape_parts.append(size_str)
+                shape_str = ", ".join(shape_parts)
+                device_fn.preamble.append(
+                    statement_from_string(
+                        f"{ret_buf_name} = nl.ndarray(({shape_str}), dtype={dtype_str}, buffer=nl.shared_hbm)"
+                    )
+                )
+                device_fn._nki_return_buffer_name = ret_buf_name
+                device_fn._nki_return_host_var = return_host_var
+    except Exception:
+        pass
+
     if tile_vars:
         # Fully unroll: N explicit dma_copy statements, one per partition tile
-        name = device_fn.tensor_arg(tensor).name
+        name = ret_buf_name if use_nki_return else device_fn.tensor_arg(tensor).name
         for i, tile_var in enumerate(tile_vars):
             part_slice_parts = list(slice_parts)
             if partition_offset_var is not None:
@@ -694,43 +728,15 @@ def _(state: CodegenState) -> None:
             )
     else:
         slice_str = ", ".join(slice_parts)
-        # Single-element output: use same pattern as working return-path kernel
-        # (helion_reduce_return_kernel.sum_vector_return): write to shared_hbm and
-        # return it from the kernel instead of DMA to passed-in tensor.
+        name = ret_buf_name if use_nki_return else device_fn.tensor_arg(tensor).name
         numel = tensor.numel()
         if numel == 1:
-            try:
-                hf = HostFunction.current()
-            except Exception:
-                hf = None
-            if hf is not None and tensor in hf.tensor_to_origin:
-                origin = hf.tensor_to_origin[tensor]
-                return_host_var = origin.host_str()
-                ret_buf_name = getattr(device_fn, "_nki_return_buffer_name", None)
-                if ret_buf_name is None:
-                    ret_buf_name = device_fn.new_var("nki_return_buf")
-                    dtype_str = env.backend.dtype_str(tensor.dtype)
-                    device_fn.preamble.append(
-                        statement_from_string(
-                            f"{ret_buf_name} = nl.ndarray((1, 1), dtype={dtype_str}, buffer=nl.shared_hbm)"
-                        )
-                    )
-                    device_fn._nki_return_buffer_name = ret_buf_name
-                    device_fn._nki_return_host_var = return_host_var
-                state.codegen.add_statement(
-                    statement_from_string(
-                        f"nisa.dma_copy(dst={ret_buf_name}, src={{value}})", value=value
-                    )
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"nisa.dma_copy(dst={name}, src={{value}})", value=value
                 )
-            else:
-                name = device_fn.tensor_arg(tensor).name
-                state.codegen.add_statement(
-                    statement_from_string(
-                        f"nisa.dma_copy(dst={name}, src={{value}})", value=value
-                    )
-                )
+            )
         else:
-            name = device_fn.tensor_arg(tensor).name
             state.codegen.add_statement(
                 statement_from_string(
                     f"nisa.dma_copy(dst={name}[{slice_str}], src={{value}})", value=value

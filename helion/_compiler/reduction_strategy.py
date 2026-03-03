@@ -133,6 +133,8 @@ class ReductionStrategy(TileStrategy):
             reduction_type,
             dim,
             block_size_var=self.block_size_var(self.block_index),
+            fake_input=fake_input,
+            fake_output=fake_output,
         )
 
     def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
@@ -417,6 +419,11 @@ class LoopedReductionStrategy(ReductionStrategy):
             device_loop.outer_prefix.append(
                 statement_from_string(f"{acc} = {acc_full}")
             )
+            nki_memset = getattr(backend, "full_memset_stmt", None)
+            if nki_memset is not None:
+                device_loop.outer_prefix.append(
+                    statement_from_string(nki_memset(acc, constant_repr(default)))
+                )
             result = self.fn.new_var(state.fx_node.name, dce=True)
             if not backend.is_indexed_reduction(reduction_type):
                 combine_expr = backend.reduction_combine_expr(
@@ -513,8 +520,22 @@ class BlockReductionStrategy(ReductionStrategy):
             is_zero_dim = True
         if is_zero_dim:
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_output.size()])
+            backend = env.backend
+            nki_memset = getattr(backend, "full_memset_stmt", None)
+            if nki_memset is not None:
+                var = self.fn.new_var("zero_dim_default", dce=True)
+                ndarray_expr = backend.full_expr(shape_dims, "0", fake_output.dtype)
+                state.add_statement(
+                    statement_from_string(f"{var} = {ndarray_expr}")
+                )
+                state.add_statement(
+                    statement_from_string(
+                        nki_memset(var, constant_repr(default))
+                    )
+                )
+                return expr_from_string(var)
             return expr_from_string(
-                env.backend.full_expr(
+                backend.full_expr(
                     shape_dims, constant_repr(default), fake_output.dtype
                 )
             )

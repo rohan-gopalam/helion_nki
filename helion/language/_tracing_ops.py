@@ -448,6 +448,26 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(_mask_to, "nki")
+def _(state: CodegenState) -> ast.AST:
+    """
+    NKI backend: currently does not implement masking semantics for _mask_to.
+
+    To keep codegen moving for kernels that use torch.amax / masking patterns,
+    treat _mask_to as a no-op on NKI and emit a warning once per compile.
+    """
+    import warnings
+
+    warnings.warn(
+        "Helion NKI backend: _mask_to is treated as a no-op on NKI; "
+        "masked elements will not be set to the specified value.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    # Simply return the original tensor expression unchanged.
+    return state.ast_arg(0)
+
+
 @_decorators.get_masked_value(_mask_to)
 def _(node: torch.fx.Node) -> float | bool:
     value = node.args[1]

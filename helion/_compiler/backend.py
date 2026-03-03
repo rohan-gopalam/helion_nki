@@ -216,6 +216,8 @@ class Backend(abc.ABC):
         dim: int,
         *,
         block_size_var: str | None = None,
+        fake_input: torch.Tensor | None = None,
+        fake_output: torch.Tensor | None = None,
     ) -> str:
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
@@ -667,17 +669,342 @@ class NKIOpOverrides:
             )
         return dst
 
+    @staticmethod
+    def _is_scalar_operand(x: object) -> bool:
+        return isinstance(x, (int, float, bool))
+
+    @staticmethod
+    def _nki_tensor_scalar(
+        data: object,
+        operand0: object,
+        op0: str,
+        *,
+        reverse0: bool = False,
+    ) -> str:
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            return ""
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return ""
+
+        dst = str(data)
+        dst_tile_vars = state.device_function.get_tile_list_vars(dst)
+        operand_tile_vars = state.device_function.get_tile_list_vars(str(operand0))
+
+        reverse_part = ", reverse0=True" if reverse0 else ""
+
+        if dst_tile_vars is not None:
+            if operand_tile_vars is not None and len(operand_tile_vars) != len(dst_tile_vars):
+                raise exc.BackendUnsupported(
+                    "nki",
+                    "tensor_scalar tile-list operand length mismatch between data and operand0",
+                )
+            for i, dv in enumerate(dst_tile_vars):
+                operand_expr = (
+                    operand_tile_vars[i]
+                    if operand_tile_vars is not None
+                    else str(operand0)
+                )
+                state.add_statement(
+                    statement_from_string(
+                        "nisa.tensor_scalar("
+                        f"dst={dv}, data={dv}, op0={op0}, operand0={operand_expr}, op1=None{reverse_part})"
+                    )
+                )
+            return dst
+
+        if operand_tile_vars is not None:
+            raise exc.BackendUnsupported(
+                "nki",
+                "tensor_scalar does not support non-tile-list data with tile-list operand0",
+            )
+
+        state.add_statement(
+            statement_from_string(
+                "nisa.tensor_scalar("
+                f"dst={dst}, data={data}, op0={op0}, operand0={operand0}, op1=None{reverse_part})"
+            )
+        )
+        return dst
+
+    @classmethod
+    def _nki_binary_op(
+        cls,
+        a: object,
+        b: object,
+        *,
+        op_tensor_tensor: str,
+        op_tensor_scalar: str,
+        allow_tensor_tensor: bool = True,
+    ) -> str:
+        a_is_scalar = cls._is_scalar_operand(a)
+        b_is_scalar = cls._is_scalar_operand(b)
+
+        if a_is_scalar and b_is_scalar:
+            raise exc.BackendUnsupported(
+                "nki",
+                "both operands are host scalars; expected at least one tile operand",
+            )
+
+        # tensor <op> scalar
+        if not a_is_scalar and b_is_scalar:
+            return cls._nki_tensor_scalar(a, b, op_tensor_scalar)
+
+        # scalar <op> tensor
+        if a_is_scalar and not b_is_scalar:
+            reverse0 = op_tensor_scalar in {"nl.subtract", "nl.divide"}
+            return cls._nki_tensor_scalar(b, a, op_tensor_scalar, reverse0=reverse0)
+
+        # tensor <op> tensor
+        if allow_tensor_tensor:
+            return cls._nki_tensor_tensor(a, b, op_tensor_tensor, "nki_binary")
+
+        raise exc.BackendUnsupported(
+            "nki",
+            f"single-op tensor_scalar path does not support tensor/tensor for op {op_tensor_scalar}",
+        )
+
+    @staticmethod
+    def _shape_from_node_arg(arg: object) -> tuple[object, ...] | None:
+        if not hasattr(arg, "meta"):
+            return None
+        val = arg.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            return tuple(val.shape)
+        return None
+
+    @classmethod
+    def _truediv_tensor_tensor_supported(cls) -> bool:
+        from torch._inductor.virtualized import V
+
+        node = V.current_node
+        if node is None or len(node.args) < 2:
+            return False
+
+        lhs_shape = cls._shape_from_node_arg(node.args[0])
+        rhs_shape = cls._shape_from_node_arg(node.args[1])
+        if lhs_shape is None or rhs_shape is None:
+            return False
+        if len(lhs_shape) != 2 or len(rhs_shape) != 2:
+            return False
+        return lhs_shape[0] == rhs_shape[0] and rhs_shape[1] == 1
+
+    @classmethod
+    def _subtract_tensor_tensor_supported(cls) -> bool:
+        """True when [M,N] - [M,1] broadcast; use tensor_scalar instead of tensor_tensor."""
+        return cls._truediv_tensor_tensor_supported()
+
+    @staticmethod
+    def _nki_reciprocal_operand(operand: object) -> object:
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+
+        if isinstance(operand, (int, float, bool)):
+            value = float(operand)
+            if value == 0.0:
+                raise exc.BackendUnsupported(
+                    "nki",
+                    "truediv with zero scalar denominator is unsupported",
+                )
+            return repr(1.0 / value)
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            return operand
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return operand
+
+        operand_str = str(operand)
+        operand_tile_vars = state.device_function.get_tile_list_vars(operand_str)
+        if operand_tile_vars is not None:
+            for ov in operand_tile_vars:
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.activation(dst={ov}, op=nl.reciprocal, data={ov})"
+                    )
+                )
+            return operand
+
+        state.add_statement(
+            statement_from_string(
+                f"nisa.activation(dst={operand_str}, op=nl.reciprocal, data={operand_str})"
+            )
+        )
+        return operand
+
+    @staticmethod
+    def _nki_activation(a: object, op: str, prefix: str) -> str:
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            return ""
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return ""
+
+        # Emit in-place activation on the destination tile variable(s).
+        # This mirrors existing nisa.tensor_tensor codegen style and avoids
+        # allocating additional temporary tiles.
+        dst = str(a)
+        dst_tile_vars = state.device_function.get_tile_list_vars(dst)
+        if dst_tile_vars is not None:
+            for dv in dst_tile_vars:
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.activation(dst={dv}, op={op}, data={dv})"
+                    )
+                )
+        else:
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.activation(dst={dst}, op={op}, data={dst})"
+                )
+            )
+        return dst
+
     def add(self, a: object, b: object) -> str:
-        out = self._nki_tensor_tensor(a, b, "nl.add", "nki_add")
-        return out
+        return self._nki_binary_op(
+            a,
+            b,
+            op_tensor_tensor="nl.add",
+            op_tensor_scalar="nl.add",
+            allow_tensor_tensor=True,
+        )
 
     def sub(self, a: object, b: object) -> str:
-        out = self._nki_tensor_tensor(a, b, "nl.subtract", "nki_sub")
-        return out
+        # [M,N] - [M,1] broadcast: use tensor_scalar (NKI tensor_tensor fails on shape mismatch)
+        if (
+            not self._is_scalar_operand(a)
+            and not self._is_scalar_operand(b)
+            and self._subtract_tensor_tensor_supported()
+        ):
+            return self._nki_tensor_scalar(a, b, "nl.subtract")
+        return self._nki_binary_op(
+            a,
+            b,
+            op_tensor_tensor="nl.subtract",
+            op_tensor_scalar="nl.subtract",
+            allow_tensor_tensor=True,
+        )
 
     def mul(self, a: object, b: object) -> str:
-        out = self._nki_tensor_tensor(a, b, "nl.multiply", "nki_mul")
-        return out
+        return self._nki_binary_op(
+            a,
+            b,
+            op_tensor_tensor="nl.multiply",
+            op_tensor_scalar="nl.multiply",
+            allow_tensor_tensor=True,
+        )
+
+    def truediv(self, a: object, b: object) -> str:
+        a_is_scalar = self._is_scalar_operand(a)
+        b_is_scalar = self._is_scalar_operand(b)
+
+        if a_is_scalar and b_is_scalar:
+            raise exc.BackendUnsupported(
+                "nki",
+                "truediv with two host scalars is unsupported in NKI codegen",
+            )
+        if not a_is_scalar and b_is_scalar:
+            recip = self._nki_reciprocal_operand(b)
+            return self._nki_tensor_scalar(a, recip, "nl.multiply")
+        if a_is_scalar and not b_is_scalar:
+            recip = self._nki_reciprocal_operand(b)
+            return self._nki_tensor_scalar(recip, a, "nl.multiply")
+        if self._truediv_tensor_tensor_supported():
+            recip = self._nki_reciprocal_operand(b)
+            return self._nki_tensor_scalar(a, recip, "nl.multiply")
+        raise exc.BackendUnsupported(
+            "nki",
+            "truediv tensor/tensor currently supports only vector-like rhs broadcast "
+            "with shape [M, 1] over a 2D lhs tile.",
+        )
+
+    def div(self, a: object, b: object) -> str:
+        return self.truediv(a, b)
+
+    def relu(self, x: object) -> str:
+        return self._nki_activation(x, "nl.relu", "nki_relu")
+
+    def sigmoid(self, x: object) -> str:
+        return self._nki_activation(x, "nl.sigmoid", "nki_sigmoid")
+
+    def tanh(self, x: object) -> str:
+        return self._nki_activation(x, "nl.tanh", "nki_tanh")
+
+    def silu(self, x: object) -> str:
+        return self._nki_activation(x, "nl.silu", "nki_silu")
+
+    def silu_dx(self, x: object) -> str:
+        return self._nki_activation(x, "nl.silu_dx", "nki_silu_dx")
+
+    def gelu(self, x: object) -> str:
+        return self._nki_activation(x, "nl.gelu", "nki_gelu")
+
+    def gelu_dx(self, x: object) -> str:
+        return self._nki_activation(x, "nl.gelu_dx", "nki_gelu_dx")
+
+    def gelu_apprx_tanh(self, x: object) -> str:
+        return self._nki_activation(x, "nl.gelu_apprx_tanh", "nki_gelu_apprx_tanh")
+
+    def gelu_apprx_sigmoid(self, x: object) -> str:
+        return self._nki_activation(
+            x, "nl.gelu_apprx_sigmoid", "nki_gelu_apprx_sigmoid"
+        )
+
+    def gelu_apprx_sigmoid_dx(self, x: object) -> str:
+        return self._nki_activation(
+            x, "nl.gelu_apprx_sigmoid_dx", "nki_gelu_apprx_sigmoid_dx"
+        )
+
+    def softplus(self, x: object) -> str:
+        return self._nki_activation(x, "nl.softplus", "nki_softplus")
+
+    def mish(self, x: object) -> str:
+        return self._nki_activation(x, "nl.mish", "nki_mish")
+
+    def erf(self, x: object) -> str:
+        return self._nki_activation(x, "nl.erf", "nki_erf")
+
+    def exp(self, x: object) -> str:
+        return self._nki_activation(x, "nl.exp", "nki_exp")
+
+    def log(self, x: object) -> str:
+        return self._nki_activation(x, "nl.log", "nki_log")
+
+    def sin(self, x: object) -> str:
+        return self._nki_activation(x, "nl.sin", "nki_sin")
+
+    def arctan(self, x: object) -> str:
+        return self._nki_activation(x, "nl.arctan", "nki_arctan")
+
+    def sqrt(self, x: object) -> str:
+        return self._nki_activation(x, "nl.sqrt", "nki_sqrt")
+
+    def rsqrt(self, x: object) -> str:
+        return self._nki_activation(x, "nl.rsqrt", "nki_rsqrt")
+
+    def reciprocal(self, x: object) -> str:
+        return self._nki_activation(x, "nl.reciprocal", "nki_reciprocal")
+
+    def sign(self, x: object) -> str:
+        return self._nki_activation(x, "nl.sign", "nki_sign")
+
+    def abs(self, x: object) -> str:
+        return self._nki_activation(x, "nl.abs", "nki_abs")
+
+    def square(self, x: object) -> str:
+        return self._nki_activation(x, "nl.square", "nki_square")
+
+    def copy(self, x: object) -> str:
+        return self._nki_activation(x, "nl.copy", "nki_copy")
 
 
 def _validate_nki_tensor_shape(shape: tuple, name: str, env: object) -> None:
@@ -898,9 +1225,17 @@ class NKIBackend(Backend):
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
+        # Two-line pattern: (1) ndarray alloc, (2) nisa.memset(dst, value=...).
+        # Callers must emit the second line via full_memset_stmt().
+        if not shape_dims:
+            return value_expr
         shape_str = ", ".join(shape_dims)
         dtype_str = self.dtype_str(dtype)
         return f"nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+
+    def full_memset_stmt(self, var: str, value_expr: str) -> str:
+        """Return the second line for full: nisa.memset(var, value=value_expr)."""
+        return f"nisa.memset({var}, value={value_expr})"
 
     def reshape_expr(self, expr: str, shape: str) -> str:
         return f"({expr}).reshape({shape})"
@@ -944,6 +1279,8 @@ class NKIBackend(Backend):
         dim: int,
         *,
         block_size_var: str | None = None,
+        fake_input: torch.Tensor | None = None,
+        fake_output: torch.Tensor | None = None,
     ) -> str:
         state = self._nki_codegen_state()
         if state is not None:
@@ -956,7 +1293,7 @@ class NKIBackend(Backend):
                 )
             _NKI_REDUCTION_OPS = {
                 "sum": "nl.add",
-                "max": "nl.max",
+                "max": "nl.maximum",  # nl.max not supported by tensor_reduce tracer
                 "min": "nl.min",
                 "prod": "nl.mul",
             }
@@ -965,15 +1302,26 @@ class NKIBackend(Backend):
                 raise exc.BackendUnsupported(
                     self.name, f"reduction {reduction_type!r} not mapped to NKI op"
                 )
-            # NKI tensor_reduce requires a concrete dst buffer; nl.zeros(()) is invalid.
-            # Use a single sbuf [1, 1] and keepdims=False (same as helion_reduce_return_kernel).
-            dtype_str = "nl.float32"  # accumulator type for reduction
+            # NKI tensor_reduce requires dst partition dim to match input. For reduce over dim 1
+            # on [P, F], output is [P, 1] with keepdims=True. Use block_sizes[0] (partition dim).
+            from .compile_environment import CompileEnvironment
+
+            env = CompileEnvironment.current()
+            if dim == 1 and len(env.block_sizes) >= 1 and state.config is not None:
+                part_size = int(env.block_sizes[0].from_config_assert(state.config))
+                dst_shape = f"[{part_size}, 1]"
+            elif fake_input is not None:
+                part_size = int(fake_input.size(0))
+                dst_shape = f"[{part_size}, 1]"
+            else:
+                dst_shape = "[1, 1]"  # fallback for scalar-like reduction
+            dtype_str = "nl.float32"
             result_var = state.device_function.new_var("nki_reduce", dce=True)
             state.add_statement(
-                f"{result_var} = nl.ndarray([1, 1], {dtype_str}, buffer=nl.sbuf)"
+                f"{result_var} = nl.ndarray({dst_shape}, {dtype_str}, buffer=nl.sbuf)"
             )
             state.add_statement(
-                f"nisa.tensor_reduce(dst={result_var}, op={op}, data={input_name}, axis={dim}, keepdims=False)"
+                f"nisa.tensor_reduce(dst={result_var}, op={op}, data={input_name}, axis={dim}, keepdims=True)"
             )
             return result_var
         raise exc.BackendUnsupported(

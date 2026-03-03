@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from ..exc import NotInsideKernel
 from . import _decorators
@@ -133,6 +134,23 @@ def _full_codegen(state: CodegenState) -> ast.AST:
     assert isinstance(fake_value, torch.Tensor)
     shape_dims = state.device_function.tile_strategy.shape_dims(fake_value.size())
     backend = CompileEnvironment.current().backend
+
+    # NKI two-line pattern: ndarray then nisa.memset(dst, value=...)
+    nki_memset = getattr(backend, "full_memset_stmt", None)
+    if nki_memset is not None and shape_dims:
+        var = state.device_function.new_var("_nki_full", dce=True)
+        ndarray_expr = backend.full_expr(shape_dims, "0", fake_value.dtype)
+        state.add_statement(statement_from_string(f"{var} = {ndarray_expr}"))
+        proxy_value = state.proxy_arg(1)
+        if isinstance(proxy_value, (int, float, bool)):
+            value_str = state.device_function.literal_expr(proxy_value)
+            state.add_statement(statement_from_string(nki_memset(var, value_str)))
+        else:
+            value_ast = state.ast_arg(1)
+            state.add_statement(
+                statement_from_string(nki_memset(var, "{val}"), val=value_ast)
+            )
+        return expr_from_string(var)
 
     # Check if the value is static (literal) or dynamic (node)
     proxy_value = state.proxy_arg(1)

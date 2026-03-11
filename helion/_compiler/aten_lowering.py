@@ -729,13 +729,14 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     K_tile = _to_int(lhs_shape[1])
     N_tile = _to_int(rhs_shape[-1])
 
-    assert M_tile % TILE_M == 0, f"M_tile={M_tile} must be a multiple of {TILE_M}"
-    assert K_tile % TILE_K == 0, f"K_tile={K_tile} must be a multiple of {TILE_K}"
+    if M_tile % TILE_M != 0:
+        raise exc.BackendUnsupported(f"NKI backend requires M_tile to be a multiple of {TILE_M}, got {M_tile}")
+    if K_tile % TILE_K != 0:
+        raise exc.BackendUnsupported(f"NKI backend requires K_tile to be a multiple of {TILE_K}, got {K_tile}")
+    
     N_sub = min(TILE_N, N_tile)
-    if N_tile > TILE_N:
-        assert N_tile % TILE_N == 0, (
-            f"N_tile={N_tile} must be <= {TILE_N} or a multiple of {TILE_N}"
-        )
+    if N_tile > TILE_N and N_tile % TILE_N != 0:
+        raise exc.BackendUnsupported(f"NKI backend requires N_tile to be <= {TILE_N} or a multiple of {TILE_N}, got {N_tile}")
 
     n_sub_m = M_tile // TILE_M
     n_sub_k = K_tile // TILE_K

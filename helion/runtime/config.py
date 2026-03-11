@@ -18,10 +18,12 @@ MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
 class Config(Mapping[str, object]):
     config: dict[str, object]
+    platform_target: str | None
 
     def __init__(
         self,
         *,
+        platform_target: str | None = None,
         # Core properties
         block_sizes: list[int] | None = None,
         elements_per_thread: list[int] | int | None = None,
@@ -78,6 +80,8 @@ class Config(Mapping[str, object]):
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
             **kwargs: Additional user-defined configuration parameters.
         """
+        self.platform_target = platform_target
+
         self.config = {}
         core_props = {
             "block_sizes": block_sizes,

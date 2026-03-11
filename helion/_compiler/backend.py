@@ -1184,7 +1184,6 @@ class NKIBackend(Backend):
             "nl": "import nki.language as nl",
             "nisa": "import nki.isa as nisa",
             "_default_nki_launcher": "from helion.runtime import default_nki_launcher as _default_nki_launcher",
-            "_get_neuron_target": "from helion.runtime.settings import get_neuron_target as _get_neuron_target",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:

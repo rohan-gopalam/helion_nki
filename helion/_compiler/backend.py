@@ -1145,7 +1145,25 @@ class NKIBackend(Backend):
 
     @property
     def function_decorator(self) -> str:
-        return "nki.jit"
+        from .compile_environment import CompileEnvironment
+        from helion.runtime.settings import get_neuron_target
+        
+        # Grab the active compilation environment
+        env = CompileEnvironment.current()
+        
+        # Extract the config (falling back safely if it's nested in state)
+        config = getattr(env, "config", None)
+        if config is None:
+            state = getattr(env, "_codegen_state", None)
+            config = getattr(state, "config", None) if state else None
+            
+        config_target = getattr(config, "platform_target", None)
+        
+        # Resolve the actual hardware target string
+        resolved_target = get_neuron_target(config_target)
+        
+        # Bake the hardware target into the generated AST
+        return f'nki.jit(platform_target="{resolved_target}")'
 
     @property
     def constexpr_type(self) -> str:
@@ -1166,6 +1184,7 @@ class NKIBackend(Backend):
             "nl": "import nki.language as nl",
             "nisa": "import nki.isa as nisa",
             "_default_nki_launcher": "from helion.runtime import default_nki_launcher as _default_nki_launcher",
+            "_get_neuron_target": "from helion.runtime.settings import get_neuron_target as _get_neuron_target",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:

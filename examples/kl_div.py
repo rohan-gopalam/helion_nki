@@ -50,7 +50,12 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128]),
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
 def kl_div_forward(
     y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
     y_true: Tensor,  # target values, shape (BT, V)

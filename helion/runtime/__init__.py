@@ -134,9 +134,36 @@ def default_nki_launcher(
     *args: object,
     **kwargs: object,
 ) -> object:
-    """Stub launcher for NKI kernels (Trainium). Raise until implemented."""
-    raise NotImplementedError(
-        "default_nki_launcher is not implemented; NKI kernel execution requires Trainium runtime."
+    """Default launcher for NKI kernels on Trainium/XLA."""
+    from torch.utils._pytree import tree_map
+
+    try:
+        from torch_xla.core import xla_model as xm
+    except Exception as err:  # pragma: no cover
+        raise NotImplementedError(
+            "default_nki_launcher requires torch_xla to execute NKI kernels."
+        ) from err
+
+    first_tensor_device: torch.device | None = None
+    moved_args: list[object] = []
+    xla_device = xm.xla_device()
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            if first_tensor_device is None:
+                first_tensor_device = arg.device
+            moved_args.append(arg.to(xla_device))
+        else:
+            moved_args.append(arg)
+
+    # pyrefly: ignore [operator]
+    result = nki_kernel[grid](*moved_args, **kwargs)
+    xm.mark_step()
+
+    if first_tensor_device is None:
+        return result
+    return tree_map(
+        lambda x: x.to(first_tensor_device) if isinstance(x, torch.Tensor) else x,
+        result,
     )
 
 

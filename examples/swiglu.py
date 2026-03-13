@@ -45,7 +45,11 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[2048]),
+)
 def swiglu_fwd(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
@@ -95,7 +99,11 @@ def swiglu_fwd(a: Tensor, b: Tensor) -> Tensor:
     return out
 
 
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[2048]),
+)
 def swiglu_bwd(gout: Tensor, x1: Tensor, x2: Tensor) -> tuple[Tensor, Tensor]:
     """
     Implement the backward formula for swiglu.
@@ -353,8 +361,9 @@ def main() -> None:
     """
     print("Testing SwiGLU kernel...")
 
-    # Test SwiGLU kernel with different shapes
-    kernel_test_shapes = [(4, 8192, 4096), (8, 8192, 4096)]
+    # Test SwiGLU kernel with smaller shapes for faster NKI compile
+    # Original: [(4, 8192, 4096), (8, 8192, 4096)]
+    kernel_test_shapes = [(2, 2048, 1024)]
 
     for shape in kernel_test_shapes:
         print(f"Testing SwiGLU kernel shape: {shape}")
@@ -363,10 +372,10 @@ def main() -> None:
 
     print("\nTesting SwiGLU MLP...")
 
-    # Test SwiGLU MLP with transformer-typical sizes
+    # Test SwiGLU MLP with smaller config for faster NKI compile
+    # Original: [(4, 8192, 4096, 11008), (8, 8192, 4096, 11008)]
     mlp_test_configs = [
-        (4, 8192, 4096, 11008),
-        (8, 8192, 4096, 11008),
+        (2, 2048, 1024, 2048),
     ]
 
     for batch_size, seq_len, hidden_size, intermediate_size in mlp_test_configs:

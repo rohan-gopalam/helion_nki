@@ -31,7 +31,13 @@ import helion.language as hl
 # %%
 # Flex Attention Kernel Implementation
 # ----------------------------
-@helion.kernel(autotune_accuracy_check=False, static_shapes=True)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(),
+    autotune_accuracy_check=False,
+    static_shapes=True,
+)
 def helion_flex_attention_kernel(
     query: torch.Tensor,
     key: torch.Tensor,

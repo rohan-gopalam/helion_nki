@@ -724,7 +724,7 @@ class ReductionLowering(InductorLowering):
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         # reduction types that preserve zeroness
-        if self.reduction_type in {"sum", "prod", "min", "max"}:
+        if self.reduction_type in {"sum", "prod", "min", "max", "mean"}:
             value = inductor_masked_value(self, node)
             if value == 0:
                 return value
@@ -959,6 +959,11 @@ class GenerateASTFromInductor(DefaultHandler):
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
+        backend = CompileEnvironment.current().backend
+        if backend.codegen_name == "nki" and src_dtype is not None and src_dtype != dtype:
+            return self._lift(backend.cast_ast(
+                self._to_ast(x), dtype, src_dtype=src_dtype
+            ))
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 

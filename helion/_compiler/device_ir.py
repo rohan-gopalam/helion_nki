@@ -87,6 +87,11 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
     decomp_table.pop(torch.ops.aten.stack.default, None)
+    # Keep SiLU as a first-class op for NKI so it lowers via NKIOpOverrides.silu.
+    # The default decomposition (x * sigmoid(x)) can alias operands and break
+    # statement-based in-place NKI codegen for SwiGLU-like patterns.
+    if CompileEnvironment.current().backend_name == "nki":
+        decomp_table.pop(torch.ops.aten.silu.default, None)
     return decomp_table
 
 
@@ -186,7 +191,7 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
         ),
     ):
         current_location().set_fx_location()
-        return proxy_tensor.make_fx(fn, decomposition_table=select_decomp_table())(
+        return proxy_tensor.make_fx(fn, decomposition_table=_get_custom_decomp_table())(
             *args
         ).graph
 

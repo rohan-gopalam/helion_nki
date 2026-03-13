@@ -27,7 +27,12 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[16, 128, 128, 128]),
+    static_shapes=True,
+)
 def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
     Performs batch matrix multiplication.
@@ -45,8 +50,9 @@ def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     out = torch.empty(
         [b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype)
     )
+    acc_dtype = torch.promote_types(A.dtype, B.dtype)
     for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
-        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=acc_dtype)
         for tile_k in hl.tile(k):
             acc = torch.baddbmm(
                 acc, A[tile_b, tile_m, tile_k], B[tile_b, tile_k, tile_n]

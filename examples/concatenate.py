@@ -25,7 +25,11 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128]),
+)
 def concat2d_dim1(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     Concatenates two 2D tensors along dimension 1 (columns).

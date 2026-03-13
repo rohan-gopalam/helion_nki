@@ -202,7 +202,25 @@ def codegen_full_nki(ctx: LoweringContext, node: Node) -> ast.AST:
     dtype_str = env.backend.dtype_str(dtype)
     var = ctx.cg.device_function.new_var("_nki_full", dce=True)
 
-    if partition_dim > NKI_PARTITION_MAX:
+    if partition_dim > NKI_PARTITION_MAX and not free_dims:
+        # 1D tensor (e.g. grad_w_acc[DIM]): in NKI semantics this represents a
+        # feature-dimension accumulator. Allocate as [1, DIM] (partition=1, free=DIM)
+        # so that it can be stored to [block_id:block_id+1, 0:DIM] in HBM.
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"{var} = nl.ndarray([1, {partition_dim}], {dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"nisa.memset({var}, value={{val}})", val=value_ast
+            )
+        )
+        # Register shape so cast_ast and other ops know the SBUF shape
+        ctx.cg.device_function._nki_sbuf_shapes[var] = [1, partition_dim]
+        # Mark as a free-dim accumulator (not a partition-split tile list)
+        ctx.cg.device_function._nki_free_dim_tile_lists.add(var)
+    elif partition_dim > NKI_PARTITION_MAX:
         n_partitions = partition_dim // NKI_PARTITION_MAX
         assert partition_dim % NKI_PARTITION_MAX == 0, (
             f"partition dim {partition_dim} must be multiple of {NKI_PARTITION_MAX}"
@@ -234,6 +252,16 @@ def codegen_full_nki(ctx: LoweringContext, node: Node) -> ast.AST:
                 f"nisa.memset({var}, value={{val}})", val=value_ast
             )
         )
+        # Register SBUF shape for multi-user detection on copy vars
+        # full_expr may have added a trailing 1 for 1D shapes internally
+        try:
+            resolved = [int(d) for d in shape_dims]
+            if len(resolved) == 1:
+                resolved.append(1)
+            if len(resolved) >= 2:
+                ctx.cg.device_function._nki_sbuf_shapes[var] = resolved
+        except (TypeError, ValueError):
+            pass
     return expr_from_string(var)
 
 
@@ -265,6 +293,16 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
 @unsqueeze_lowering.register_codegen("cute")
 def codegen_unsqueeze_cute(ctx: LoweringContext, node: Node) -> object:
     # Cute lowers one element per thread, so unsqueeze is representational only.
+    assert not node.kwargs, "unsqueeze kwargs not supported"
+    tensor = _env_arg(ctx, cast("Node", node.args[0]))
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
+@unsqueeze_lowering.register_codegen("nki")
+def codegen_unsqueeze_nki(ctx: LoweringContext, node: Node) -> object:
+    # NKI tensors are already 2D (partition, free) and broadcast automatically.
+    # unsqueeze is a no-op.
     assert not node.kwargs, "unsqueeze kwargs not supported"
     tensor = _env_arg(ctx, cast("Node", node.args[0]))
     assert isinstance(tensor, ast.AST)
@@ -486,6 +524,23 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
         f"jnp.broadcast_to({{tensor}}, {shape_str})",
         tensor=tensor,
     )
+
+
+silu_lowering = register_lowering(
+    torch.ops.aten.silu.default,
+    masked_value_fn=passthrough_masked_value,
+)
+
+
+@silu_lowering.register_codegen("nki")
+def codegen_silu_nki(ctx: LoweringContext, node: Node) -> object:
+    """Lower aten.silu directly to the NKI activation override."""
+    assert not node.kwargs, "silu kwargs not supported"
+    x = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(x, ast.AST)
+    x_name = ast.unparse(x)
+    result_name = CompileEnvironment.current().backend.inductor_op_overrides().silu(x_name)
+    return expr_from_string(result_name)
 
 
 def apply_dot_requirements(lowering: AtenLowering, node: Node) -> Lowering:
@@ -729,6 +784,16 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     K_tile = _to_int(lhs_shape[1])
     N_tile = _to_int(rhs_shape[-1])
 
+    # Determine input dtype for nc_matmul — both operands must match.
+    # nc_transpose always produces fp32 (via PSUM), so we may need to
+    # cast back to the input dtype before nc_matmul.
+    lhs_dtype = lhs_node.meta["val"].dtype
+    rhs_dtype = rhs_node.meta["val"].dtype
+    # nc_matmul requires matching non-32-bit types on trn1
+    matmul_dtype = rhs_dtype  # moving operand dtype
+    need_cast_after_transpose = (matmul_dtype != torch.float32)
+    matmul_dtype_str = env.backend.dtype_str(matmul_dtype)
+
     assert M_tile % TILE_M == 0, f"M_tile={M_tile} must be a multiple of {TILE_M}"
     assert K_tile % TILE_K == 0, f"K_tile={K_tile} must be a multiple of {TILE_K}"
     N_sub = min(TILE_N, N_tile)
@@ -773,7 +838,45 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     sub_k_var = state.device_function.new_var("_sub_k")
     lhs_t_psum = state.device_function.new_var("_lhs_t_psum")
     lhs_t_sbuf = state.device_function.new_var("_lhs_t_sbuf")
+    lhs_t_cast = state.device_function.new_var("_lhs_t_cast") if need_cast_after_transpose else None
     mm_psum = state.device_function.new_var("_mm_psum")
+
+    def _transpose_stmts(lhs_slice: str) -> list[ast.AST]:
+        """Generate transpose + optional cast statements for one LHS sub-tile.
+        Returns statements that leave the transposed data in lhs_t_sbuf (or
+        lhs_t_cast if a dtype cast is needed for nc_matmul compatibility).
+        The final variable name to use as stationary is _stationary_var."""
+        stmts = [
+            statement_from_string(
+                f"{lhs_t_psum} = nl.ndarray([{TILE_K}, {TILE_M}], nl.float32, buffer=nl.psum)"
+            ),
+            statement_from_string(
+                f"nisa.nc_transpose(dst={lhs_t_psum}, data={lhs_slice})"
+            ),
+            statement_from_string(
+                f"{lhs_t_sbuf} = nl.ndarray([{TILE_K}, {TILE_M}], nl.float32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
+            ),
+        ]
+        if need_cast_after_transpose:
+            # Cast fp32 transposed result back to input dtype for nc_matmul
+            stmts.extend([
+                statement_from_string(
+                    f"{lhs_t_cast} = nl.ndarray([{TILE_K}, {TILE_M}], {matmul_dtype_str}, buffer=nl.sbuf)"
+                ),
+                statement_from_string(
+                    f"nisa.memset({lhs_t_cast}, value=0)"
+                ),
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={lhs_t_cast}, data1={lhs_t_cast}, data2={lhs_t_sbuf}, op=nl.add)"
+                ),
+            ])
+        return stmts
+
+    # The variable name to use as the stationary operand for nc_matmul
+    _stationary_var = lhs_t_cast if need_cast_after_transpose else lhs_t_sbuf
 
     def _lhs_ref(m_i: int) -> str:
         """Get the concrete SBUF tile name for LHS partition index m_i."""
@@ -831,26 +934,14 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
 
     def _make_k_body_for_m(m_i: int, n_expr: str, k_expr: str) -> list[ast.AST]:
         """Statements for one K-sub-tile within one M-stripe."""
-        return [
+        stmts = _transpose_stmts(_lhs_k_slice(m_i, k_expr))
+        stmts.append(
             statement_from_string(
-                f"{lhs_t_psum} = nl.ndarray([{TILE_K}, {TILE_M}], nl.float32, buffer=nl.psum)"
-            ),
-            statement_from_string(
-                f"nisa.nc_transpose(dst={lhs_t_psum}, "
-                f"data={_lhs_k_slice(m_i, k_expr)})"
-            ),
-            statement_from_string(
-                f"{lhs_t_sbuf} = nl.ndarray([{TILE_K}, {TILE_M}], nl.float32, buffer=nl.sbuf)"
-            ),
-            statement_from_string(
-                f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
-            ),
-            statement_from_string(
-                f"nisa.nc_matmul(dst={mm_psum}, stationary={lhs_t_sbuf}, "
+                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
                 f"moving={_rhs_ref(0, n_expr) if not rhs_is_list else _rhs_ref(0, n_expr)})"
-                # k_expr is the loop var; for rhs, we use it as index below
             ),
-        ]
+        )
+        return stmts
 
     def _make_k_body_rhs_loop(m_i: int, n_expr: str, k_expr: str) -> list[ast.AST]:
         """Statements for one K-sub-tile, with rhs indexed by k_expr (affine loop var)."""
@@ -868,25 +959,14 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
                 f"{rhs_name}[{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}, "
                 f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
             )
-        return [
+        stmts = _transpose_stmts(_lhs_k_slice(m_i, k_expr))
+        stmts.append(
             statement_from_string(
-                f"{lhs_t_psum} = nl.ndarray([{TILE_K}, {TILE_M}], nl.float32, buffer=nl.psum)"
-            ),
-            statement_from_string(
-                f"nisa.nc_transpose(dst={lhs_t_psum}, "
-                f"data={_lhs_k_slice(m_i, k_expr)})"
-            ),
-            statement_from_string(
-                f"{lhs_t_sbuf} = nl.ndarray([{TILE_K}, {TILE_M}], nl.float32, buffer=nl.sbuf)"
-            ),
-            statement_from_string(
-                f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
-            ),
-            statement_from_string(
-                f"nisa.nc_matmul(dst={mm_psum}, stationary={lhs_t_sbuf}, "
+                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
                 f"moving={rhs_ref})"
             ),
-        ]
+        )
+        return stmts
 
     def _emit_one_m_stripe(m_i: int, n_expr: str) -> None:
         """Emit all statements for a single M-stripe (fully unrolled, no sub_m loop)."""
@@ -907,63 +987,29 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
                     )
                 else:
                     rhs_ref = rhs_tile_vars[k_i]
+                for s in _transpose_stmts(_lhs_k_slice(m_i, str(k_i))):
+                    state.add_statement(s)
                 state.add_statement(
                     statement_from_string(
-                        f"{lhs_t_psum} = nl.ndarray([{TILE_K}, {TILE_M}], "
-                        f"nl.float32, buffer=nl.psum)"
-                    )
-                )
-                state.add_statement(
-                    statement_from_string(
-                        f"nisa.nc_transpose(dst={lhs_t_psum}, "
-                        f"data={_lhs_k_slice(m_i, str(k_i))})"
-                    )
-                )
-                state.add_statement(
-                    statement_from_string(
-                        f"{lhs_t_sbuf} = nl.ndarray([{TILE_K}, {TILE_M}], "
-                        f"nl.float32, buffer=nl.sbuf)"
-                    )
-                )
-                state.add_statement(
-                    statement_from_string(
-                        f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
-                    )
-                )
-                state.add_statement(
-                    statement_from_string(
-                        f"nisa.nc_matmul(dst={mm_psum}, stationary={lhs_t_sbuf}, "
+                        f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
                         f"moving={rhs_ref})"
                     )
                 )
         elif n_sub_k > 1:
             # rhs is not a list; use affine_range for K loop
+            k_body = _transpose_stmts(_lhs_k_slice(m_i, sub_k_var))
+            k_body.append(
+                statement_from_string(
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                    f"moving={_rhs_ref(0, n_expr)})"
+                ),
+            )
             state.add_statement(
                 create(
                     ast.For,
                     target=create(ast.Name, id=sub_k_var, ctx=ast.Store()),
                     iter=expr_from_string(f"nl.affine_range({n_sub_k})"),
-                    body=[
-                        statement_from_string(
-                            f"{lhs_t_psum} = nl.ndarray([{TILE_K}, {TILE_M}], "
-                            f"nl.float32, buffer=nl.psum)"
-                        ),
-                        statement_from_string(
-                            f"nisa.nc_transpose(dst={lhs_t_psum}, "
-                            f"data={_lhs_k_slice(m_i, sub_k_var)})"
-                        ),
-                        statement_from_string(
-                            f"{lhs_t_sbuf} = nl.ndarray([{TILE_K}, {TILE_M}], "
-                            f"nl.float32, buffer=nl.sbuf)"
-                        ),
-                        statement_from_string(
-                            f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
-                        ),
-                        statement_from_string(
-                            f"nisa.nc_matmul(dst={mm_psum}, stationary={lhs_t_sbuf}, "
-                            f"moving={_rhs_ref(0, n_expr)})"
-                        ),
-                    ],
+                    body=k_body,
                     orelse=[],
                 )
             )
@@ -974,32 +1020,11 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
                 f"{rhs_tile_vars[0]}[0:{TILE_K}, "  # type: ignore[index]
                 f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
             )
+            for s in _transpose_stmts(_lhs_k_slice(m_i, '0')):
+                state.add_statement(s)
             state.add_statement(
                 statement_from_string(
-                    f"{lhs_t_psum} = nl.ndarray([{TILE_K}, {TILE_M}], "
-                    f"nl.float32, buffer=nl.psum)"
-                )
-            )
-            state.add_statement(
-                statement_from_string(
-                    f"nisa.nc_transpose(dst={lhs_t_psum}, "
-                    f"data={_lhs_k_slice(m_i, '0')})"
-                )
-            )
-            state.add_statement(
-                statement_from_string(
-                    f"{lhs_t_sbuf} = nl.ndarray([{TILE_K}, {TILE_M}], "
-                    f"nl.float32, buffer=nl.sbuf)"
-                )
-            )
-            state.add_statement(
-                statement_from_string(
-                    f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
-                )
-            )
-            state.add_statement(
-                statement_from_string(
-                    f"nisa.nc_matmul(dst={mm_psum}, stationary={lhs_t_sbuf}, "
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
                     f"moving={rhs_ref_0})"
                 )
             )
@@ -1093,6 +1118,39 @@ def codegen_mm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
 
 @addmm_lowering.register_codegen("nki")
 def codegen_addmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, True)
+
+
+@bmm_lowering.register_codegen("nki")
+def codegen_bmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    lhs_val = node.args[0].meta["val"]
+    rhs_val = node.args[1].meta["val"]
+    if isinstance(lhs_val, torch.Tensor) and isinstance(rhs_val, torch.Tensor):
+        if lhs_val.ndim != 2 or rhs_val.ndim != 2:
+            raise exc.BackendUnsupported(
+                "nki",
+                "bmm lowering currently supports only 2D sliced operands. "
+                "Tile over batch so each iteration passes [M,K] and [K,N].",
+            )
+    return _nki_dot(ctx, node, False)
+
+
+@baddbmm_lowering.register_codegen("nki")
+def codegen_baddbmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    acc_val = node.args[0].meta["val"]
+    lhs_val = node.args[1].meta["val"]
+    rhs_val = node.args[2].meta["val"]
+    if (
+        isinstance(acc_val, torch.Tensor)
+        and isinstance(lhs_val, torch.Tensor)
+        and isinstance(rhs_val, torch.Tensor)
+        and (acc_val.ndim != 2 or lhs_val.ndim != 2 or rhs_val.ndim != 2)
+    ):
+        raise exc.BackendUnsupported(
+            "nki",
+            "baddbmm lowering currently supports only 2D sliced operands. "
+            "Tile over batch so each iteration passes [M,N], [M,K], [K,N].",
+        )
     return _nki_dot(ctx, node, True)
 
 

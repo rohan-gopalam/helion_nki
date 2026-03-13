@@ -20,15 +20,17 @@ from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
-# Override default config to work around Triton tl.dot requirement:
-# `AssertionError: Input shapes should have M >= 16, N >= 16 and K >= 32`
-config = None
-if os.environ.get("HELION_AUTOTUNE_EFFORT") == "none":
-    config = helion.Config(block_sizes=[32, 32, 32])
+# Fixed config for explicit no-autotune runs.
+config = helion.Config(block_sizes=[32, 32, 32])
 
 
 # %%
-@helion.kernel(static_shapes=True, config=config)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    static_shapes=True,
+    config=config,
+)
 def fp8_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """
     FP8 General Matrix Multiplication (GEMM).

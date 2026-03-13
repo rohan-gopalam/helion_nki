@@ -23,7 +23,11 @@ import helion.language as hl
 # %%
 # Helion Kernel Implementation
 # ----------------------------
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+)
 def helion_mamba2_chunk_scan_kernel(
     cb: torch.Tensor,
     x: torch.Tensor,

@@ -21,7 +21,13 @@ from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 
 
-@helion.kernel(static_shapes=True, dot_precision="ieee")
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128, 128, 128]),
+    static_shapes=True,
+    dot_precision="ieee",
+)
 def split_k_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
     Two-stage split-K matmul using hl.barrier().  The barrier approach

@@ -42,7 +42,11 @@ omitted from storage.
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+)
 def jagged_dense_add_2d(
     x_data: torch.Tensor, x_offsets: torch.Tensor, y: torch.Tensor
 ) -> torch.Tensor:

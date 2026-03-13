@@ -838,10 +838,15 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
     reduction_loop: int
 
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int | None:
+        env = CompileEnvironment.current()
         if (
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
+            # NKI reduction DMA paths require source/destination extents to match.
+            # Avoid power-of-2 expansion for implicit reduction loop tile sizes.
+            if env.backend_name == "nki":
+                return max(1, block_size_info.size_hint())
             return max(1, next_power_of_2(block_size_info.size_hint()))
         return config.reduction_loops[self.reduction_loop]
 

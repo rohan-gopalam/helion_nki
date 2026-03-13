@@ -31,7 +31,12 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+    static_shapes=True,
+)
 def broadcast_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """
     Batch matrix multiplication with broadcasting.
@@ -51,8 +56,11 @@ def broadcast_matmul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     out_2d = torch.empty(
         [b * m, n], device=x.device, dtype=torch.promote_types(x.dtype, w.dtype)
     )
+    # Use same dtype as inputs for accumulator - Neuron matmul does not support
+    # mixing float16 inputs with float32 accumulator.
+    acc_dtype = torch.promote_types(x.dtype, w.dtype)
     for tile_bm, tile_n in hl.tile([b * m, n]):
-        acc = hl.zeros([tile_bm, tile_n], dtype=torch.float32)
+        acc = hl.zeros([tile_bm, tile_n], dtype=acc_dtype)
         for tile_k in hl.tile(k):
             acc = torch.addmm(acc, x_2d[tile_bm, tile_k], w[tile_k, tile_n])
         out_2d[tile_bm, tile_n] = acc

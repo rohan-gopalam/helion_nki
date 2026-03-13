@@ -62,7 +62,6 @@ def _resolve_warning_name(name: str) -> type[exc.BaseWarning]:
         )
     return warning_cls
 
-
 def _get_ignore_warnings() -> list[type[exc.BaseWarning]]:
     value = os.environ.get("HELION_IGNORE_WARNINGS")
     if not value:

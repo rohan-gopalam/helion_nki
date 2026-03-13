@@ -35,7 +35,11 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128]),
+)
 def batch_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Batched softmax with arithmetic broadcasting.

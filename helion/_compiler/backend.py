@@ -655,6 +655,111 @@ class NKIOpOverrides:
         dst_tile_vars = state.device_function.get_tile_list_vars(dst)
         b_tile_vars = state.device_function.get_tile_list_vars(str(b))
 
+        # If the first operand's buffer must be preserved, writing the result
+        # back into 'a' in-place would corrupt future reads of 'a'.
+        # Detect two cases and allocate a fresh output buffer instead:
+        #
+        # 1. The first operand FX node has multiple users in the current graph
+        #    (the value is needed again later in this iteration).
+        #
+        # 2. The destination variable name is a second-level Helion copy var
+        #    (e.g. "_nki_cast_copy_0"): these are outer-loop read-only captures
+        #    that alias the outer-scope SBUF buffer. In-place writes would corrupt
+        #    the buffer for subsequent loop iterations. (First-level "_copy" vars
+        #    like "_nki_full_copy" are accumulators and should remain in-place.)
+        from torch._inductor.virtualized import V
+
+        cur_node = V.current_node
+        _is_second_level_copy = "_copy_" in dst and dst[-1:].isdigit()
+        # (debug removed)
+        a_node_has_other_users = _is_second_level_copy or (
+            cur_node is not None
+            and len(cur_node.args) >= 1
+            and hasattr(cur_node.args[0], "users")
+            and len(cur_node.args[0].users) > 1
+        )
+        if a_node_has_other_users:
+            shape_list = getattr(state.device_function, "_nki_sbuf_shapes", {}).get(dst)
+            out_val = cur_node.meta.get("val") if cur_node else None
+            # Fallback: derive shape from the output fake tensor with config substitution
+            # ONLY for second-level copy vars (outer-scope loop captures like _nki_cast_copy_0).
+            # Do NOT use this fallback for the general users>1 path: when V.current_node is the
+            # surrounding reduction node its output shape is the reduced shape (e.g. [1]), not the
+            # accumulator shape ([1, 4096]), and allocating a buffer with the wrong shape breaks NKI.
+            # When V.current_node is None (NKI codegen path), derive shape
+            # from the source variable's registered SBUF shape.
+            # Copy vars (e.g. _nki_full_copy_0) aren't registered, but
+            # we can strip suffixes to find the original var.
+            if shape_list is None and _is_second_level_copy:
+                # Try direct lookup first
+                _lookup_name = dst
+                _sbuf_shapes = state.device_function._nki_sbuf_shapes
+                # Strip copy suffixes: _nki_full_copy_0 → _nki_full_copy → _nki_full
+                while _lookup_name not in _sbuf_shapes and "_copy" in _lookup_name:
+                    idx = _lookup_name.rfind("_copy")
+                    _lookup_name = _lookup_name[:idx]
+                src_shape = _sbuf_shapes.get(_lookup_name)
+                if src_shape is not None and len(src_shape) >= 2:
+                    shape_list = list(src_shape)
+                    if out_val is None:
+                        out_val = torch.empty(1)  # just needs to be non-None and a Tensor
+            if shape_list is None and _is_second_level_copy and out_val is not None and isinstance(out_val, torch.Tensor):
+                from .compile_environment import CompileEnvironment as _CE
+
+                _env2 = _CE.current()
+                _state2 = getattr(_env2, "_codegen_state", None)
+                if _state2 is not None and _state2.config is not None:
+                    import sympy as _sp2
+
+                    _subs2: dict[_sp2.Symbol, int] = {}
+                    for _bs2 in _env2.block_sizes:
+                        _c2 = _bs2.from_config(_state2.config)
+                        if isinstance(_c2, int):
+                            _subs2[_bs2.symbol()] = _c2
+                    _resolved2 = []
+                    for _d2 in out_val.shape:
+                        if isinstance(_d2, torch.SymInt):
+                            try:
+                                _resolved2.append(int(_d2._sympy_().subs(_subs2)))
+                            except (TypeError, ValueError):
+                                _resolved2.append(int(_env2.size_hint(_d2)))
+                        else:
+                            _resolved2.append(int(_d2))
+                    if len(_resolved2) >= 2:  # only use if 2-D (NKI requirement)
+                        shape_list = _resolved2
+            if shape_list is not None and out_val is not None and isinstance(out_val, torch.Tensor):
+                # Derive dtype: prefer FX node output, fallback to float32
+                if hasattr(out_val, 'dtype') and out_val.numel() > 1:
+                    dtype_str = env.backend.dtype_str(out_val.dtype)
+                elif cur_node is not None and isinstance(cur_node.meta.get("val"), torch.Tensor):
+                    dtype_str = env.backend.dtype_str(cur_node.meta["val"].dtype)
+                else:
+                    dtype_str = "nl.float32"
+                shape_str = ", ".join(str(d) for d in shape_list)
+                new_dst = state.device_function.new_var(prefix, dce=True)
+                # Register the new variable's SBUF shape for downstream cast_ast
+                state.device_function._nki_sbuf_shapes[new_dst] = list(shape_list)
+                state.add_statement(
+                    statement_from_string(
+                        f"{new_dst} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+                    )
+                )
+                if b_tile_vars is not None:
+                    # tile-list variant: emit per-tile ops into new_dst
+                    for i, bv in enumerate(b_tile_vars):
+                        state.add_statement(
+                            statement_from_string(
+                                f"nisa.tensor_tensor(dst={new_dst}, data1={a}, data2={bv}, op={op})"
+                            )
+                        )
+                else:
+                    state.add_statement(
+                        statement_from_string(
+                            f"nisa.tensor_tensor(dst={new_dst}, data1={a}, data2={b}, op={op})"
+                        )
+                    )
+                return new_dst
+
         if dst_tile_vars is not None:
             for i, dv in enumerate(dst_tile_vars):
                 bv = b_tile_vars[i] if b_tile_vars else str(b)
@@ -669,9 +774,34 @@ class NKIOpOverrides:
             )
         return dst
 
-    @staticmethod
-    def _is_scalar_operand(x: object) -> bool:
-        return isinstance(x, (int, float, bool))
+    @classmethod
+    def _resolve_scalar_operand(cls, x: object) -> object:
+        """Resolve operand to scalar value if it's a const or var holding const."""
+        if isinstance(x, (int, float, bool)):
+            return x
+        if isinstance(x, str):
+            try:
+                float(x)
+                return x  # numeric string like "1.0"
+            except (ValueError, TypeError):
+                pass
+            # Var holding constant (e.g. v_0 = 1.0 from lift)?
+            from .compile_environment import CompileEnvironment
+
+            env = CompileEnvironment.current()
+            state = getattr(env, "_codegen_state", None)
+            if state is not None and hasattr(state, "codegen"):
+                cg = state.codegen
+                if hasattr(cg, "get_var_constant_value"):
+                    val = cg.get_var_constant_value(x)
+                    if val is not None:
+                        return val
+        return x
+
+    @classmethod
+    def _is_scalar_operand(cls, x: object) -> bool:
+        resolved = cls._resolve_scalar_operand(x)
+        return isinstance(resolved, (int, float, bool))
 
     @staticmethod
     def _nki_tensor_scalar(
@@ -691,6 +821,15 @@ class NKIOpOverrides:
         if state is None:
             return ""
 
+        def _scalar_for_emit(x: object) -> object:
+            """Emit scalar as Python literal (1.0 not '1.0') for nisa.tensor_scalar."""
+            if isinstance(x, str):
+                try:
+                    return float(x) if "." in x or "e" in x.lower() else int(x)
+                except (ValueError, TypeError):
+                    pass
+            return x
+
         dst = str(data)
         dst_tile_vars = state.device_function.get_tile_list_vars(dst)
         operand_tile_vars = state.device_function.get_tile_list_vars(str(operand0))
@@ -707,7 +846,7 @@ class NKIOpOverrides:
                 operand_expr = (
                     operand_tile_vars[i]
                     if operand_tile_vars is not None
-                    else str(operand0)
+                    else _scalar_for_emit(operand0)
                 )
                 state.add_statement(
                     statement_from_string(
@@ -723,10 +862,11 @@ class NKIOpOverrides:
                 "tensor_scalar does not support non-tile-list data with tile-list operand0",
             )
 
+        operand_emit = _scalar_for_emit(operand0)
         state.add_statement(
             statement_from_string(
                 "nisa.tensor_scalar("
-                f"dst={dst}, data={data}, op0={op0}, operand0={operand0}, op1=None{reverse_part})"
+                f"dst={dst}, data={data}, op0={op0}, operand0={operand_emit}, op1=None{reverse_part})"
             )
         )
         return dst
@@ -752,12 +892,16 @@ class NKIOpOverrides:
 
         # tensor <op> scalar
         if not a_is_scalar and b_is_scalar:
-            return cls._nki_tensor_scalar(a, b, op_tensor_scalar)
+            return cls._nki_tensor_scalar(a, cls._resolve_scalar_operand(b), op_tensor_scalar)
 
         # scalar <op> tensor
         if a_is_scalar and not b_is_scalar:
             reverse0 = op_tensor_scalar in {"nl.subtract", "nl.divide"}
-            return cls._nki_tensor_scalar(b, a, op_tensor_scalar, reverse0=reverse0)
+            return cls._nki_tensor_scalar(b, cls._resolve_scalar_operand(a), op_tensor_scalar, reverse0=reverse0)
+
+        # tensor <op> scalar-like FX rhs (e.g. runtime scalar kernel arg)
+        if not a_is_scalar and not b_is_scalar and cls._is_scalar_like_tensor(b):
+            return cls._nki_tensor_scalar(a, b, op_tensor_scalar)
 
         # tensor <op> tensor
         if allow_tensor_tensor:
@@ -778,7 +922,66 @@ class NKIOpOverrides:
         return None
 
     @classmethod
+    def _is_scalar_like_tensor(cls, x: object) -> bool:
+        """Check if the RHS operand of the current binary node is scalar-like.
+
+        Returns True if the RHS is a 0-dim tensor, a [1]-shaped tensor (or [1,1],
+        etc.), or a non-tensor symbolic value (e.g. a scalar function parameter).
+
+        SymInt dimensions are first checked statically, then resolved against the
+        current config so that tensors like [u_inner, 1] with FixedBlockSizeSource(1)
+        (config=1, hint=64) are correctly identified as scalar-like.
+        """
+        from torch._inductor.virtualized import V
+
+        node = V.current_node
+        if node is None or len(node.args) < 2:
+            return False
+        rhs = node.args[1]
+        if not hasattr(rhs, "meta"):
+            return False
+        val = rhs.meta.get("val")
+        if val is None:
+            return False
+        if not isinstance(val, torch.Tensor):
+            return True
+        shape = tuple(val.shape)
+        if len(shape) == 0 or all(d == 1 for d in shape):
+            return True
+        # Slow path: resolve any SymInt dims using configured block size values.
+        # Needed when a tile has block_size=1 (FixedBlockSizeSource) but its tracing
+        # hint is >1, making shape dims appear non-unit until config substitution.
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        state = getattr(env, "_codegen_state", None)
+        if state is None or state.config is None:
+            return False
+        import sympy as _sympy
+
+        _bs_subs: dict[_sympy.Symbol, int] = {}
+        for _bs in env.block_sizes:
+            _cfg = _bs.from_config(state.config)
+            if isinstance(_cfg, int):
+                _bs_subs[_bs.symbol()] = _cfg
+        resolved = []
+        for d in shape:
+            if isinstance(d, torch.SymInt):
+                try:
+                    resolved.append(int(d._sympy_().subs(_bs_subs)))
+                except (TypeError, ValueError):
+                    resolved.append(int(env.size_hint(d)))
+            else:
+                resolved.append(int(d))
+        return all(d == 1 for d in resolved)
+
+    @classmethod
     def _truediv_tensor_tensor_supported(cls) -> bool:
+        """Check if tensor/tensor truediv can use reciprocal+tensor_scalar.
+
+        Supports [M,N]/[M,1] broadcast and same-shape divisions where
+        one dimension is 1 (NKI tensor_scalar broadcasts over free dim).
+        """
         from torch._inductor.virtualized import V
 
         node = V.current_node
@@ -794,6 +997,22 @@ class NKIOpOverrides:
         return lhs_shape[0] == rhs_shape[0] and rhs_shape[1] == 1
 
     @classmethod
+    def _same_shape_tensor_tensor(cls) -> bool:
+        """True when both operands have the same shape (any dimensionality)."""
+        from torch._inductor.virtualized import V
+
+        node = V.current_node
+        if node is None or len(node.args) < 2:
+            return False
+        lhs_shape = cls._shape_from_node_arg(node.args[0])
+        rhs_shape = cls._shape_from_node_arg(node.args[1])
+        if lhs_shape is None or rhs_shape is None:
+            return False
+        if len(lhs_shape) != len(rhs_shape):
+            return False
+        return all(a == b for a, b in zip(lhs_shape, rhs_shape))
+
+    @classmethod
     def _subtract_tensor_tensor_supported(cls) -> bool:
         """True when [M,N] - [M,1] broadcast; use tensor_scalar instead of tensor_tensor."""
         return cls._truediv_tensor_tensor_supported()
@@ -803,8 +1022,9 @@ class NKIOpOverrides:
         from .ast_extension import statement_from_string
         from .compile_environment import CompileEnvironment
 
-        if isinstance(operand, (int, float, bool)):
-            value = float(operand)
+        resolved = NKIOpOverrides._resolve_scalar_operand(operand)
+        if isinstance(resolved, (int, float, bool)):
+            value = float(resolved)
             if value == 0.0:
                 raise exc.BackendUnsupported(
                     "nki",
@@ -830,6 +1050,31 @@ class NKIOpOverrides:
                 )
             return operand
 
+        # Check for second-level copy vars (outer-scope captures)
+        _is_copy = "_copy_" in operand_str and operand_str[-1:].isdigit()
+        if _is_copy:
+            _lookup = operand_str
+            _sbuf = state.device_function._nki_sbuf_shapes
+            while _lookup not in _sbuf and "_copy" in _lookup:
+                idx = _lookup.rfind("_copy")
+                _lookup = _lookup[:idx]
+            src_shape = _sbuf.get(_lookup)
+            if src_shape is not None and len(src_shape) >= 2:
+                shape_str = ", ".join(str(d) for d in src_shape)
+                new_var = state.device_function.new_var("nki_reciprocal", dce=True)
+                state.device_function._nki_sbuf_shapes[new_var] = list(src_shape)
+                state.add_statement(
+                    statement_from_string(
+                        f"{new_var} = nl.ndarray([{shape_str}], nl.float32, buffer=nl.sbuf)"
+                    )
+                )
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.activation(dst={new_var}, op=nl.reciprocal, data={operand_str})"
+                    )
+                )
+                return new_var
+
         state.add_statement(
             statement_from_string(
                 f"nisa.activation(dst={operand_str}, op=nl.reciprocal, data={operand_str})"
@@ -849,11 +1094,77 @@ class NKIOpOverrides:
         if state is None:
             return ""
 
-        # Emit in-place activation on the destination tile variable(s).
-        # This mirrors existing nisa.tensor_tensor codegen style and avoids
-        # allocating additional temporary tiles.
         dst = str(a)
         dst_tile_vars = state.device_function.get_tile_list_vars(dst)
+
+        # Check if the input FX node has other users or if the dst is a
+        # second-level copy var (read-only outer-scope capture). In-place
+        # modification would corrupt values needed by later ops or iterations.
+        from torch._inductor.virtualized import V
+        cur_node = V.current_node
+        _is_second_level_copy = "_copy_" in dst and dst[-1:].isdigit()
+        need_new_buffer = _is_second_level_copy
+        if not need_new_buffer and cur_node is not None and len(cur_node.args) >= 1:
+            input_node = cur_node.args[0]
+            if hasattr(input_node, "users") and len(input_node.users) > 1:
+                need_new_buffer = True
+
+        if need_new_buffer and dst_tile_vars is None:
+            shape_list = state.device_function._nki_sbuf_shapes.get(dst)
+            out_val = cur_node.meta.get("val") if cur_node else None
+            # For copy vars, strip suffixes to find the original var's shape
+            if shape_list is None and _is_second_level_copy:
+                _lookup = dst
+                _sbuf = state.device_function._nki_sbuf_shapes
+                while _lookup not in _sbuf and "_copy" in _lookup:
+                    idx = _lookup.rfind("_copy")
+                    _lookup = _lookup[:idx]
+                src_shape = _sbuf.get(_lookup)
+                if src_shape is not None and len(src_shape) >= 2:
+                    shape_list = list(src_shape)
+                    if out_val is None:
+                        out_val = torch.empty(1)
+            # Derive shape from FX output tensor
+            if shape_list is None and out_val is not None and isinstance(out_val, torch.Tensor) and out_val.numel() > 1:
+                import sympy as _sp
+                _subs: dict[_sp.Symbol, int] = {}
+                for _bs in env.block_sizes:
+                    _c = _bs.from_config(state.config) if hasattr(state, 'config') and state.config else None
+                    if isinstance(_c, int):
+                        _subs[_bs.symbol()] = _c
+                _resolved = []
+                for _d in out_val.shape:
+                    if isinstance(_d, torch.SymInt):
+                        try:
+                            _resolved.append(int(_d._sympy_().subs(_subs)))
+                        except (TypeError, ValueError):
+                            _resolved.append(int(env.size_hint(_d)))
+                    else:
+                        _resolved.append(int(_d))
+                if len(_resolved) >= 2:
+                    shape_list = _resolved
+            if shape_list is not None and out_val is not None:
+                if hasattr(out_val, 'dtype') and out_val.numel() > 1:
+                    dtype_str = env.backend.dtype_str(out_val.dtype)
+                elif cur_node is not None and isinstance(cur_node.meta.get("val"), torch.Tensor):
+                    dtype_str = env.backend.dtype_str(cur_node.meta["val"].dtype)
+                else:
+                    dtype_str = "nl.float32"
+                shape_str = ", ".join(str(d) for d in shape_list)
+                new_dst = state.device_function.new_var(prefix, dce=True)
+                state.device_function._nki_sbuf_shapes[new_dst] = list(shape_list)
+                state.add_statement(
+                    statement_from_string(
+                        f"{new_dst} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+                    )
+                )
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.activation(dst={new_dst}, op={op}, data={dst})"
+                    )
+                )
+                return new_dst
+
         if dst_tile_vars is not None:
             for dv in dst_tile_vars:
                 state.add_statement(
@@ -895,6 +1206,12 @@ class NKIOpOverrides:
         )
 
     def mul(self, a: object, b: object) -> str:
+        if (
+            not self._is_scalar_operand(a)
+            and not self._is_scalar_operand(b)
+            and self._truediv_tensor_tensor_supported()
+        ):
+            return self._nki_tensor_scalar(a, b, "nl.multiply")
         return self._nki_binary_op(
             a,
             b,
@@ -902,6 +1219,34 @@ class NKIOpOverrides:
             op_tensor_scalar="nl.multiply",
             allow_tensor_tensor=True,
         )
+
+    def maximum(self, a: object, b: object) -> str:
+        return self._nki_binary_op(
+            a,
+            b,
+            op_tensor_tensor="nl.maximum",
+            op_tensor_scalar="nl.maximum",
+            allow_tensor_tensor=True,
+        )
+
+    def minimum(self, a: object, b: object) -> str:
+        return self._nki_binary_op(
+            a,
+            b,
+            op_tensor_tensor="nl.minimum",
+            op_tensor_scalar="nl.minimum",
+            allow_tensor_tensor=True,
+        )
+
+    def neg(self, a: object) -> str:
+        """neg(x) = -x via tensor_scalar multiply by -1."""
+        return self._nki_tensor_scalar(a, -1.0, "nl.multiply")
+
+    def constant(self, value: int | float | bool, dtype: torch.dtype) -> str:
+        """Return string repr for _unpack_opsvalue; _is_scalar_operand treats numeric strings as scalars."""
+        from torch._inductor.codegen.simd import constant_repr
+
+        return constant_repr(value)
 
     def truediv(self, a: object, b: object) -> str:
         a_is_scalar = self._is_scalar_operand(a)
@@ -921,6 +1266,12 @@ class NKIOpOverrides:
         if self._truediv_tensor_tensor_supported():
             recip = self._nki_reciprocal_operand(b)
             return self._nki_tensor_scalar(a, recip, "nl.multiply")
+        if self._is_scalar_like_tensor(b):
+            recip = self._nki_reciprocal_operand(b)
+            return self._nki_tensor_scalar(a, recip, "nl.multiply")
+        if self._same_shape_tensor_tensor():
+            recip = self._nki_reciprocal_operand(b)
+            return self._nki_tensor_tensor(a, recip, "nl.multiply", "nki_div")
         raise exc.BackendUnsupported(
             "nki",
             "truediv tensor/tensor currently supports only vector-like rhs broadcast "
@@ -975,6 +1326,12 @@ class NKIOpOverrides:
 
     def exp(self, x: object) -> str:
         return self._nki_activation(x, "nl.exp", "nki_exp")
+
+    def exp2(self, x: object) -> str:
+        """exp2(x) = 2^x = exp(x * ln(2))."""
+        import math
+        scaled = self._nki_tensor_scalar(x, repr(math.log(2)), "nl.multiply")
+        return self._nki_activation(scaled, "nl.exp", "nki_exp2")
 
     def log(self, x: object) -> str:
         return self._nki_activation(x, "nl.log", "nki_log")
@@ -1087,6 +1444,12 @@ class NKIBackend(Backend):
         from .compile_environment import CompileEnvironment
         from .tile_strategy import NDTileStrategy
 
+        class _NKINDTileStrategy(NDTileStrategy):
+            def supports_index_rank_expansion(self) -> bool:
+                # NKI handles broadcasting via partition/free axis semantics.
+                # Adding [None, :] produces 3D indexing on 2D SBUF tiles.
+                return False
+
         env = CompileEnvironment.current()
         block_size_infos = [env.block_sizes[i] for i in block_ids]
         loop_order = env.config_spec.loop_orders.config_get(
@@ -1095,7 +1458,7 @@ class NKIBackend(Backend):
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1
         )
-        return NDTileStrategy(
+        return _NKINDTileStrategy(
             fn,
             block_ids,
             block_size=[bs.from_config_assert(config) for bs in block_size_infos],
@@ -1120,7 +1483,7 @@ class NKIBackend(Backend):
         """NKI: use nl.sequential_range with literal step (no tl.range / constexpr)."""
         begin_part = begin if begin is not None else "0"
         step_part = step if step is not None else "1"
-        return f"nl.sequential_range({begin_part}, {{end}}, {step_part})"
+        return f"nl.sequential_range({begin_part}, {end}, {step_part})"
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         _DTYPE_MAP = {
@@ -1223,14 +1586,131 @@ class NKIBackend(Backend):
         return offset_var
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
-        # NKI tracer does not support .to() on ndarray/tensor access; reduction result is already correct dtype.
+        # For simple cases where we can't emit statements, return as-is.
+        # Real casting is done in cast_ast below.
         return expr_str
 
-    def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
-        return expr_from_string(
-            self.cast_expr("{x}", self.dtype_str(target_dtype)),
-            x=x,
+    def cast_ast(
+        self,
+        x: ast.AST,
+        target_dtype: torch.dtype,
+        src_dtype: torch.dtype | None = None,
+        src_shape: list[int | torch.SymInt] | None = None,
+    ) -> ast.AST:
+        """NKI dtype cast: allocate a new buffer, memset to 0, add the source
+        into it.  tensor_tensor with mismatched dtypes does the conversion
+        on Trainium hardware (e.g. fp16 src → fp32 dst)."""
+        from .ast_extension import statement_from_string
+
+        state = self._nki_codegen_state()
+        if state is None:
+            return x
+
+        # Skip cast if source and target dtypes match or source is unknown
+        if src_dtype is None or src_dtype == target_dtype:
+            return x
+
+        src_name = ast.unparse(x) if isinstance(x, ast.AST) else str(x)
+
+        # Look up the SBUF tile shape registered during load codegen
+        shape_dims = state.device_function._nki_sbuf_shapes.get(src_name)
+
+        if shape_dims is None:
+            # Fallback: try to find the first reduction block size for [1, RBLOCK]
+            from .compile_environment import CompileEnvironment
+            env = CompileEnvironment.current()
+            for _bid in range(len(env.block_sizes)):
+                _bs = env.block_sizes[_bid]
+                if _bs.reduction:
+                    rblock = int(_bs.from_config_assert(state.config))
+                    shape_dims = [1, rblock]
+                    break
+
+        if shape_dims is None:
+            shape_dims = [1, 1]
+
+        # Resolve symbolic dimensions to concrete values using config
+        import sympy as _sympy
+        from .compile_environment import CompileEnvironment
+        env = CompileEnvironment.current()
+        _bs_subs: dict[_sympy.Symbol, int] = {}
+        for _bid in range(len(env.block_sizes)):
+            _bs = env.block_sizes[_bid]
+            _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+        resolved = []
+        for s in shape_dims:
+            if isinstance(s, torch.SymInt):
+                resolved.append(int(s._sympy_().subs(_bs_subs)))
+            else:
+                resolved.append(int(s))
+
+        # NKI requires at least 2D. If 1D, add trailing 1.
+        if len(resolved) == 1:
+            resolved.append(1)
+
+        shape_parts = [str(d) for d in resolved]
+        shape_str = ", ".join(shape_parts)
+
+        dtype_str = self.dtype_str(target_dtype)
+        src_name = ast.unparse(x) if isinstance(x, ast.AST) else str(x)
+        cast_var = state.device_function.new_var("_nki_cast", dce=True)
+
+        # Register the cast var's shape so downstream casts and stores can look it up
+        state.device_function._nki_sbuf_shapes[cast_var] = resolved
+
+        src_tile_vars = state.device_function.get_tile_list_vars(src_name)
+        # Check if src is a scalar (no SBUF shape, no tile vars, shape is [1,1])
+        src_is_scalar = (
+            src_tile_vars is None
+            and state.device_function._nki_sbuf_shapes.get(src_name) is None
+            and resolved == [1, 1]
         )
+
+        # Emit: cast_var = nl.ndarray(shape, target_dtype, buffer=nl.sbuf)
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{cast_var} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+
+        if src_is_scalar:
+            # For scalar-to-tensor cast, use memset with the scalar value directly
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"nisa.memset({cast_var}, value={src_name})"
+                )
+            )
+        elif src_tile_vars is not None:
+            cast_tile_vars = []
+            for i, tv in enumerate(src_tile_vars):
+                ctv = f"{cast_var}_{i}"
+                cast_tile_vars.append(ctv)
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{ctv} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+                    )
+                )
+                state.codegen.add_statement(
+                    statement_from_string(f"nisa.memset({ctv}, value=0)")
+                )
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"nisa.tensor_tensor(dst={ctv}, data1={ctv}, data2={tv}, op=nl.add)"
+                    )
+                )
+            state.device_function.register_tile_list(cast_var, cast_tile_vars)
+        else:
+            state.codegen.add_statement(
+                statement_from_string(f"nisa.memset({cast_var}, value=0)")
+            )
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={cast_var}, data1={cast_var}, data2={src_name}, op=nl.add)"
+                )
+            )
+
+        return expr_from_string(cast_var)
 
     def _nki_codegen_state(self) -> object | None:
         """Return current codegen state when set (Option B, NKI statement-based codegen)."""
@@ -1247,6 +1727,9 @@ class NKIBackend(Backend):
         # Callers must emit the second line via full_memset_stmt().
         if not shape_dims:
             return value_expr
+        # NKI requires at least 2D (partition, free). Append trailing 1 if 1D.
+        if len(shape_dims) == 1:
+            shape_dims = shape_dims + ["1"]
         shape_str = ", ".join(shape_dims)
         dtype_str = self.dtype_str(dtype)
         return f"nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
@@ -1302,37 +1785,93 @@ class NKIBackend(Backend):
     ) -> str:
         state = self._nki_codegen_state()
         if state is not None:
-            # NKI tensor_reduce only supports free-axis reduction (axis 1+). Dim 0 is partition axis.
-            if dim == 0:
-                raise exc.BackendUnsupported(
-                    self.name,
-                    "reduction over dim 0 not supported; NKI tensor_reduce requires free axis (dim >= 1). "
-                    "Transpose or use a different pattern.",
-                )
             _NKI_REDUCTION_OPS = {
                 "sum": "nl.add",
-                "max": "nl.maximum",  # nl.max not supported by tensor_reduce tracer
+                "max": "nl.maximum",
                 "min": "nl.min",
                 "prod": "nl.mul",
+                "mean": "nl.add",
             }
             op = _NKI_REDUCTION_OPS.get(reduction_type)
             if op is None:
                 raise exc.BackendUnsupported(
                     self.name, f"reduction {reduction_type!r} not mapped to NKI op"
                 )
-            # NKI tensor_reduce requires dst partition dim to match input. For reduce over dim 1
-            # on [P, F], output is [P, 1] with keepdims=True. Use block_sizes[0] (partition dim).
+
             from .compile_environment import CompileEnvironment
 
             env = CompileEnvironment.current()
-            if dim == 1 and len(env.block_sizes) >= 1 and state.config is not None:
-                part_size = int(env.block_sizes[0].from_config_assert(state.config))
-                dst_shape = f"[{part_size}, 1]"
-            elif fake_input is not None:
-                part_size = int(fake_input.size(0))
+
+            if dim == 0:
+                _NKI_PARTITION_REDUCE_OPS = {"sum": "nl.add", "max": "nl.maximum", "mean": "nl.add"}
+                part_op = _NKI_PARTITION_REDUCE_OPS.get(reduction_type)
+                if part_op is None:
+                    raise exc.BackendUnsupported(
+                        self.name,
+                        f"partition-axis reduction {reduction_type!r} not supported by "
+                        "nisa.tensor_partition_reduce (supports add, max)",
+                    )
+                if fake_input is not None:
+                    free_size = int(fake_input.size(1)) if fake_input.ndim >= 2 else 1
+                else:
+                    free_size = 1
+                dst_shape = f"[1, {free_size}]"
+                dtype_str = "nl.float32"
+                result_var = state.device_function.new_var("nki_part_reduce", dce=True)
+                state.add_statement(
+                    f"{result_var} = nl.ndarray({dst_shape}, {dtype_str}, buffer=nl.sbuf)"
+                )
+                state.add_statement(
+                    f"nisa.tensor_partition_reduce(dst={result_var}, op={part_op}, data={input_name})"
+                )
+                if reduction_type == "mean":
+                    if fake_input is None:
+                        raise exc.BackendUnsupported(
+                            self.name,
+                            "mean reduction requires fake_input to determine reduction extent",
+                        )
+                    reduction_extent = fake_input.size(0)
+                    if isinstance(reduction_extent, torch.SymInt):
+                        reduction_extent = env.size_hint(reduction_extent)
+                    reduction_extent_int = int(reduction_extent)
+                    if reduction_extent_int > 0:
+                        scale = 1.0 / reduction_extent_int
+                        state.add_statement(
+                            "nisa.tensor_scalar("
+                            f"dst={result_var}, data={result_var}, op0=nl.multiply, operand0={repr(scale)}, op1=None)"
+                        )
+                # In NKI, always keep the result as 2D [1, free_size] — do NOT
+                # slice to [free_size] (1D).  The partition-reduce output is [1, N]
+                # and downstream accumulators (e.g. grad_w_acc) are also [1, N].
+                # Taking [0, :] would create a 1D tensor that mismatches the 2D
+                # accumulator in nisa.tensor_tensor, producing silent wrong values.
+                return result_var
+
+            # dim >= 1: use tensor_reduce on the free axis
+            # Derive the partition size from fake_input.size(0) with SymInt→config
+            # substitution so the configured block size is used rather than the trace
+            # hint (e.g. an inner tile with block_size=1 has a default hint of 64,
+            # but the actual partition dimension at runtime is 1).
+            if fake_input is not None and fake_input.ndim >= 2:
+                part_size_sym = fake_input.size(0)
+                if isinstance(part_size_sym, torch.SymInt) and state.config is not None:
+                    import sympy as _sympy
+                    _bs_subs: dict[_sympy.Symbol, int] = {}
+                    for _bs in env.block_sizes:
+                        _cfg = _bs.from_config(state.config)
+                        if isinstance(_cfg, int):
+                            _bs_subs[_bs.symbol()] = _cfg
+                    _resolved = part_size_sym._sympy_().subs(_bs_subs)
+                    try:
+                        part_size = int(_resolved)
+                    except (TypeError, ValueError):
+                        part_size = int(env.size_hint(part_size_sym))
+                else:
+                    part_size = int(part_size_sym)
                 dst_shape = f"[{part_size}, 1]"
             else:
-                dst_shape = "[1, 1]"  # fallback for scalar-like reduction
+                part_size = 1
+                dst_shape = "[1, 1]"
             dtype_str = "nl.float32"
             result_var = state.device_function.new_var("nki_reduce", dce=True)
             state.add_statement(
@@ -1341,6 +1880,41 @@ class NKIBackend(Backend):
             state.add_statement(
                 f"nisa.tensor_reduce(dst={result_var}, op={op}, data={input_name}, axis={dim}, keepdims=True)"
             )
+            if reduction_type == "mean":
+                if fake_input is None:
+                    raise exc.BackendUnsupported(
+                        self.name,
+                        "mean reduction requires fake_input to determine reduction extent",
+                    )
+                reduction_extent = fake_input.size(dim)
+                if isinstance(reduction_extent, torch.SymInt):
+                    reduction_extent = env.size_hint(reduction_extent)
+                reduction_extent_int = int(reduction_extent)
+                if reduction_extent_int <= 0:
+                    raise exc.BackendUnsupported(
+                        self.name,
+                        f"mean reduction requires positive reduction extent, got {reduction_extent_int}",
+                    )
+                scale = 1.0 / reduction_extent_int
+                state.add_statement(
+                    "nisa.tensor_scalar("
+                    f"dst={result_var}, data={result_var}, op0=nl.multiply, operand0={repr(scale)}, op1=None)"
+                )
+            # Register the reduction result's SBUF shape for downstream store codegen
+            state.device_function._nki_sbuf_shapes[result_var] = [part_size, 1]
+
+            if (
+                fake_input is not None
+                and fake_output is not None
+                and fake_output.ndim == fake_input.ndim - 1
+                and dim == 1
+            ):
+                # For vector reductions (partition_dim > 1), keep the 2D [P, 1]
+                # result so the store codegen can use partition-axis DMA.
+                # For scalar reductions (partition_dim == 1), squeeze to 1D.
+                if part_size > 1:
+                    return result_var
+                return f"{result_var}[:, 0]"
             return result_var
         raise exc.BackendUnsupported(
             self.name,
@@ -1357,6 +1931,16 @@ class NKIBackend(Backend):
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
         return NKIOpOverrides()
+
+    def autotune(
+        self,
+        bound_kernel: BoundKernel[Any],
+        args: Sequence[object],
+        *,
+        force: bool = True,
+        **kwargs: object,
+    ) -> Config:
+        return bound_kernel.config_spec.default_config()
 
 
 # Mapping from torch dtype to JAX dtype string (e.g., "jnp.float32")

@@ -80,6 +80,8 @@ def copy_engine_all_gather_w_progress(
 
 # %%
 @helion.kernel(
+    backend="nki",
+    autotune_effort="none",
     config=helion.Config(
         block_sizes=[128, 256, 64],
         num_warps=8,

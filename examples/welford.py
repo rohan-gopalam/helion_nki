@@ -25,7 +25,7 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(backend="nki", autotune_effort="none", config=helion.Config(block_sizes=[128, 128, 128]))
 def welford(
     weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor, eps: float = 1e-05
 ) -> torch.Tensor:

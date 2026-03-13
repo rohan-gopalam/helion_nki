@@ -31,7 +31,12 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+    static_shapes=True,
+)
 def matmul_split_k(
     x: torch.Tensor,
     y: torch.Tensor,

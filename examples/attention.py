@@ -32,6 +32,9 @@ import helion.language as hl
 
 # %%
 @helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
     # Static shapes provides a speedup for attention
     static_shapes=True,
 )

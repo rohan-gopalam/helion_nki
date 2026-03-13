@@ -264,6 +264,10 @@ class DeviceFunction:
         )
         self._variable_renames: dict[str, list[str]] = {}
         self._nki_tile_lists: dict[str, list[str]] = {}  # var → [var_0, var_1, ...]
+        self._nki_sbuf_shapes: dict[str, list[int]] = {}  # var → [p, f]
+        # Tile lists where tiles represent the FREE dimension (not partition).
+        # These must be distributed along dim 1 when stored to a 2D buffer.
+        self._nki_free_dim_tile_lists: set[str] = set()
         self.dce_vars: list[str] = []
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
@@ -339,6 +343,7 @@ class DeviceFunction:
 
     def block_size_var(self, block_id: int) -> str | None:
         key = (block_id,)
+        env = CompileEnvironment.current()
 
         # Block size var could be used outside of a hl.tile loop, and at that point
         # no tile strategy has populated the cache yet, so we must lazily create
@@ -346,7 +351,6 @@ class DeviceFunction:
         # later strategies will reuse the cached name or intentionally replace it
         # (e.g. flattened loops, reductions).
         if key not in self.block_size_var_cache:
-            env = CompileEnvironment.current()
             block_value = env.block_sizes[block_id].from_config(self.config)
 
             if block_value is None:
@@ -355,6 +359,14 @@ class DeviceFunction:
             var_name = self.new_var(f"_BLOCK_SIZE_{block_id}")
             self.block_size_var_cache[key] = var_name
             self.constexpr_arg_with_host_def(var_name, block_value)
+        else:
+            # Some strategies pre-populate the cache with a symbol name only.
+            # Ensure the constexpr argument/host-side definition exists.
+            var_name = self.block_size_var_cache[key]
+            if var_name.isidentifier() and var_name not in self._constexpr_args:
+                block_value = env.block_sizes[block_id].from_config(self.config)
+                if block_value is not None:
+                    self.constexpr_arg_with_host_def(var_name, block_value)
 
         return self.block_size_var_cache[key]
 
@@ -694,6 +706,19 @@ class DeviceFunction:
         self.arguments.sort(key=lambda arg: arg.sort_key())
         return self.arguments
 
+    def _nki_return_statements(self) -> list[ast.stmt]:
+        """Generate return statement(s) for NKI kernel with one or more output buffers."""
+        bufs = getattr(self, "_nki_return_buffers", None)
+        if not bufs:
+            single = getattr(self, "_nki_return_buffer_name", None)
+            if single is not None:
+                return [statement_from_string(f"return {single}")]
+            return []
+        buf_names = [info["buf_name"] for info in bufs.values()]
+        if len(buf_names) == 1:
+            return [statement_from_string(f"return {buf_names[0]}")]
+        return [statement_from_string(f"return ({', '.join(buf_names)})")]
+
     def codegen_function_def(self) -> list[ast.stmt]:
         prefix = []
         if self._tensor_descriptor_args:
@@ -740,6 +765,26 @@ class DeviceFunction:
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
+        tensor_shape_preamble: list[ast.AST] = []
+        if backend.name == "nki":
+            # Normalize tensor argument views at kernel entry to the compile-time
+            # shape expected by codegen. This keeps raw NKI kernel invocation
+            # compatible with equivalent higher-rank view inputs.
+            for arg in param_args:
+                if isinstance(arg, TensorArg):
+                    shape_parts = [self.literal_expr(s) for s in arg.fake_value.size()]
+                    if arg.fake_value.dim() == 1:
+                        # Reshape [N] → [1, N] so the large dimension is the
+                        # free axis.  This avoids tile-list fragmentation for
+                        # broadcast vectors like weight/bias and keeps the
+                        # partition dimension at 1 for natural broadcasting.
+                        shape_parts = ["1"] + shape_parts
+                    tensor_shape_preamble.append(
+                        statement_from_string(
+                            f"{arg.name} = {arg.name}.reshape([{', '.join(shape_parts)}])"
+                        )
+                    )
+
         return [
             *prefix,
             ast_rename(
@@ -749,13 +794,10 @@ class DeviceFunction:
                     args=create_arguments(args),
                     body=[
                         *scalar_preamble,
+                        *tensor_shape_preamble,
                         *self.preamble,
                         *self.body,
-                        *(
-                            [statement_from_string(f"return {self._nki_return_buffer_name}")]
-                            if getattr(self, "_nki_return_buffer_name", None) is not None
-                            else []
-                        ),
+                        *self._nki_return_statements(),
                     ],
                     decorator_list=[expr_from_string(backend.function_decorator)]
                     if backend.function_decorator
@@ -796,10 +838,34 @@ class DeviceFunction:
             config=self.config,
             has_barrier=env.has_barrier,
         )
-        return_host_var = getattr(self, "_nki_return_host_var", None)
+        bufs = getattr(self, "_nki_return_buffers", None)
         call_str = f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})"
-        if return_host_var is not None:
-            call_str = f"{return_host_var} = " + call_str
+        if bufs and len(bufs) > 1:
+            result_var = "_nki_result"
+            call_str = f"{result_var} = {call_str}"
+            post_stmts: list[ast.stmt] = []
+            for i, info in enumerate(bufs.values()):
+                host_var = info["host_var"]
+                reshape = info["host_reshape"]
+                if reshape is not None:
+                    post_stmts.append(
+                        statement_from_string(
+                            f"{host_var} = {result_var}[{i}].reshape({reshape})"
+                        )
+                    )
+                else:
+                    post_stmts.append(
+                        statement_from_string(f"{host_var} = {result_var}[{i}]")
+                    )
+            self._nki_post_call_stmts = post_stmts
+        else:
+            return_host_var = getattr(self, "_nki_return_host_var", None)
+            return_host_reshape = getattr(self, "_nki_return_host_reshape", None)
+            if return_host_var is not None:
+                if return_host_reshape is not None:
+                    call_str = f"{return_host_var} = {call_str}.reshape({return_host_reshape})"
+                else:
+                    call_str = f"{return_host_var} = " + call_str
         # TODO(jansel): we should run CSE this statement
         call_statement = statement_from_string(
             call_str,

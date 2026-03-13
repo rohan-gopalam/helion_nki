@@ -27,7 +27,12 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=False)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+    static_shapes=False,
+)
 def moe_matmul_ogs(
     A: torch.Tensor,  # [T, K] - Input activations (T tokens, K features)
     W: torch.Tensor,  # [E, K, N] - Expert weights (E experts, K input features, N output features)

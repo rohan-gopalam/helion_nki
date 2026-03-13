@@ -135,6 +135,9 @@ def torch_grpo_loss(
 
 
 @helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def grpo_loss_forward(
@@ -227,6 +230,9 @@ def grpo_loss_forward(
 
 
 @helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
     ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
 def grpo_loss_backward(

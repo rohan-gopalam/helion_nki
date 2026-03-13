@@ -150,6 +150,16 @@ def _full_codegen(state: CodegenState) -> ast.AST:
             state.add_statement(
                 statement_from_string(nki_memset(var, "{val}"), val=value_ast)
             )
+        # Register SBUF shape for multi-user detection on copy vars
+        if hasattr(state.device_function, "_nki_sbuf_shapes"):
+            try:
+                resolved = [int(d) for d in shape_dims]
+                if len(resolved) == 1:
+                    resolved.append(1)  # full_expr adds trailing 1 for 1D
+                if len(resolved) >= 2:
+                    state.device_function._nki_sbuf_shapes[var] = resolved
+            except (TypeError, ValueError):
+                pass
         return expr_from_string(var)
 
     # Check if the value is static (literal) or dynamic (node)

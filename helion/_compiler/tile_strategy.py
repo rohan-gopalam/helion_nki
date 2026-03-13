@@ -1009,10 +1009,25 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         assert isinstance(proxy_ends, list)
         # For NKI device loops, use dimension size as loop end (e.g. x.shape[1] for K)
         # so the range is 0..dim_size with step block_size, not 0..128.
+        # Only apply when begin == 0 (top-level loops).  For nested loops with a
+        # non-zero begin (e.g. inner tile of hl.tile(mb_cta.begin, mb_cta.end)),
+        # bs_info.size is the range *length* (32), not the absolute end
+        # (offset_0 + 32), so replacing ends[i] with bs_info.size would give a
+        # wrong constant stop value and make all but the first outer iteration empty.
         if env.backend.name == "nki":
             ends = list(ends)
             proxy_ends = list(proxy_ends)
             for i, block_idx in enumerate(block_ids):
+                begin_i = begins[i]
+                begin_is_zero = (
+                    (isinstance(begin_i, int) and begin_i == 0)
+                    or (
+                        isinstance(begin_i, torch.SymInt)
+                        and begin_i._sympy_() == 0
+                    )
+                )
+                if not begin_is_zero:
+                    continue  # keep the original absolute end for nested loops
                 bs_info = env.block_sizes[block_idx]
                 if isinstance(bs_info.size, (int, torch.SymInt)):
                     ends[i] = bs_info.size
@@ -1110,7 +1125,7 @@ class NDTileStrategy(_BaseNDTileStrategy):
         self.l2_grouping = l2_grouping
 
     def mask_var(self, block_idx: int) -> str | None:
-        return self.mask_vars[block_idx]
+        return self.mask_vars.get(block_idx)
 
     def _setup_mask(
         self,

@@ -207,7 +207,10 @@ def _has_mtia_runtime() -> bool:
 
 # Determine DEVICE without calling functions that initialize CUDA.
 # is_cpu() calls _get_triton_backend() which triggers CUDA init on CUDA devices.
-if os.environ.get("TRITON_CPU_BACKEND", "0") == "1":
+if _get_backend() == "nki":
+    # Canonical examples create host tensors and the NKI launcher moves them to XLA.
+    DEVICE = torch.device("cpu")
+elif os.environ.get("TRITON_CPU_BACKEND", "0") == "1":
     DEVICE = torch.device("cpu")
 elif torch.xpu.is_available():
     DEVICE = torch.device("xpu")
@@ -956,6 +959,10 @@ def run_example(
                     t.grad = None
 
     # Benchmark all functions
+    if _get_backend() == "nki":
+        print("Skipping benchmark on NKI backend.", file=sys.stderr)
+        return
+
     all_benchmarks = {**kernels, **baselines}
     bench_fns = [functools.partial(fn, *args) for fn in all_benchmarks.values()]
     repeat = compute_repeat(bench_fns[0])

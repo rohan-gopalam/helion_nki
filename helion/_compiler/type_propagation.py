@@ -2363,9 +2363,10 @@ class TypePropagation(ast.NodeVisitor):
                     raise exc.NestedGridLoop
 
         self.device_loop_depth += device_loop
+        env = CompileEnvironment.current()
         _maybe_patch_tensor_factories = (
             patch_tensor_factories
-            if self.device_loop_depth > 0
+            if self.device_loop_depth > 0 and env.backend_name != "nki"
             else contextlib.nullcontext
         )
         with _maybe_patch_tensor_factories():

@@ -45,9 +45,11 @@ def baseline_sum(x: torch.Tensor) -> torch.Tensor:
 
 # %%
 @helion.kernel(
+    backend="nki",
+    autotune_effort="none",
     config=helion.Config(
         block_sizes=[1],
-        reduction_loops=[None],
+        reduction_loops=[16384],  # NKI: tile the reduction to fit in SBUF
         num_warps=32,
         num_stages=4,
         indexing="block_ptr",
@@ -80,10 +82,12 @@ def longsum(x: torch.Tensor) -> torch.Tensor:
 
 # %%
 @helion.kernel(
+    backend="nki",
+    autotune_effort="none",
     config=helion.Config(
         block_sizes=[1],
         reduction_loops=[
-            32768
+            16384
         ],  # [None] for naive reduction, [tile_size] for looped reduction
         num_warps=16,
         num_stages=5,
@@ -117,8 +121,10 @@ def longsum_w_red_loop(x: torch.Tensor) -> torch.Tensor:
 
 # %%
 @helion.kernel(
+    backend="nki",
+    autotune_effort="none",
     config=helion.Config(
-        block_sizes=[32768, 1], num_warps=16, num_stages=5, indexing="pointer"
+        block_sizes=[4096, 1], num_warps=16, num_stages=5, indexing="pointer"
     )
 )
 def longsum_manual(x: torch.Tensor) -> torch.Tensor:
@@ -187,7 +193,7 @@ def main() -> None:
 
     Tests with a tensor of shape [4, 130000] to demonstrate handling of long reduction dimensions.
     """
-    check(4, 130000)  # seq_len = 128k
+    check(4, 131072)  # seq_len = 128k, must be divisible by tile size for NKI
 
 
 if __name__ == "__main__":

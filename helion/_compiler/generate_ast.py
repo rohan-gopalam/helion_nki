@@ -59,6 +59,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         self.current_grid_state: DeviceGridState | None = None
         self.next_else_block: list[ast.AST] | None = None
+        # Track var=const for NKI tensor_scalar (avoids tensor_tensor when one op is scalar)
+        self._var_to_constant: dict[str, int | float | bool] = {}
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -88,7 +90,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
+        # Track var=const for NKI tensor_scalar scalar operand resolution
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Constant)
+        ):
+            self._var_to_constant[stmt.targets[0].id] = stmt.value.value
         self.statements_stack[-1].append(stmt)
+
+    def get_var_constant_value(self, var_name: str) -> int | float | bool | None:
+        """Return constant value if var was assigned a literal, else None."""
+        return self._var_to_constant.get(var_name)
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
         import_stmt = statement_from_string(
@@ -380,7 +394,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
-                return self.device_function.codegen_function_call()
+                call_stmt = self.device_function.codegen_function_call()
+                post_stmts = getattr(
+                    self.device_function, "_nki_post_call_stmts", None
+                )
+                if post_stmts:
+                    self.add_statement(call_stmt)
+                    for s in post_stmts:
+                        self.add_statement(s)
+                    return None
+                return call_stmt
             return None
         return self.generic_visit(node)
 

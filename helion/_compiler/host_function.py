@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import sys
 import textwrap
@@ -122,9 +123,14 @@ class HostFunction:
                     propagate_types(self)
                 with measure("HostFunction.finalize_config_spec"):
                     env.finalize_config_spec()
+                maybe_patch_tensor_factories = (
+                    patch_tensor_factories()
+                    if env.backend_name != "nki"
+                    else contextlib.nullcontext()
+                )
                 with (
                     measure("HostFunction.lower_to_device_ir"),
-                    patch_tensor_factories(),
+                    maybe_patch_tensor_factories,
                 ):
                     self.device_ir = lower_to_device_ir(self)
 

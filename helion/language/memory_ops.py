@@ -538,11 +538,30 @@ def _(state: CodegenState) -> ast.AST:
             return s
         return int(s._sympy_().subs(_bs_subs))
 
+    # NKI fix: when a SymInt subscript lost its BlockSizeOrigin (concretized by
+    # inductor), compute_shape eliminates the dimension.  Detect this case:
+    # if the tensor is 2D, subscript has a SymInt for dim 0, and output_shape
+    # has only 1 element, the first dim was incorrectly eliminated.  Re-insert
+    # it using the active outer tile loop's block_size.
+    if (
+        tensor.dim() == 2
+        and len(output_shape) == 1
+        and len(subscript) >= 2
+        and isinstance(subscript[0], torch.SymInt)
+    ):
+        # Find the tile loop block_id for dim 0 from active device loops
+        for bid in state.codegen.active_device_loops.keys():
+            if bid < len(env.block_sizes) and not env.block_sizes[bid].reduction:
+                bs_val = int(env.block_sizes[bid].from_config_assert(state.config))
+                # This is the outer tile loop; re-insert its block_size as dim 0
+                output_shape = [env.block_sizes[bid].var, *output_shape]
+                break
+
     partition_dim = _resolve_dim(output_shape[0])
     free_dims = [_resolve_dim(s) for s in output_shape[1:]]
     dtype_str = backend.dtype_str(tensor.dtype)
 
-    # Build slices from the subscript list.
+    # Build slices from the subscript list - process only actual tensor dimensions
     fx_subscript = (
         state.fx_node.args[1]
         if state.fx_node is not None and len(state.fx_node.args) >= 2
@@ -550,30 +569,93 @@ def _(state: CodegenState) -> ast.AST:
     )
     slice_parts: list[str] = []
     partition_offset_var: str | None = None
+
+    # Track which subscript elements map to tensor dimensions
+    tensor_dim_idx = 0
     for i, sub_val in enumerate(subscript):
+        # Skip None subscripts (newaxis/broadcasting dimensions)
+        if sub_val is None:
+            continue
+
+        # Stop if we've processed all tensor dimensions
+        if tensor_dim_idx >= tensor.dim():
+            break
+
         block_id = None
+        # Try to get block_id from FX node metadata
         if fx_subscript is not None and i < len(fx_subscript):
             fx_node_i = fx_subscript[i]
             if isinstance(fx_node_i, torch.fx.Node):
                 val = fx_node_i.meta.get("val")
                 if val is not None:
                     block_id = env.get_block_id(val)
-        if block_id is not None:
+
+        # NKI fix: when get_block_id fails for a SymInt subscript (concretized
+        # hint value instead of symbolic), try to match the active tile loop by
+        # checking which non-reduction block_id iterates over this dimension.
+        if block_id is None and isinstance(sub_val, torch.SymInt):
+            for bid in state.codegen.active_device_loops.keys():
+                if bid < len(env.block_sizes) and not env.block_sizes[bid].reduction:
+                    block_id = bid
+                    break
+
+        # For slice(None), check if this is a reduction dimension
+        if block_id is None and isinstance(sub_val, slice):
+            # Check if this dimension matches a reduction block size
+            dim_size = tensor.size(tensor_dim_idx)
+            for bid in state.codegen.active_device_loops.keys():
+                if bid < len(env.block_sizes):
+                    block_size = env.block_sizes[bid].from_config_assert(state.config)
+                    # Skip trivial block_size=1 (matches everything via divisibility)
+                    if block_size <= 1:
+                        continue
+                    # Match by size - if dimension is divisible by block size, it's likely the reduction
+                    if isinstance(dim_size, int) and block_size > 0 and dim_size % block_size == 0:
+                        # Match for: dim 1 of 2D tensors, or dim 0 of 1D tensors
+                        if (tensor_dim_idx == 1 and tensor.dim() == 2) or (
+                            tensor_dim_idx == 0 and tensor.dim() == 1
+                        ):
+                            block_id = bid
+                            break
+
+        # Build the slice for this tensor dimension
+        if block_id is not None and block_id in state.codegen.active_device_loops:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
-            if i == 0:
+            if tensor_dim_idx == 0:
                 partition_offset_var = offset_var
-            slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
+            slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
         else:
-            size_i = tensor.size(i) if i < tensor.dim() else sub_val
+            # Fixed slice for this dimension
+            size_i = tensor.size(tensor_dim_idx)
             size_str = (
                 state.sympy_expr(size_i._sympy_())
                 if isinstance(size_i, torch.SymInt)
                 else str(size_i)
             )
-            slice_parts.append(f"0 : {size_str}")
+            slice_parts.append(f"0:{size_str}")
 
-    if partition_dim > NKI_PARTITION_MAX:
+        # Advance to next tensor dimension
+        tensor_dim_idx += 1
+
+    if partition_dim > NKI_PARTITION_MAX and free_dims in ([], [1]):
+        # 1D / [1, N] path: tensor is 1D (reshaped to [1, N] at kernel entry).
+        # Allocate a single [1, partition_dim] SBUF and one DMA copy.
+        device_fn._nki_sbuf_shapes[sbuf_name] = [1, partition_dim]
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{sbuf_name} = nl.ndarray([1, {partition_dim}], "
+                f"{dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        # Build the source slice: name[0:1, orig_slice] to match the [1, N] reshape
+        orig_slice = slice_parts[0] if slice_parts else f"0:{partition_dim}"
+        state.codegen.add_statement(
+            statement_from_string(
+                f"nisa.dma_copy(dst={sbuf_name}, src={name}[0:1, {orig_slice}])"
+            )
+        )
+    elif partition_dim > NKI_PARTITION_MAX:
         n_partitions = partition_dim // NKI_PARTITION_MAX
         assert partition_dim % NKI_PARTITION_MAX == 0
         free_str = ", ".join(str(d) for d in free_dims)
@@ -607,13 +689,29 @@ def _(state: CodegenState) -> ast.AST:
             )
         device_fn.register_tile_list(sbuf_name, tile_vars)
     else:
-        shape_str = f"{partition_dim}, " + ", ".join(str(d) for d in free_dims)
+        # NKI requires at least 2D SBUF buffers. If free_dims is empty,
+        # add a trailing dimension of 1.
+        # Special case: 1D tensors are reshaped to [1, N] at kernel entry,
+        # so their tile iterates over the free axis — use [1, tile_size].
+        if not free_dims:
+            if tensor.dim() == 1:
+                sbuf_shape = [1, partition_dim]
+            else:
+                sbuf_shape = [partition_dim, 1]
+        else:
+            sbuf_shape = [partition_dim] + free_dims
+        shape_str = ", ".join(str(d) for d in sbuf_shape)
+        device_fn._nki_sbuf_shapes[sbuf_name] = sbuf_shape
         state.codegen.add_statement(
             statement_from_string(
                 f"{sbuf_name} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
             )
         )
         slice_str = ", ".join(slice_parts)
+        # For 1D tensors reshaped to [1, N] at kernel entry, the DMA source
+        # needs 2D indexing. Prepend "0:1" for the partition dimension.
+        if tensor.dim() == 1 and len(slice_parts) == 1:
+            slice_str = f"0:1, {slice_str}"
         state.codegen.add_statement(
             statement_from_string(
                 f"nisa.dma_copy(dst={sbuf_name}, src={name}[{slice_str}])"
@@ -646,7 +744,12 @@ def _(state: CodegenState) -> None:
     )
     slice_parts: list[str] = []
     partition_offset_var: str | None = None
+    tensor_dim_idx = 0
     for i, sub_val in enumerate(subscript):
+        if sub_val is None:
+            continue
+        if tensor_dim_idx >= tensor.dim():
+            break
         block_id = None
         if fx_subscript is not None and i < len(fx_subscript):
             fx_node_i = fx_subscript[i]
@@ -654,26 +757,55 @@ def _(state: CodegenState) -> None:
                 val = fx_node_i.meta.get("val")
                 if val is not None:
                     block_id = env.get_block_id(val)
-        if block_id is not None:
+
+        # NKI fix: fallback for concretized SymInt subscripts
+        if block_id is None and isinstance(sub_val, torch.SymInt):
+            for bid in state.codegen.active_device_loops.keys():
+                if bid < len(env.block_sizes) and not env.block_sizes[bid].reduction:
+                    block_id = bid
+                    break
+
+        # NKI fix: fallback for slice subscripts — match reduction blocks (skip block_size=1)
+        if block_id is None and isinstance(sub_val, slice):
+            dim_size = tensor.size(tensor_dim_idx) if tensor_dim_idx < tensor.dim() else None
+            if dim_size is not None:
+                for bid in state.codegen.active_device_loops.keys():
+                    if bid < len(env.block_sizes):
+                        block_size = env.block_sizes[bid].from_config_assert(state.config)
+                        if block_size <= 1:
+                            continue
+                        if isinstance(dim_size, int) and block_size > 0 and dim_size % block_size == 0:
+                            if (tensor_dim_idx == 1 and tensor.dim() == 2) or (
+                                tensor_dim_idx == 0 and tensor.dim() == 1
+                            ):
+                                block_id = bid
+                                break
+
+        if block_id is not None and block_id in state.codegen.active_device_loops:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
-            if i == 0:
+            # For 1D tensors, don't set partition_offset_var here.
+            # The partition vs free layout decision is deferred to HBM
+            # allocation based on the value's SBUF shape.
+            if tensor_dim_idx == 0 and tensor.dim() != 1:
                 partition_offset_var = offset_var
             slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
         else:
-            size_i = tensor.size(i) if i < tensor.dim() else sub_val
+            size_i = tensor.size(tensor_dim_idx) if tensor_dim_idx < tensor.dim() else sub_val
             size_str = (
                 state.sympy_expr(size_i._sympy_())
                 if isinstance(size_i, torch.SymInt)
                 else str(size_i)
             )
             slice_parts.append(f"0 : {size_str}")
+        tensor_dim_idx += 1
 
     value_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
     tile_vars = device_fn.get_tile_list_vars(value_name)
 
     # NKI output tensors: use return buffer (allocate, write, return) instead of
     # passed-in tensor; NKI does not propagate writes to passed tensors.
+    # Each distinct output tensor gets its own HBM return buffer.
     use_nki_return = False
     ret_buf_name: str | None = None
     try:
@@ -682,36 +814,111 @@ def _(state: CodegenState) -> None:
             use_nki_return = True
             origin = hf.tensor_to_origin[tensor]
             return_host_var = origin.host_str()
-            ret_buf_name = getattr(device_fn, "_nki_return_buffer_name", None)
-            if ret_buf_name is None:
+
+            # Follow view chain to find the base tensor.
+            # When `out_flat = out.view(-1)`, the NKI wrapper must assign
+            # to `out` (the base), not `out_flat` (a view that gets rebound).
+            _base_tensor = tensor
+            while getattr(_base_tensor, "_base", None) is not None:
+                _base_tensor = _base_tensor._base
+            if _base_tensor is not tensor and _base_tensor in hf.tensor_to_origin:
+                base_origin = hf.tensor_to_origin[_base_tensor]
+                return_host_var = base_origin.host_str()
+                # We'll set host_reshape to the base tensor's shape below
+                # (stored in _nki_base_tensor_shape for use in reshape logic)
+                if not hasattr(device_fn, "_nki_base_tensor_shapes"):
+                    device_fn._nki_base_tensor_shapes = {}
+                device_fn._nki_base_tensor_shapes[id(tensor)] = list(_base_tensor.shape)
+
+            # Use per-tensor return buffers dict for multi-output support
+            if not hasattr(device_fn, "_nki_return_buffers"):
+                device_fn._nki_return_buffers = {}
+
+            tensor_id = id(tensor)
+            if tensor_id in device_fn._nki_return_buffers:
+                ret_buf_name = device_fn._nki_return_buffers[tensor_id]["buf_name"]
+            else:
                 ret_buf_name = device_fn.new_var("nki_return_buf")
                 dtype_str = env.backend.dtype_str(tensor.dtype)
                 shape_parts = []
-                for i in range(tensor.dim()):
-                    size_i = tensor.size(i)
+                for dim_i in range(tensor.dim()):
+                    size_i = tensor.size(dim_i)
                     size_str = (
                         state.sympy_expr(size_i._sympy_())
                         if isinstance(size_i, torch.SymInt)
                         else str(size_i)
                     )
                     shape_parts.append(size_str)
-                shape_str = ", ".join(shape_parts)
+
+                # NKI requires 2D buffers (partition, free). For 1D output
+                # tensors, choose layout based on the value's SBUF shape:
+                # - [P, 1] value (from reduction): use [N, 1] HBM (partition-axis)
+                # - [1, F] value (element-wise): use [1, N] HBM (free-axis)
+                host_reshape = None
+                # Check if we're storing to a view of a base tensor
+                base_shapes = getattr(device_fn, "_nki_base_tensor_shapes", {})
+                base_shape = base_shapes.get(tensor_id)
+                if tensor.dim() == 1:
+                    val_sbuf_shape = device_fn._nki_sbuf_shapes.get(value_name)
+                    use_partition_layout = (
+                        val_sbuf_shape is not None
+                        and len(val_sbuf_shape) >= 2
+                        and val_sbuf_shape[0] > 1
+                        and val_sbuf_shape[1] == 1
+                    )
+                    if use_partition_layout:
+                        shape_str = f"{shape_parts[0]}, 1"
+                    else:
+                        shape_str = f"1, {shape_parts[0]}"
+                    if base_shape is not None:
+                        # Reshape NKI result to the base tensor's shape
+                        host_reshape = f"[{', '.join(str(d) for d in base_shape)}]"
+                    else:
+                        host_reshape = f"[{shape_parts[0]}]"
+                else:
+                    shape_str = ", ".join(shape_parts)
+                    if base_shape is not None:
+                        host_reshape = f"[{', '.join(str(d) for d in base_shape)}]"
                 device_fn.preamble.append(
                     statement_from_string(
-                        f"{ret_buf_name} = nl.ndarray(({shape_str}), dtype={dtype_str}, buffer=nl.shared_hbm)"
+                        f"{ret_buf_name} = nl.ndarray([{shape_str}], dtype={dtype_str}, buffer=nl.shared_hbm)"
                     )
                 )
-                device_fn._nki_return_buffer_name = ret_buf_name
-                device_fn._nki_return_host_var = return_host_var
+                device_fn._nki_return_buffers[tensor_id] = {
+                    "buf_name": ret_buf_name,
+                    "host_var": return_host_var,
+                    "host_reshape": host_reshape,
+                }
+                # Keep backward compat: also set single-buffer attrs
+                # (used if there's only one output)
+                if len(device_fn._nki_return_buffers) == 1:
+                    device_fn._nki_return_buffer_name = ret_buf_name
+                    device_fn._nki_return_host_var = return_host_var
+                    device_fn._nki_return_host_reshape = host_reshape
     except Exception:
         pass
 
     if tile_vars:
         # Fully unroll: N explicit dma_copy statements, one per partition tile
         name = ret_buf_name if use_nki_return else device_fn.tensor_arg(tensor).name
+
+        # Determine whether tiles split along the partition dim (dim 0) or
+        # the free dim (last dim). If partition_offset_var is set, tiles split
+        # along dim 0 (partition). Otherwise, if the destination is 2D+ and
+        # there's no partition tiling, tiles split along the last dim (free).
+        tile_along_free = (
+            partition_offset_var is None
+            and len(slice_parts) >= 2
+        )
+
         for i, tile_var in enumerate(tile_vars):
             part_slice_parts = list(slice_parts)
-            if partition_offset_var is not None:
+            if tile_along_free:
+                # Tiles distribute along the free dimension (last dim)
+                part_slice_parts[-1] = (
+                    f"{i}*{NKI_PARTITION_MAX} : {i + 1}*{NKI_PARTITION_MAX}"
+                )
+            elif partition_offset_var is not None:
                 part_slice_parts[0] = (
                     f"{partition_offset_var}+{i}*{NKI_PARTITION_MAX} : "
                     f"{partition_offset_var}+{i + 1}*{NKI_PARTITION_MAX}"
@@ -727,8 +934,48 @@ def _(state: CodegenState) -> None:
                 )
             )
     else:
-        slice_str = ", ".join(slice_parts)
+        # Adjust slice for [1, N] SBUF values stored to 2D destinations:
+        # When the stored value is a [1, N] accumulator (partition=1) but the
+        # destination's first-dim slice has width > 1 (e.g. offset_0:offset_0+32),
+        # shrink the first dim to width 1 using the block-id formula.
+        adjusted_slice_parts = list(slice_parts)
+        if len(slice_parts) >= 1 and partition_offset_var is not None:
+            sbuf_shape = device_fn._nki_sbuf_shapes.get(value_name)
+            if sbuf_shape is not None and len(sbuf_shape) >= 1 and sbuf_shape[0] == 1:
+                # [1, N] value — store to a single row: offset//block_size
+                # find block_size from offset_var
+                for bid in state.codegen.active_device_loops.keys():
+                    if bid < len(env.block_sizes):
+                        bsize = env.block_sizes[bid].from_config_assert(state.config)
+                        if bsize > 1:
+                            boff = state.codegen.offset_var(bid)
+                            if boff == partition_offset_var:
+                                adjusted_slice_parts[0] = (
+                                    f"{partition_offset_var} // {int(bsize)} : "
+                                    f"{partition_offset_var} // {int(bsize)} + 1"
+                                )
+                                break
+
+        slice_str = ", ".join(adjusted_slice_parts)
         name = ret_buf_name if use_nki_return else device_fn.tensor_arg(tensor).name
+        # For 1D output tensors stored into 2D return buffers:
+        # Check the HBM buffer layout to decide slicing.
+        if use_nki_return and tensor.dim() == 1:
+            tensor_id = id(tensor)
+            buf_info = device_fn._nki_return_buffers.get(tensor_id, {})
+            val_sbuf_shape = device_fn._nki_sbuf_shapes.get(value_name)
+            use_partition_layout = (
+                val_sbuf_shape is not None
+                and len(val_sbuf_shape) >= 2
+                and val_sbuf_shape[0] > 1
+                and val_sbuf_shape[1] == 1
+            )
+            if use_partition_layout:
+                # [N, 1] HBM: partition-axis slicing, append "0:1" for free dim
+                slice_str = f"{slice_str}, 0:1"
+            else:
+                # [1, N] HBM: free-axis slicing, prepend "0:1" for partition dim
+                slice_str = f"0:1, {slice_str}"
         numel = tensor.numel()
         if numel == 1:
             state.codegen.add_statement(

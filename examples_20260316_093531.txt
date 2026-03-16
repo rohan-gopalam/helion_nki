@@ -1,0 +1,128 @@
+
+=== add.py ===
+ plugin failed
+2026-Mar-16 09:35:49.0607 275732:276241 [13] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_addc2bjn6eg_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_addeh11ad59.klir'
+2026-03-16 09:36:02.000970:  275732  [INFO]: Compilation Successfully Completed for model.MODULE_14379360200071347703+e30acd3a.hlo_module.pb
+
+
+=== aot_example.py ===
+
+
+=== attention.py ===
+FAILED
+m_users=2] = call_function[target=torch.ops.aten.bmm.default](args = (%_new_var, %k), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/attention.py", line 77, in attention
+    qk = torch.bmm(q, k)
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=3] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [1024], [%q, %m_i, %l_i, %acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/attention.py", line 75, in attention
+    for tile_n in hl.tile(v_view.size(1)):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== batch_softmax.py ===
+-Mar-16 09:36:22.0292 277435:277849 [6] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_batch_softmaxjdxc6xu7_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_batch_softmaxuauwov7i.klir'
+2026-03-16 09:36:24.000043:  277435  [INFO]: Compilation Successfully Completed for model.MODULE_12400539661160591355+e30acd3a.hlo_module.pb
+
+
+=== bf16xint16_gemm.py ===
+FAILED
+ule>
+    main()
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bf16xint16_gemm.py", line 180, in main
+    check(256, 256, 256)
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bf16xint16_gemm.py", line 154, in check
+    run_example(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_testing.py", line 879, in run_example
+    torch.testing.assert_close(
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch/testing/_comparison.py", line 1589, in assert_close
+    raise error_metas[0].to_error(msg)
+AssertionError: Tensor-likes are not close!
+
+Mismatched elements: 65424 / 65536 (99.8%)
+Greatest absolute difference: 1875968.0 at index (10, 26) (up to 0.01 allowed)
+Greatest relative difference: 39827.5078125 at index (154, 100) (up to 0.01 allowed)
+
+
+=== blackwell_attention.py ===
+
+
+=== bmm.py ===
+FAILED
+^^^^^^^^^
+
+
+While executing %acc : [num_users=1] = call_function[target=torch.ops.aten.baddbmm.default](args = (%_new_var, %load, %load_1), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bmm.py", line 57, in bmm
+    acc = torch.baddbmm(
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [768], [%acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bmm.py", line 56, in bmm
+    for tile_k in hl.tile(k):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== broadcast_matmul.py ===
+ 09:37:26.0009 280372:280953 [28] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_broadcast_matmuln3gza2h8_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_broadcast_matmulubsf00bc.klir'
+2026-03-16 09:37:40.000444:  280372  [INFO]: Compilation Successfully Completed for model.MODULE_18161740616263789973+e30acd3a.hlo_module.pb
+
+
+=== concatenate.py ===
+FAILED
+, line 1218, in run_node
+    raise InductorLoweringError(
+helion.exc.InductorLoweringError: Error in codegen for node where (aten.where.self): 'NKIOpOverrides' object has no attribute 'where'
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/concatenate.py", line 58, in concat2d_dim1
+    out[tile0, tile1] = torch.where(
+                        ^^^^^^^^^^^^
+
+
+While executing %where : [num_users=1] = call_function[target=torch.ops.aten.where.self](args = (%subscript_2, %x_part, %y_part), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/concatenate.py", line 58, in concat2d_dim1
+    out[tile0, tile1] = torch.where(
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== cross_entropy.py ===
+FAILED
+", line 100, in __call__
+    return kernel(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/_torch_xla.py", line 102, in __call__
+    config = self.dump_config_with_boundargs(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/FrameworkKernel.py", line 264, in dump_config_with_boundargs
+    _, klir_binary, metadata = self.specialize_and_call(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/TraceKernel.py", line 281, in specialize_and_call
+    raise Exception("Error(s) during tracing:\n" + "\n".join(metadata["errors"]))
+Exception: Error(s) during tracing:
+0:0:unsupported dtype 'int64'
+
+
+=== embedding.py ===

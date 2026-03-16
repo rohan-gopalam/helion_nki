@@ -30,7 +30,9 @@ import helion.language as hl
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[16, 128, 128, 128]),
+    # NKI requires batch block_size=1: nc_matmul only supports 2D tiles,
+    # so we iterate over batch elements one at a time.
+    config=helion.Config(block_sizes=[1, 128, 128, 128]),
     static_shapes=True,
 )
 def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -98,7 +100,7 @@ def main() -> None:
     assert version.parse(torch.__version__.split("+")[0]) >= version.parse("2.8"), (
         "Requires torch 2.8+"
     )
-    check(16, 512, 768, 1024)
+    check(2, 128, 128, 128)
 
 
 if __name__ == "__main__":

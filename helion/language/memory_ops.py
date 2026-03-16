@@ -569,6 +569,7 @@ def _(state: CodegenState) -> ast.AST:
     )
     slice_parts: list[str] = []
     partition_offset_var: str | None = None
+    _used_block_ids_load: set[int] = set()
 
     # Track which subscript elements map to tensor dimensions
     tensor_dim_idx = 0
@@ -596,7 +597,8 @@ def _(state: CodegenState) -> ast.AST:
         if block_id is None and isinstance(sub_val, torch.SymInt):
             for bid in state.codegen.active_device_loops.keys():
                 if bid < len(env.block_sizes) and not env.block_sizes[bid].reduction:
-                    block_id = bid
+                    if bid not in _used_block_ids_load:
+                        block_id = bid
                     break
 
         # For slice(None), check if this is a reduction dimension
@@ -619,6 +621,8 @@ def _(state: CodegenState) -> ast.AST:
                             break
 
         # Build the slice for this tensor dimension
+        if block_id is not None:
+            _used_block_ids_load.add(block_id)
         if block_id is not None and block_id in state.codegen.active_device_loops:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
@@ -637,6 +641,81 @@ def _(state: CodegenState) -> ast.AST:
 
         # Advance to next tensor dimension
         tensor_dim_idx += 1
+
+    # 3D+ tensors: reshaped to 2D at kernel entry ([B,M,K] → [B*M, K]).
+    # Combine the leading slice_parts into one flattened partition slice
+    # and squeeze output_shape to 2D.
+    if tensor.dim() > 2 and len(slice_parts) > 2:
+        # Combine all leading slice_parts (except the last) into one flat slice.
+        # Each leading slice is "offset:offset+block_size".  For the flattened
+        # tensor the row index is: batch_off * dim1_size + dim1_off (+ ...).
+        # Extract (offset, block_size) pairs from leading slice_parts.
+        leading_offsets: list[str] = []
+        leading_block_sizes: list[int] = []
+        original_dim_sizes: list[int] = []
+        for dim_i in range(tensor.dim() - 1):
+            sp = slice_parts[dim_i]
+            if ":" in sp:
+                off_str, end_str = sp.split(":")
+                off_str = off_str.strip()
+                leading_offsets.append(off_str)
+                # Try to extract numeric block size
+                # end_str is like "offset_0+128" or "offset_0 + 128"
+                plus_idx = end_str.find("+")
+                if plus_idx >= 0:
+                    bs_str = end_str[plus_idx + 1:].strip()
+                    try:
+                        leading_block_sizes.append(int(bs_str))
+                    except ValueError:
+                        leading_block_sizes.append(1)
+                else:
+                    # No "+": format is "0:size" — block_size is the end value
+                    end_str = end_str.strip()
+                    try:
+                        end_val = int(end_str)
+                        start_val = int(off_str) if off_str.strip().isdigit() else 0
+                        leading_block_sizes.append(end_val - start_val)
+                    except (ValueError, TypeError):
+                        leading_block_sizes.append(1)
+            else:
+                # Scalar index (block_size=1)
+                leading_offsets.append(sp.strip())
+                leading_block_sizes.append(1)
+            original_dim_sizes.append(
+                int(tensor.size(dim_i)) if isinstance(tensor.size(dim_i), int)
+                else _resolve_dim(tensor.size(dim_i))
+            )
+
+        # Build flat offset: off0 * size1 * size2 * ... + off1 * size2 * ... + offN
+        # and flat block_size: product of all leading block sizes
+        flat_offset_parts: list[str] = []
+        for j, off in enumerate(leading_offsets):
+            multiplier_parts = [str(original_dim_sizes[k]) for k in range(j + 1, len(original_dim_sizes))]
+            if multiplier_parts:
+                multiplier = " * ".join(multiplier_parts)
+                flat_offset_parts.append(f"{off} * {multiplier}")
+            else:
+                flat_offset_parts.append(off)
+        flat_offset = " + ".join(flat_offset_parts)
+        flat_block_size = 1
+        for bs in leading_block_sizes:
+            flat_block_size *= bs
+
+        # Replace leading slice_parts with one combined slice
+        flat_slice = f"({flat_offset}):({flat_offset}) + {flat_block_size}"
+        slice_parts = [flat_slice] + [slice_parts[-1]]
+
+        # Fix partition_offset_var to point to the flat offset expression
+        partition_offset_var = f"({flat_offset})"
+
+        # Squeeze output_shape to 2D: combine leading dims
+        flat_partition = 1
+        for dim_i in range(tensor.dim() - 1):
+            flat_partition *= _resolve_dim(output_shape[dim_i]) if dim_i < len(output_shape) else 1
+        if len(output_shape) > 2:
+            output_shape = [flat_partition] + [output_shape[-1]]
+        partition_dim = _resolve_dim(output_shape[0])
+        free_dims = [_resolve_dim(s) for s in output_shape[1:]]
 
     if partition_dim > NKI_PARTITION_MAX and free_dims in ([], [1]):
         # 1D / [1, N] path: tensor is 1D (reshaped to [1, N] at kernel entry).
@@ -761,6 +840,7 @@ def _(state: CodegenState) -> None:
     )
     slice_parts: list[str] = []
     partition_offset_var: str | None = None
+    _used_block_ids_store: set[int] = set()
     tensor_dim_idx = 0
     for i, sub_val in enumerate(subscript):
         if sub_val is None:
@@ -779,8 +859,9 @@ def _(state: CodegenState) -> None:
         if block_id is None and isinstance(sub_val, torch.SymInt):
             for bid in state.codegen.active_device_loops.keys():
                 if bid < len(env.block_sizes) and not env.block_sizes[bid].reduction:
-                    block_id = bid
-                    break
+                    if bid not in _used_block_ids_store:
+                        block_id = bid
+                        break
 
         # NKI fix: fallback for slice subscripts — match reduction blocks (skip block_size=1)
         if block_id is None and isinstance(sub_val, slice):
@@ -798,6 +879,8 @@ def _(state: CodegenState) -> None:
                                 block_id = bid
                                 break
 
+        if block_id is not None:
+            _used_block_ids_store.add(block_id)
         if block_id is not None and block_id in state.codegen.active_device_loops:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
@@ -816,6 +899,70 @@ def _(state: CodegenState) -> None:
             )
             slice_parts.append(f"0 : {size_str}")
         tensor_dim_idx += 1
+
+    # 3D+ tensors: reshaped to 2D at kernel entry.
+    # Combine leading slice_parts into one flat partition slice.
+    if tensor.dim() > 2 and len(slice_parts) > 2:
+        import sympy as _sympy_store
+
+        _bs_subs_store: dict[_sympy_store.Symbol, int] = {}
+        for _bid in range(len(env.block_sizes)):
+            _bs = env.block_sizes[_bid]
+            _bs_subs_store[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+        def _resolve_dim_store(s: int | torch.SymInt) -> int:
+            if isinstance(s, int):
+                return s
+            return int(s._sympy_().subs(_bs_subs_store))
+
+        leading_offsets_s: list[str] = []
+        original_dim_sizes_s: list[int] = []
+        leading_block_sizes_s: list[int] = []
+        for dim_i in range(tensor.dim() - 1):
+            sp = slice_parts[dim_i]
+            if ":" in sp:
+                off_str, end_str = sp.split(":")
+                off_str = off_str.strip()
+                leading_offsets_s.append(off_str)
+                plus_idx = end_str.find("+")
+                if plus_idx >= 0:
+                    bs_str = end_str[plus_idx + 1:].strip()
+                    try:
+                        leading_block_sizes_s.append(int(bs_str))
+                    except ValueError:
+                        leading_block_sizes_s.append(1)
+                else:
+                    end_str = end_str.strip()
+                    try:
+                        end_val = int(end_str)
+                        start_val = int(off_str) if off_str.strip().isdigit() else 0
+                        leading_block_sizes_s.append(end_val - start_val)
+                    except (ValueError, TypeError):
+                        leading_block_sizes_s.append(1)
+            else:
+                leading_offsets_s.append(sp.strip())
+                leading_block_sizes_s.append(1)
+            original_dim_sizes_s.append(
+                int(tensor.size(dim_i)) if isinstance(tensor.size(dim_i), int)
+                else _resolve_dim_store(tensor.size(dim_i))
+            )
+
+        flat_offset_parts_s: list[str] = []
+        for j, off in enumerate(leading_offsets_s):
+            multiplier_parts = [str(original_dim_sizes_s[k]) for k in range(j + 1, len(original_dim_sizes_s))]
+            if multiplier_parts:
+                multiplier = " * ".join(multiplier_parts)
+                flat_offset_parts_s.append(f"{off} * {multiplier}")
+            else:
+                flat_offset_parts_s.append(off)
+        flat_offset_s = " + ".join(flat_offset_parts_s)
+        flat_block_size_s = 1
+        for bs in leading_block_sizes_s:
+            flat_block_size_s *= bs
+
+        flat_slice = f"({flat_offset_s}) : ({flat_offset_s}) + {flat_block_size_s}"
+        slice_parts = [flat_slice] + [slice_parts[-1]]
+        partition_offset_var = f"({flat_offset_s})"
 
     value_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
     tile_vars = device_fn.get_tile_list_vars(value_name)
@@ -892,6 +1039,13 @@ def _(state: CodegenState) -> None:
                         host_reshape = f"[{', '.join(str(d) for d in base_shape)}]"
                     else:
                         host_reshape = f"[{shape_parts[0]}]"
+                elif tensor.dim() > 2:
+                    # 3D+ output: flatten to 2D for NKI HBM buffer,
+                    # reshape back to original shape on host.
+                    leading = shape_parts[:-1]
+                    flat_leading = " * ".join(f"({p})" for p in leading)
+                    shape_str = f"({flat_leading}), {shape_parts[-1]}"
+                    host_reshape = f"[{', '.join(shape_parts)}]"
                 else:
                     shape_str = ", ".join(shape_parts)
                     if base_shape is not None:
@@ -962,7 +1116,7 @@ def _(state: CodegenState) -> None:
                 # [1, N] value — store to a single row: offset//block_size
                 # find block_size from offset_var
                 for bid in state.codegen.active_device_loops.keys():
-                    if bid < len(env.block_sizes):
+                    if bid < len(env.block_sizes) and state.codegen.active_device_loops[bid]:
                         bsize = env.block_sizes[bid].from_config_assert(state.config)
                         if bsize > 1:
                             boff = state.codegen.offset_var(bid)

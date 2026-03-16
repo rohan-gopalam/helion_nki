@@ -307,6 +307,11 @@ def _(state: CodegenState) -> object:
 
     lhs_shape = list(lhs_proxy.shape)
     rhs_shape = list(rhs_proxy.shape)
+    # Squeeze leading batch dims for 3D+ shapes (batch_block=1)
+    while len(lhs_shape) > 2:
+        lhs_shape = lhs_shape[1:]
+    while len(rhs_shape) > 2:
+        rhs_shape = rhs_shape[1:]
     M_tile = _to_int(lhs_shape[0])
     K_tile = _to_int(lhs_shape[1])
     N_tile = _to_int(rhs_shape[-1])

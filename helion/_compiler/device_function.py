@@ -779,6 +779,15 @@ class DeviceFunction:
                         # broadcast vectors like weight/bias and keeps the
                         # partition dimension at 1 for natural broadcasting.
                         shape_parts = ["1"] + shape_parts
+                    elif arg.fake_value.dim() > 2:
+                        # Reshape 3D+ tensors to 2D by combining all leading
+                        # dims into the first dim.  E.g. [B,M,K] → [B*M, K].
+                        # NKI SBUF only supports 2D tiles; DMA requires src/dst
+                        # dims to match. The batch loop uses b_idx*dim + offset
+                        # to index into this flattened tensor.
+                        leading = shape_parts[:-1]
+                        flat = " * ".join(leading)
+                        shape_parts = [f"({flat})"] + shape_parts[-1:]
                     tensor_shape_preamble.append(
                         statement_from_string(
                             f"{arg.name} = {arg.name}.reshape([{', '.join(shape_parts)}])"

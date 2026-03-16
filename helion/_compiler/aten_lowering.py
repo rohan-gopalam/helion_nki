@@ -197,6 +197,19 @@ def codegen_full_nki(ctx: LoweringContext, node: Node) -> ast.AST:
             return s
         return int(s._sympy_().subs(_bs_subs))
 
+    # Squeeze leading batch dims (size 1) from 3D+ shapes to 2D.
+    # E.g. hl.zeros([1, tile_m, tile_n]) → [tile_m, tile_n] in NKI SBUF.
+    size = list(size)
+    while len(size) > 2 and _resolve_dim(size[0]) == 1:
+        size = size[1:]
+    # Also handle case where leading dims multiply to the partition dim
+    # (e.g. [B_tile, M_tile, N_tile] with B_tile > 1 — combine into flat partition)
+    if len(size) > 2:
+        flat_part = 1
+        for s in size[:-1]:
+            flat_part *= _resolve_dim(s)
+        size = [flat_part, _resolve_dim(size[-1])]
+
     partition_dim = _resolve_dim(size[0])
     free_dims = [_resolve_dim(s) for s in size[1:]]
     dtype_str = env.backend.dtype_str(dtype)
@@ -782,8 +795,8 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
 
-    lhs_shape = list(lhs_node.meta["val"].size())  # [M_tile, K_tile]
-    rhs_shape = list(rhs_node.meta["val"].size())  # [K_tile, N_tile]
+    lhs_shape = list(lhs_node.meta["val"].size())  # [M_tile, K_tile] or [B, M_tile, K_tile]
+    rhs_shape = list(rhs_node.meta["val"].size())  # [K_tile, N_tile] or [B, K_tile, N_tile]
 
     import sympy as _sympy
 
@@ -796,6 +809,14 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         if isinstance(s, int):
             return s
         return int(s._sympy_().subs(_bs_subs))
+
+    # Squeeze leading batch dimensions (size 1) from 3D+ shapes.
+    # The SBUF operands are already 2D (load codegen flattened them),
+    # so we just need the last 2 dims for tile size computation.
+    while len(lhs_shape) > 2:
+        lhs_shape = lhs_shape[1:]
+    while len(rhs_shape) > 2:
+        rhs_shape = rhs_shape[1:]
 
     M_tile = _to_int(lhs_shape[0])
     K_tile = _to_int(lhs_shape[1])
@@ -811,17 +832,23 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     need_cast_after_transpose = (matmul_dtype != torch.float32)
     matmul_dtype_str = env.backend.dtype_str(matmul_dtype)
 
-    if M_tile % TILE_M != 0:
-        raise exc.BackendUnsupported(f"NKI backend requires M_tile to be a multiple of {TILE_M}, got {M_tile}")
-    if K_tile % TILE_K != 0:
-        raise exc.BackendUnsupported(f"NKI backend requires K_tile to be a multiple of {TILE_K}, got {K_tile}")
+    if M_tile % TILE_M != 0 and M_tile > TILE_M:
+        raise exc.BackendUnsupported("nki", f"M_tile must be <= {TILE_M} or a multiple of {TILE_M}, got {M_tile}")
+    if K_tile % TILE_K != 0 and K_tile > TILE_K:
+        raise exc.BackendUnsupported("nki", f"K_tile must be <= {TILE_K} or a multiple of {TILE_K}, got {K_tile}")
     N_sub = min(TILE_N, N_tile)
     if N_tile > TILE_N and N_tile % TILE_N != 0:
-        raise exc.BackendUnsupported(f"NKI backend requires N_tile to be <= {TILE_N} or a multiple of {TILE_N}, got {N_tile}")
+        raise exc.BackendUnsupported("nki", f"N_tile must be <= {TILE_N} or a multiple of {TILE_N}, got {N_tile}")
 
-    n_sub_m = M_tile // TILE_M
-    n_sub_k = K_tile // TILE_K
+    actual_tile_m = min(M_tile, TILE_M)
+    actual_tile_k = min(K_tile, TILE_K)
+    n_sub_m = max(1, M_tile // TILE_M)
+    n_sub_k = max(1, K_tile // TILE_K)
     n_sub_n = max(1, N_tile // N_sub)
+
+    # From here on, use actual tile sizes for all allocations and slicing
+    TILE_M = actual_tile_m
+    TILE_K = actual_tile_k
 
     lhs_name = ast.unparse(lhs)
     rhs_name = ast.unparse(rhs)
@@ -1140,34 +1167,11 @@ def codegen_addmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
 
 @bmm_lowering.register_codegen("nki")
 def codegen_bmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
-    lhs_val = node.args[0].meta["val"]
-    rhs_val = node.args[1].meta["val"]
-    if isinstance(lhs_val, torch.Tensor) and isinstance(rhs_val, torch.Tensor):
-        if lhs_val.ndim != 2 or rhs_val.ndim != 2:
-            raise exc.BackendUnsupported(
-                "nki",
-                "bmm lowering currently supports only 2D sliced operands. "
-                "Tile over batch so each iteration passes [M,K] and [K,N].",
-            )
     return _nki_dot(ctx, node, False)
 
 
 @baddbmm_lowering.register_codegen("nki")
 def codegen_baddbmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
-    acc_val = node.args[0].meta["val"]
-    lhs_val = node.args[1].meta["val"]
-    rhs_val = node.args[2].meta["val"]
-    if (
-        isinstance(acc_val, torch.Tensor)
-        and isinstance(lhs_val, torch.Tensor)
-        and isinstance(rhs_val, torch.Tensor)
-        and (acc_val.ndim != 2 or lhs_val.ndim != 2 or rhs_val.ndim != 2)
-    ):
-        raise exc.BackendUnsupported(
-            "nki",
-            "baddbmm lowering currently supports only 2D sliced operands. "
-            "Tile over batch so each iteration passes [M,N], [M,K], [K,N].",
-        )
     return _nki_dot(ctx, node, True)
 
 

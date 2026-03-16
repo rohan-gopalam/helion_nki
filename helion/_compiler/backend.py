@@ -640,6 +640,19 @@ class NKIOpOverrides:
     """
 
     @staticmethod
+    def _squeeze_shape_2d(shape: list[int]) -> list[int]:
+        """Squeeze a shape to 2D for NKI SBUF. Drops leading 1-dims, then
+        flattens remaining leading dims if still > 2D."""
+        while len(shape) > 2 and shape[0] == 1:
+            shape = shape[1:]
+        if len(shape) > 2:
+            flat = 1
+            for d in shape[:-1]:
+                flat *= d
+            shape = [flat, shape[-1]]
+        return shape
+
+    @staticmethod
     def _nki_tensor_tensor(a: object, b: object, op: str, prefix: str) -> str:
         from .ast_extension import statement_from_string
         from .compile_environment import CompileEnvironment
@@ -650,6 +663,56 @@ class NKIOpOverrides:
         state = getattr(env, "_codegen_state", None)
         if state is None:
             return ""
+
+        def _emit_partition_broadcast(hbm_src: str, f_count: int, p_count: int,
+                                      target_dtype_str: str,
+                                      src_var_name: str = "") -> str | None:
+            """Broadcast HBM [1, F] data to [P, F] SBUF buffer.
+            Returns the SBUF variable name or None. Used by both multi-user and partition-mismatch paths.
+            """
+            from .ast_extension import create as _create, expr_from_string as _efrom
+            if not hasattr(state.device_function, "_nki_hbm_sources"):
+                state.device_function._nki_hbm_sources = {}
+            sbuf_dtypes = getattr(state.device_function, "_nki_sbuf_dtypes", {})
+            hbm_dtype_str = sbuf_dtypes.get(src_var_name, "nl.float16")
+            bcast_native = state.device_function.new_var(
+                "_nki_bcast_fp16" if hbm_dtype_str == "nl.float16" else "_nki_bcast_fp32",
+                dce=True,
+            )
+            state.device_function._nki_sbuf_shapes[bcast_native] = [p_count, f_count]
+            state.device_function._nki_hbm_sources[bcast_native] = hbm_src
+            if not hasattr(state.device_function, "_nki_sbuf_dtypes"):
+                state.device_function._nki_sbuf_dtypes = {}
+            state.device_function._nki_sbuf_dtypes[bcast_native] = hbm_dtype_str
+            state.add_statement(statement_from_string(
+                f"{bcast_native} = nl.ndarray([{p_count}, {f_count}], {hbm_dtype_str}, buffer=nl.sbuf)"
+            ))
+            p_loop_var = state.device_function.new_var("_p_bcast")
+            state.add_statement(_create(
+                ast.For,
+                target=_create(ast.Name, id=p_loop_var, ctx=ast.Store()),
+                iter=_efrom(f"nl.affine_range({p_count})"),
+                body=[statement_from_string(
+                    f"nisa.dma_copy(dst={bcast_native}[{p_loop_var}:{p_loop_var}+1, 0:{f_count}], "
+                    f"src={hbm_src})"
+                )],
+                orelse=[],
+            ))
+            if hbm_dtype_str == target_dtype_str:
+                return bcast_native
+            bcast_final = state.device_function.new_var("_nki_bcast", dce=True)
+            state.device_function._nki_sbuf_shapes[bcast_final] = [p_count, f_count]
+            state.device_function._nki_hbm_sources[bcast_final] = hbm_src
+            state.device_function._nki_sbuf_dtypes[bcast_final] = target_dtype_str
+            state.add_statement(statement_from_string(
+                f"{bcast_final} = nl.ndarray([{p_count}, {f_count}], {target_dtype_str}, buffer=nl.sbuf)"
+            ))
+            state.add_statement(statement_from_string(f"nisa.memset({bcast_final}, value=0)"))
+            state.add_statement(statement_from_string(
+                f"nisa.tensor_tensor(dst={bcast_final}, data1={bcast_final}, "
+                f"data2={bcast_native}, op=nl.add)"
+            ))
+            return bcast_final
 
         # Use ast.unparse for AST nodes to get the variable name string,
         # since str(ast.Name(id='x')) returns an object repr, not 'x'.
@@ -730,6 +793,9 @@ class NKIOpOverrides:
                             _resolved2.append(int(_d2))
                     if len(_resolved2) >= 2:  # only use if 2-D (NKI requirement)
                         shape_list = _resolved2
+            # Squeeze 3D+ shapes to 2D for NKI SBUF
+            if shape_list is not None:
+                shape_list = NKIOpOverrides._squeeze_shape_2d(shape_list)
             if shape_list is not None and out_val is not None and isinstance(out_val, torch.Tensor):
                 # Derive dtype: prefer FX node output, fallback to float32
                 if hasattr(out_val, 'dtype') and out_val.numel() > 1:
@@ -761,68 +827,6 @@ class NKIOpOverrides:
                         f"{new_dst} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
                     )
                 )
-
-                def _emit_partition_broadcast(hbm_src: str, f_count: int, p_count: int,
-                                      target_dtype_str: str,
-                                      src_var_name: str = "") -> str | None:
-                    """Broadcast HBM [1, F] data to [P, F] SBUF buffer.
-
-                    Uses the source variable's registered SBUF dtype for the DMA load
-                    (so fp32 HBM data loads into fp32 buffer, fp16 into fp16), then
-                    casts to target_dtype_str if different.
-                    Returns the SBUF variable name or None.
-                    """
-                    from .ast_extension import create as _create, expr_from_string as _efrom
-                    if not hasattr(state.device_function, "_nki_hbm_sources"):
-                        state.device_function._nki_hbm_sources = {}
-
-                    # Determine the dtype of the HBM source data.
-                    # Look up the source variable's dtype; default to float16.
-                    sbuf_dtypes = getattr(state.device_function, "_nki_sbuf_dtypes", {})
-                    hbm_dtype_str = sbuf_dtypes.get(src_var_name, "nl.float16")
-
-                    # Step 1: DMA broadcast in the native HBM data dtype
-                    bcast_native = state.device_function.new_var(
-                        "_nki_bcast_fp16" if hbm_dtype_str == "nl.float16" else "_nki_bcast_fp32",
-                        dce=True,
-                    )
-                    state.device_function._nki_sbuf_shapes[bcast_native] = [p_count, f_count]
-                    state.device_function._nki_hbm_sources[bcast_native] = hbm_src
-                    if not hasattr(state.device_function, "_nki_sbuf_dtypes"):
-                        state.device_function._nki_sbuf_dtypes = {}
-                    state.device_function._nki_sbuf_dtypes[bcast_native] = hbm_dtype_str
-                    state.add_statement(statement_from_string(
-                        f"{bcast_native} = nl.ndarray([{p_count}, {f_count}], {hbm_dtype_str}, buffer=nl.sbuf)"
-                    ))
-                    p_loop_var = state.device_function.new_var("_p_bcast")
-                    state.add_statement(_create(
-                        ast.For,
-                        target=_create(ast.Name, id=p_loop_var, ctx=ast.Store()),
-                        iter=_efrom(f"nl.affine_range({p_count})"),
-                        body=[statement_from_string(
-                            f"nisa.dma_copy(dst={bcast_native}[{p_loop_var}:{p_loop_var}+1, 0:{f_count}], "
-                            f"src={hbm_src})"
-                        )],
-                        orelse=[],
-                    ))
-
-                    # Step 2: cast to target dtype if different from source dtype
-                    if hbm_dtype_str == target_dtype_str:
-                        return bcast_native
-                    bcast_final = state.device_function.new_var("_nki_bcast", dce=True)
-                    state.device_function._nki_sbuf_shapes[bcast_final] = [p_count, f_count]
-                    state.device_function._nki_hbm_sources[bcast_final] = hbm_src
-                    state.device_function._nki_sbuf_dtypes[bcast_final] = target_dtype_str
-                    state.add_statement(statement_from_string(
-                        f"{bcast_final} = nl.ndarray([{p_count}, {f_count}], {target_dtype_str}, buffer=nl.sbuf)"
-                    ))
-                    state.add_statement(statement_from_string(f"nisa.memset({bcast_final}, value=0)"))
-                    state.add_statement(statement_from_string(
-                        f"nisa.tensor_tensor(dst={bcast_final}, data1={bcast_final}, "
-                        f"data2={bcast_native}, op=nl.add)"
-                    ))
-                    return bcast_final
-
 
                 if b_tile_vars is not None:
                     # tile-list variant: emit per-tile ops into new_dst
@@ -1061,6 +1065,7 @@ class NKIOpOverrides:
                     _lk = _lk[:_lk.rfind("_copy")]
                 _ts_shape = _sb.get(_lk)
             if _ts_shape is not None and len(_ts_shape) >= 2:
+                _ts_shape = NKIOpOverrides._squeeze_shape_2d(list(_ts_shape))
                 _ts_out_val = _ts_node.meta.get("val") if _ts_node else None
                 _ts_dtype = "nl.float32"
                 if _ts_out_val is not None and isinstance(_ts_out_val, torch.Tensor):
@@ -1154,6 +1159,28 @@ class NKIOpOverrides:
         if not a_is_scalar and not b_is_scalar and cls._is_scalar_like_tensor(b):
             return cls._nki_tensor_scalar(a, b, op_tensor_scalar)
 
+        # Check for broadcast pattern: [M,N] op [M,1] after 3D squeeze
+        # This handles cases like acc * alpha[:, :, None] where alpha is [1,M,1]
+        if not a_is_scalar and not b_is_scalar:
+            from torch._inductor.virtualized import V as _V_bin
+            _bin_node = _V_bin.current_node
+            if _bin_node is not None and len(_bin_node.args) >= 2:
+                _lhs_s = cls._shape_from_node_arg(_bin_node.args[0])
+                _rhs_s = cls._shape_from_node_arg(_bin_node.args[1])
+                if _lhs_s is not None and _rhs_s is not None:
+                    _lhs_sq = tuple(cls._squeeze_shape_2d(list(_lhs_s)))
+                    _rhs_sq = tuple(cls._squeeze_shape_2d(list(_rhs_s)))
+                    if (len(_lhs_sq) == 2 and len(_rhs_sq) == 2
+                            and _lhs_sq[0] == _rhs_sq[0] and _rhs_sq[1] == 1
+                            and _lhs_sq[1] != 1):
+                        return cls._nki_tensor_scalar(a, b, op_tensor_scalar)
+                    # Also handle reverse: [M,1] op [M,N]
+                    if (len(_lhs_sq) == 2 and len(_rhs_sq) == 2
+                            and _lhs_sq[0] == _rhs_sq[0] and _lhs_sq[1] == 1
+                            and _rhs_sq[1] != 1):
+                        reverse0 = op_tensor_scalar in {"nl.subtract", "nl.divide"}
+                        return cls._nki_tensor_scalar(b, a, op_tensor_scalar, reverse0=reverse0)
+
         # tensor <op> tensor
         if allow_tensor_tensor:
             return cls._nki_tensor_tensor(a, b, op_tensor_tensor, "nki_binary")
@@ -1232,6 +1259,7 @@ class NKIOpOverrides:
 
         Supports [M,N]/[M,1] broadcast and same-shape divisions where
         one dimension is 1 (NKI tensor_scalar broadcasts over free dim).
+        Also handles 3D+ shapes with leading 1-dims (from batch_block=1).
         """
         from torch._inductor.virtualized import V
 
@@ -1243,13 +1271,18 @@ class NKIOpOverrides:
         rhs_shape = cls._shape_from_node_arg(node.args[1])
         if lhs_shape is None or rhs_shape is None:
             return False
+        # Squeeze leading dims for 3D+ shapes (3D→2D at kernel entry).
+        # Dims may be symbolic (SymInt) so just drop all leading dims to get last 2.
+        lhs_shape = lhs_shape[-2:] if len(lhs_shape) >= 2 else lhs_shape
+        rhs_shape = rhs_shape[-2:] if len(rhs_shape) >= 2 else rhs_shape
         if len(lhs_shape) != 2 or len(rhs_shape) != 2:
             return False
         return lhs_shape[0] == rhs_shape[0] and rhs_shape[1] == 1
 
     @classmethod
     def _same_shape_tensor_tensor(cls) -> bool:
-        """True when both operands have the same shape (any dimensionality)."""
+        """True when both operands have the same shape (any dimensionality).
+        Squeezes leading 1-dims for 3D+ shapes."""
         from torch._inductor.virtualized import V
 
         node = V.current_node
@@ -1259,6 +1292,9 @@ class NKIOpOverrides:
         rhs_shape = cls._shape_from_node_arg(node.args[1])
         if lhs_shape is None or rhs_shape is None:
             return False
+        # Use last 2 dims for 3D+ shapes (3D→2D at kernel entry)
+        lhs_shape = lhs_shape[-2:] if len(lhs_shape) >= 2 else lhs_shape
+        rhs_shape = rhs_shape[-2:] if len(rhs_shape) >= 2 else rhs_shape
         if len(lhs_shape) != len(rhs_shape):
             return False
         return all(a == b for a, b in zip(lhs_shape, rhs_shape))
@@ -1408,6 +1444,9 @@ class NKIOpOverrides:
                         _resolved.append(int(_d))
                 if len(_resolved) >= 2:
                     shape_list = _resolved
+            # Squeeze 3D+ shapes to 2D for NKI SBUF
+            if shape_list is not None:
+                shape_list = NKIOpOverrides._squeeze_shape_2d(shape_list)
             if shape_list is not None and out_val is not None:
                 if hasattr(out_val, 'dtype') and out_val.numel() > 1:
                     dtype_str = env.backend.dtype_str(out_val.dtype)
@@ -1980,6 +2019,14 @@ class NKIBackend(Backend):
                             _resolved_dims.append(int(env.size_hint(_d)))
                     else:
                         _resolved_dims.append(int(_d))
+                # Squeeze 3D+ shapes to 2D (NKI SBUF is always 2D)
+                while len(_resolved_dims) > 2 and _resolved_dims[0] == 1:
+                    _resolved_dims = _resolved_dims[1:]
+                if len(_resolved_dims) > 2:
+                    flat = 1
+                    for d in _resolved_dims[:-1]:
+                        flat *= d
+                    _resolved_dims = [flat, _resolved_dims[-1]]
                 if len(_resolved_dims) == 0:
                     shape_dims = [1, 1]  # scalar
                 elif len(_resolved_dims) == 1:
@@ -2007,7 +2054,14 @@ class NKIBackend(Backend):
             else:
                 resolved.append(int(s))
 
-        # NKI requires at least 2D. If 1D, add trailing 1.
+        # NKI SBUF is always 2D. Squeeze 3D+ to 2D, pad 1D to 2D.
+        while len(resolved) > 2 and resolved[0] == 1:
+            resolved = resolved[1:]
+        if len(resolved) > 2:
+            flat = 1
+            for d in resolved[:-1]:
+                flat *= d
+            resolved = [flat, resolved[-1]]
         if len(resolved) == 1:
             resolved.append(1)
 
@@ -2128,6 +2182,19 @@ class NKIBackend(Backend):
         # NKI requires at least 2D (partition, free). Append trailing 1 if 1D.
         if len(shape_dims) == 1:
             shape_dims = shape_dims + ["1"]
+        # NKI SBUF is always 2D. Squeeze leading 1-dims from 3D+ shapes,
+        # then flatten remaining leading dims if still > 2D.
+        while len(shape_dims) > 2:
+            try:
+                if int(shape_dims[0]) == 1:
+                    shape_dims = shape_dims[1:]
+                    continue
+            except (ValueError, TypeError):
+                pass
+            # Flatten leading dims into one
+            leading = shape_dims[:-1]
+            flat = " * ".join(f"({d})" for d in leading)
+            shape_dims = [flat, shape_dims[-1]]
         shape_str = ", ".join(shape_dims)
         dtype_str = self.dtype_str(dtype)
         return f"nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
@@ -2137,7 +2204,8 @@ class NKIBackend(Backend):
         return f"nisa.memset({var}, value={value_expr})"
 
     def reshape_expr(self, expr: str, shape: str) -> str:
-        return f"({expr}).reshape({shape})"
+        # NKI SBUF tensors are always 2D; reshape is a no-op
+        return expr
 
     def scalar_load_expr(self, tensor_name: str) -> str:
         raise exc.BackendUnsupported(
@@ -2148,8 +2216,8 @@ class NKIBackend(Backend):
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         raise exc.BackendUnsupported(
             self.name,
-            "tile boundary masking should not occur with exact-multiple shapes — "
-            "if you need causal masking that is not yet implemented.",
+            "trn1 does not support tensor comparison ops needed for where/masking. "
+            "Use slice-based approaches (separate DMA copies) instead.",
         )
 
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
@@ -2246,12 +2314,20 @@ class NKIBackend(Backend):
                 return result_var
 
             # dim >= 1: use tensor_reduce on the free axis
+            # For 3D+ shapes (batch_block=1), adjust dim to account for
+            # squeezed leading dims: e.g. dim=2 on [1,M,N] → dim=1 on [M,N]
+            if fake_input is not None and fake_input.ndim > 2:
+                n_squeeze = fake_input.ndim - 2
+                dim = dim - n_squeeze
+
             # Derive the partition size from fake_input.size(0) with SymInt→config
             # substitution so the configured block size is used rather than the trace
             # hint (e.g. an inner tile with block_size=1 has a default hint of 64,
             # but the actual partition dimension at runtime is 1).
             if fake_input is not None and fake_input.ndim >= 2:
-                part_size_sym = fake_input.size(0)
+                # For 3D+ inputs, partition dim is after squeezed leading dims
+                part_dim_idx = max(0, fake_input.ndim - 2)
+                part_size_sym = fake_input.size(part_dim_idx)
                 if isinstance(part_size_sym, torch.SymInt) and state.config is not None:
                     import sympy as _sympy
                     _bs_subs: dict[_sympy.Symbol, int] = {}

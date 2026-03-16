@@ -1,0 +1,432 @@
+
+=== add.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== aot_example.py ===
+
+
+=== attention.py ===
+FAILED
+m_users=2] = call_function[target=torch.ops.aten.bmm.default](args = (%_new_var, %k), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/attention.py", line 77, in attention
+    qk = torch.bmm(q, k)
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=3] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [1024], [%q, %m_i, %l_i, %acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/attention.py", line 75, in attention
+    for tile_n in hl.tile(v_view.size(1)):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== batch_softmax.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== bf16xint16_gemm.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== blackwell_attention.py ===
+
+
+=== bmm.py ===
+FAILED
+^^^^^^^^^
+
+
+While executing %acc : [num_users=1] = call_function[target=torch.ops.aten.baddbmm.default](args = (%_new_var, %load, %load_1), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bmm.py", line 57, in bmm
+    acc = torch.baddbmm(
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [768], [%acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bmm.py", line 56, in bmm
+    for tile_k in hl.tile(k):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== broadcast_matmul.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== concatenate.py ===
+FAILED
+, line 1218, in run_node
+    raise InductorLoweringError(
+helion.exc.InductorLoweringError: Error in codegen for node where (aten.where.self): 'NKIOpOverrides' object has no attribute 'where'
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/concatenate.py", line 58, in concat2d_dim1
+    out[tile0, tile1] = torch.where(
+                        ^^^^^^^^^^^^
+
+
+While executing %where : [num_users=1] = call_function[target=torch.ops.aten.where.self](args = (%subscript_2, %x_part, %y_part), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/concatenate.py", line 58, in concat2d_dim1
+    out[tile0, tile1] = torch.where(
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== cross_entropy.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== embedding.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== exp.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== fp8_gemm.py ===
+FAILED
+ = call_function[target=helion.language.memory_ops.load](args = (%x, [%sym_size_int, %block_size_2], None, None), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/fp8_gemm.py", line 56, in fp8_gemm
+    x_tile = x[tile_m, tile_k]
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [256], [%acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/fp8_gemm.py", line 54, in fp8_gemm
+    for tile_k in hl.tile(k):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== fused_linear_jsd.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== gather_gemv.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== gdn_fwd_h.py ===
+FAILED
+oad](args = (%g, [%u4, %sub_1, %u5], None, None), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/gdn_fwd_h.py", line 71, in helion_gdn_fwd_h
+    b_g_last = g[i_b, t_i_last, i_h].to(acc_dtype)
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [4096], [%b_h]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/gdn_fwd_h.py", line 62, in helion_gdn_fwd_h
+    for t_i in hl.tile(seqlen, block_size=chunk_size):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== geglu.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== grouped_gemm.py ===
+FAILED
+me/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/grouped_gemm.py", line 92, in grouped_gemm_jagged
+    for g in hl.grid(G):
+
+
+
+=== grpo_loss.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== int4_gemm.py ===
+FAILED
+rnel_test/helion_nki/helion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/int4_gemm.py", line 62, in matmul_bf16_int4
+    for tile_m, tile_n in hl.tile([M, N]):
+
+
+
+=== jagged_dense_add.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== jagged_hstu_attn.py ===
+FAILED
+lion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_hstu_attn.py", line 115, in _helion_jagged_attention_kernel
+    for tile_b, tile_h, tile_q in hl.tile(
+
+
+
+=== jagged_layer_norm.py ===
+FAILED
+s = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_layer_norm.py", line 112, in jagged_layer_norm_kernel
+    for tile_k in hl.tile(0, max_seq_len):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop_1 : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (3, [0], [32], [%max_seq_len, %starts, %seq_lengths, %mean_acc_1, %var_acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_layer_norm.py", line 110, in jagged_layer_norm_kernel
+    for tile_m in hl.tile(M):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== jagged_mean.py ===
+FAILED
+new_var_3, %feature_valid, %row_sums]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_mean.py", line 82, in jagged_mean_kernel
+    for tile_k in hl.tile(0, max_nnz):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=0] = call_function[target=helion.language._tracing_ops._for_loop](args = (1, [0], [%u0], [%feature_counts, %max_nnz, %starts, %nnz]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_mean.py", line 74, in jagged_mean_kernel
+    for tile_m in hl.tile(max_M):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== jagged_softmax.py ===
+FAILED
+, %block_max, %block_new_max, %block_L]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_softmax.py", line 96, in jagged_softmax_kernel
+    for tile_k in hl.tile(max_seqlen):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=0] = call_function[target=helion.language._tracing_ops._for_loop](args = (2, [0], [128], [%max_seqlen, %starts, %seqlens]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_softmax.py", line 91, in jagged_softmax_kernel
+    for tile_m in hl.tile(M):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== jagged_sum.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== jsd.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== kl_div.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== layer_norm.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== layer_norm_f32.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== long_sum.py ===
+FAILED
+sions.py", line 3004, in wrapper
+    return arg(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/core/xla_model.py", line 137, in xla_device
+    return torch_xla.device(n)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch_xla/torch_xla.py", line 40, in device
+    return torch.device(torch_xla._XLAC._xla_get_default_device())
+RuntimeError: Init: error condition (((rt_status) != NRT_SUCCESS)):  [General]: [NRT_FAILURE] status_code=1. Operation failed due to an unspecified error condition in the runtime system. For more details check stderr, or system logs for neuron messages. https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html#nrt-troubleshooting
+
+
+=== low_mem_dropout.py ===
+FAILED
+/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/low_mem_dropout.py", line 49, in low_mem_dropout
+    for tidx in hl.tile(n):
+
+
+
+=== mamba2_chunk_scan.py ===
+FAILED
+ng codegen not registered for <OpOverload(op='aten.permute', overload='default')>
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/mamba2_chunk_scan.py", line 106, in helion_mamba2_chunk_scan_kernel
+    acc_o = hl.dot(C_local, prev_states_local.T, acc=acc_o)
+                            ^^^^^^^^^^^^^^^^^^^
+
+
+While executing %permute : [num_users=1] = call_function[target=torch.ops.aten.permute.default](args = (%prev_states_local, [1, 0]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/mamba2_chunk_scan.py", line 106, in helion_mamba2_chunk_scan_kernel
+    acc_o = hl.dot(C_local, prev_states_local.T, acc=acc_o)
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== mamba2_chunk_state.py ===

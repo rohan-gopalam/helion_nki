@@ -650,11 +650,19 @@ def _(state: CodegenState) -> ast.AST:
         )
         # Build the source slice: name[0:1, orig_slice] to match the [1, N] reshape
         orig_slice = slice_parts[0] if slice_parts else f"0:{partition_dim}"
+        hbm_src_1d = f"{name}[0:1, {orig_slice}]"
         state.codegen.add_statement(
             statement_from_string(
-                f"nisa.dma_copy(dst={sbuf_name}, src={name}[0:1, {orig_slice}])"
+                f"nisa.dma_copy(dst={sbuf_name}, src={hbm_src_1d})"
             )
         )
+        # Register HBM source for partition-broadcast codegen
+        if not hasattr(device_fn, "_nki_hbm_sources"):
+            device_fn._nki_hbm_sources = {}
+        device_fn._nki_hbm_sources[sbuf_name] = hbm_src_1d
+        if not hasattr(device_fn, "_nki_sbuf_dtypes"):
+            device_fn._nki_sbuf_dtypes = {}
+        device_fn._nki_sbuf_dtypes[sbuf_name] = dtype_str
     elif partition_dim > NKI_PARTITION_MAX:
         n_partitions = partition_dim // NKI_PARTITION_MAX
         assert partition_dim % NKI_PARTITION_MAX == 0
@@ -702,6 +710,10 @@ def _(state: CodegenState) -> ast.AST:
             sbuf_shape = [partition_dim] + free_dims
         shape_str = ", ".join(str(d) for d in sbuf_shape)
         device_fn._nki_sbuf_shapes[sbuf_name] = sbuf_shape
+        # Track SBUF dtype for correct broadcast buffer allocation
+        if not hasattr(device_fn, "_nki_sbuf_dtypes"):
+            device_fn._nki_sbuf_dtypes = {}
+        device_fn._nki_sbuf_dtypes[sbuf_name] = dtype_str
         state.codegen.add_statement(
             statement_from_string(
                 f"{sbuf_name} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
@@ -712,11 +724,16 @@ def _(state: CodegenState) -> ast.AST:
         # needs 2D indexing. Prepend "0:1" for the partition dimension.
         if tensor.dim() == 1 and len(slice_parts) == 1:
             slice_str = f"0:1, {slice_str}"
+        hbm_src_expr = f"{name}[{slice_str}]"
         state.codegen.add_statement(
             statement_from_string(
-                f"nisa.dma_copy(dst={sbuf_name}, src={name}[{slice_str}])"
+                f"nisa.dma_copy(dst={sbuf_name}, src={hbm_src_expr})"
             )
         )
+        # Track HBM source for partition-broadcast codegen in tensor_tensor
+        if not hasattr(device_fn, "_nki_hbm_sources"):
+            device_fn._nki_hbm_sources = {}
+        device_fn._nki_hbm_sources[sbuf_name] = hbm_src_expr
     return expr_from_string(sbuf_name)
 
 

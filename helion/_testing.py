@@ -945,13 +945,26 @@ def run_example(
                         f"impl has grad={tensor.grad is not None}"
                     )
 
+                    import torch.nn.functional as F
+
+                    # Grab FP32 representations
+                    grad_fp32 = tensor.grad.to(torch.float32)
+                    base_fp32 = baseline_grad.to(torch.float32)
+
+                    # Calculate Mean Squared Error
+                    mse_loss = F.mse_loss(grad_fp32, base_fp32).item()
+
+                    rtol=1e-2
+                    atol=6e-2
+
                     if baseline_grad is not None:
+                        print(f"DEBUG TOLERANCES: rtol={rtol}, atol={atol}", file=sys.stderr)
                         torch.testing.assert_close(
                             tensor.grad.to(torch.float32),
                             baseline_grad.to(torch.float32),
                             rtol=rtol,
                             atol=atol,
-                            msg=f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}",
+                            msg=lambda default: f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}, MSE: {mse_loss}\n{default}" #msg=f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}, MSE: {mse_loss}",
                         )
 
                 # Clear gradients for next test

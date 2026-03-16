@@ -543,6 +543,7 @@ class _Settings:
     autotune_baseline_atol: float | None = None
     autotune_baseline_rtol: float | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    platform_target: str | None = None
 
 
 class Settings(_Settings):
@@ -648,6 +649,7 @@ class Settings(_Settings):
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
         ),
+        "platform_target": "The hardware platform to compile for when using the NKI backend (e.g. 'trn1').",
     }
 
     def __init__(self, **settings: object) -> None:

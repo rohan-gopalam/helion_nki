@@ -23,6 +23,7 @@ Based on liger_kernel's GEGLU implementation used in Gemma and other gated feedf
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -386,15 +387,22 @@ def main() -> None:
     Main entry point that runs the GEGLU kernel and MLP verification.
     Tests various shapes including typical transformer sizes.
     """
+    _nki_mode = os.environ.get("HELION_BACKEND") == "nki"
     print("Testing GEGLU kernel...")
 
-    # Test GEGLU kernel with different shapes
-    kernel_test_shapes = [(8, 2048, 4096), (8, 4096, 8192)]
+    # NKI: use small shapes to keep compilation/execution time reasonable.
+    # The view(-1) flattens the tensor; large shapes (e.g. 8×2048×4096 = 67M elements)
+    # cause NKI compilation to time out.
+    kernel_test_shapes = [(128, 1024)] if _nki_mode else [(8, 2048, 4096), (8, 4096, 8192)]
 
     for shape in kernel_test_shapes:
         print(f"\nTesting GEGLU kernel shape: {shape}")
         check_geglu_kernel(shape)
         print(f"✓ GEGLU kernel shape {shape} passed")
+
+    if _nki_mode:
+        # NKI: skip MLP test (involves large matmul pipelines that compile slowly)
+        return
 
     print("\n\nTesting GEGLU MLP...")
 

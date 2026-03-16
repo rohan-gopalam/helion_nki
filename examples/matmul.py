@@ -308,9 +308,8 @@ def check(m: int, k: int, n: int) -> None:
     y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
     bias = torch.randn([n], device=DEVICE, dtype=torch.float16)
     bias_scalar = torch.randn([1], device=DEVICE, dtype=torch.float16)
-    # Test without bias (plain matmul only for NKI)
+    # Test without bias
     run_example(matmul, torch.matmul, (x, y))
-    return  # NKI: skip epilogue/bias/backward tests for now
 
     # Test for addmm with scalar bias
     def addmm(bias: Tensor, mat1: Tensor, mat2: Tensor) -> Tensor:
@@ -346,6 +345,9 @@ def check(m: int, k: int, n: int) -> None:
         baseline_wrapper,
         (x, y),
     )
+
+    # NKI: skip backward tests (matmul_bwd uses unsupported patterns)
+    return
 
     # Test matmul forward + backward pass
     print("\n\n=== MatMul Forward + Backward Pass Test ===")

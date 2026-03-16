@@ -323,6 +323,23 @@ reshape_lowering = register_lowering(
 )
 
 
+@squeeze_lowering.register_codegen("nki")
+def codegen_squeeze_nki(ctx: LoweringContext, node: Node) -> object:
+    # NKI tensors are already 2D (partition, free); squeeze is a no-op.
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
+@view_lowering.register_codegen("nki")
+@reshape_lowering.register_codegen("nki")
+def codegen_view_nki(ctx: LoweringContext, node: Node) -> object:
+    # NKI SBUF tensors are 2D (partition, free); view/reshape are no-ops.
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
 @squeeze_lowering.register_codegen("triton")
 @view_lowering.register_codegen("triton")
 @reshape_lowering.register_codegen("triton")

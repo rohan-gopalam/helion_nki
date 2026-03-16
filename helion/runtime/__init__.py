@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import linecache
 import os
+import time
 from typing import Any
 from typing import cast
 
@@ -156,8 +157,18 @@ def default_nki_launcher(
             moved_args.append(arg)
 
     # pyrefly: ignore [operator]
+    import sys
+    print("        [Profile] Starting nki_kernel (XLA trace/compile)...", file=sys.stderr)
+    t_nki_start = time.time()
     result = nki_kernel[grid](*moved_args, **kwargs)
+    t_nki_end = time.time()
+    print(f"        [Profile] nki_kernel took {t_nki_end - t_nki_start:.2f} seconds.", file=sys.stderr)
+    
+    print("        [Profile] Starting xm.mark_step() (XLA execution)...", file=sys.stderr)
+    t_mark_start = time.time()
     xm.mark_step()
+    t_mark_end = time.time()
+    print(f"        [Profile] xm.mark_step took {t_mark_end - t_mark_start:.2f} seconds.", file=sys.stderr)
 
     if first_tensor_device is None:
         return result

@@ -31,7 +31,7 @@ import helion.language as hl
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(),
+    config=helion.Config(block_sizes=[128, 128]),
     static_shapes=True,
 )
 def matmul_layernorm(
@@ -39,6 +39,10 @@ def matmul_layernorm(
 ) -> torch.Tensor:
     """
     Performs matrix multiplication followed by layer normalization.
+
+    NKI: single outer loop over tile_m. K must fit in one NKI partition (≤128).
+    Uses y.size(1) directly in hl.zeros so that acc and hl.dot share the same
+    symbolic dimension, avoiding ControlFlowTensorMismatch.
 
     Args:
         x: First input tensor of shape [M, K]
@@ -50,8 +54,7 @@ def matmul_layernorm(
         Output tensor of shape [M, N] containing the result of matrix multiplication followed by layer normalization
     """
     m, k = x.size()
-    k2 = y.size(0)
-    n = hl.specialize(y.size(1))
+    k2, n = y.size()
     assert k == k2, f"size mismatch {k} != {k2}"
     assert weight.size(0) == n, f"weight size mismatch {weight.size(0)} != {n}"
     assert bias.size(0) == n, f"bias size mismatch {bias.size(0)} != {n}"
@@ -59,18 +62,18 @@ def matmul_layernorm(
         [m, n], dtype=torch.promote_types(x.dtype, y.dtype), device=x.device
     )
     for tile_m in hl.tile(m):
-        acc = hl.zeros([tile_m, n], dtype=torch.float32)
+        # Use y.size(1) in hl.zeros so acc has same symbolic as hl.dot output
+        acc = hl.zeros([tile_m, y.size(1)], dtype=torch.float32)
         for tile_k in hl.tile(k):
-            mm = torch.matmul(x[tile_m, tile_k], y[tile_k, :])
-            acc = acc + mm
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, :], acc=acc, out_dtype=torch.float32)
         eps = 1e-5
-        sum_vals = acc.sum(dim=-1, keepdim=True)
-        mean = sum_vals / n
-        centered = acc - mean
-        var = (centered * centered).sum(dim=-1, keepdim=True) / n
-        normalized = centered * torch.rsqrt(var + eps)
-        acc = normalized * (weight[:].to(torch.float32)) + (bias[:].to(torch.float32))
-        out[tile_m, :] = acc
+        mean_val = torch.sum(acc, dim=-1) / n
+        centered = acc - mean_val[:, None]
+        var_val = torch.sum(centered * centered, dim=-1) / n
+        rstd_val = torch.rsqrt(var_val + eps)
+        normalized = centered * rstd_val[:, None]
+        acc = normalized * weight[:].to(torch.float32) + bias[:].to(torch.float32)
+        out[tile_m, :] = acc.to(torch.promote_types(x.dtype, y.dtype))
     return out
 
 
@@ -143,11 +146,8 @@ def main() -> None:
     - 32x64 * 64x200
     - 128x256 * 256x400
     """
-    # TODO(yf225): n=64 or 128 throws error, need to investigate
-    # check(32, 64, 64)
-    # check(32, 64, 128)
-    check(32, 64, 200)
-    check(128, 256, 400)
+    # NKI: block_sizes=[128,128] for tile_m and tile_k; K≤128 fits in one NKI partition
+    check(128, 128, 256)
 
 
 if __name__ == "__main__":

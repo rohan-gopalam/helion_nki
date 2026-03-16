@@ -347,8 +347,10 @@ def main() -> None:
     Tests various configurations including different beta values and label masking.
     """
     print("Testing JSD kernel...")
-    B = 4
-    T = 2048
+    # NKI: B*T must stay small enough that B*T*V*4 bytes < 4 GB per tensor.
+    # kl_div uses B=8,T=512 (BT=4096); mirror that here.
+    B = 8
+    T = 512
     beta = 0.5
     ignore_index = -100
     use_labels = False

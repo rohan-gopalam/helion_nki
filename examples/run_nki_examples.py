@@ -55,14 +55,19 @@ def main() -> None:
     for path in scripts:
         rel = path.relative_to(_EXAMPLES_DIR).as_posix()
         print(f"\n=== {rel} ===")
-        result = subprocess.run(
-            [sys.executable, str(path)],
-            cwd=_REPO,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, str(path)],
+                cwd=_REPO,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired as e:
+            print("FAILED (timeout after 600s)")
+            failed.append(rel)
+            continue
         if result.returncode == 0:
             if "PASSED" in result.stdout:
                 print("PASSED")

@@ -12,6 +12,8 @@ This example demonstrates how to implement a cross entropy loss function using H
 # %%
 from __future__ import annotations
 
+import os
+
 import torch
 
 import helion
@@ -93,7 +95,11 @@ def main() -> None:
     """
     Main entry point that runs the cross entropy kernel verification.
     """
-    batch_size, seq_len, vocab_size = 8, 2048, 131072
+    # NKI: use smaller sizes to stay within device memory (131072 vocab → 8 GB)
+    if os.environ.get("HELION_BACKEND") == "nki":
+        batch_size, seq_len, vocab_size = 1, 128, 1024
+    else:
+        batch_size, seq_len, vocab_size = 8, 2048, 131072
     n = batch_size * seq_len
     logits = torch.randn(n, vocab_size, device=DEVICE, dtype=torch.float32)
     labels = torch.randint(0, vocab_size, (n,), device=DEVICE, dtype=torch.long)

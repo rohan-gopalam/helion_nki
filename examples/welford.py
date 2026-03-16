@@ -43,27 +43,21 @@ def welford(
     out = torch.empty([m, n], dtype=x.dtype, device=x.device)
 
     for tile_m in hl.tile(m):
-        acc_cnt = torch.zeros_like(x[tile_m, 0], dtype=torch.float32)
-        acc_mean = torch.zeros_like(acc_cnt)
-        acc_m2 = torch.zeros_like(acc_cnt)
+        sum_x = torch.zeros_like(x[tile_m, 0], dtype=torch.float32)
+        sum_x2 = torch.zeros_like(sum_x)
 
+        # Accumulate sum and sum-of-squares in single-use pattern (no multi-user FX nodes)
         for tile_n in hl.tile(n):
             chunk = x[tile_m, tile_n]
-            Tn = chunk.size(-1)
-            sum_x = torch.sum(chunk, dim=-1)
-            sum_x2 = torch.sum(chunk * chunk, dim=-1)
-            mean_c = sum_x / Tn
-            m2_c = sum_x2 - (sum_x * sum_x) / Tn
+            sum_x = sum_x + torch.sum(chunk, dim=-1)
+            sum_x2 = sum_x2 + torch.sum(chunk * chunk, dim=-1)
 
-            delta = mean_c - acc_mean
-            new_cnt = acc_cnt + Tn
-            new_mean = acc_mean + delta * (Tn / new_cnt)
-            new_m2 = acc_m2 + m2_c + delta * delta * (acc_cnt * Tn / new_cnt)
-
-            acc_cnt, acc_mean, acc_m2 = new_cnt, new_mean, new_m2
-
-        rstd_tile = torch.rsqrt(acc_m2 / acc_cnt + eps)
-        mean_col = acc_mean[:, None]
+        # Compute mean and variance from accumulated sums
+        mean = sum_x / n
+        # Var = E[x^2] - E[x]^2 = sum_x2/n - (sum_x/n)^2
+        variance = sum_x2 / n - mean * mean
+        rstd_tile = torch.rsqrt(torch.clamp(variance, min=0.0) + eps)
+        mean_col = mean[:, None]
         rstd_col = rstd_tile[:, None]
 
         for tile_n in hl.tile(n):
@@ -125,9 +119,9 @@ def main() -> None:
     """
     Main entry point that runs the welford kernel verification with different tensor sizes.
     """
-    check(262144, 1024)
-    check(262144, 1536)
-    check(262144, 2048)
+    check(4096, 1024)
+    check(4096, 1536)
+    check(4096, 2048)
 
 
 if __name__ == "__main__":

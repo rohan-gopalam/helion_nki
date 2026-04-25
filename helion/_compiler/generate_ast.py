@@ -342,6 +342,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 env = CompileEnvironment.current()
                 if env.backend.name == "nki":
                     env.backend.validate_nki_tensor_shapes(root)
+                    # Run FX-graph fusion passes after validation: annotate
+                    # nodes with metadata that downstream codegen consumes
+                    # (e.g. matmul→activation PSUM reuse). Passes are read-only
+                    # on graph structure; they only set node.meta entries.
+                    from .nki_fusion import annotate_fx_graph
+                    annotate_fx_graph(root)
                 with env.set_codegen_state(state):
                     if (
                         isinstance(grid_state, DeviceGridState)

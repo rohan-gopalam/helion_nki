@@ -506,6 +506,101 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(f"({load_expr} if {mask_expr} else {zero}(0))")
 
 
+def _nki_subscript_block_id(
+    sub_val: object,
+    fx_node_i: object,
+    env: CompileEnvironment,
+) -> int | None:
+    """Return the block_id a subscript element corresponds to, or None.
+
+    Tries in order:
+      1. The live SymInt in ``sub_val`` via ``env.get_block_id``.
+      2. The FX subscript node's ``meta["val"]`` (which might still be a
+         live SymInt even if ``sub_val`` has been concretized).
+      3. Free sympy symbols of either — match each symbol to a registered
+         block size via ``env.get_block_id``.
+      4. The FX node's name (Helion names symnode getters after their debug
+         names ``block_size_N`` / ``rdim_N`` per compile_environment.py:245).
+      5. The FX node's first positional arg (which for ``_get_symnode`` is
+         the debug name string).
+
+    This is the canonical NKI-backend subscript→block_id resolver. It does
+    NOT consult ``active_device_loops``: positional heuristics there are
+    fragile (e.g. broke for ``y[:, tile_n]`` when subscripts concretize).
+    """
+    import sympy as _sp
+
+    # 1. Direct SymInt lookup.
+    if isinstance(sub_val, torch.SymInt):
+        bid = env.get_block_id(sub_val)
+        if bid is not None:
+            return bid
+        sym_expr = sub_val._sympy_()
+        free = getattr(sym_expr, "free_symbols", None)
+        if free:
+            for sym in free:
+                bid = env.get_block_id(sym)
+                if bid is not None:
+                    return bid
+
+    # 2. FX node's meta["val"] (survives even if sub_val was concretized).
+    if isinstance(fx_node_i, torch.fx.Node):
+        fx_val = fx_node_i.meta.get("val")
+        if isinstance(fx_val, torch.SymInt):
+            bid = env.get_block_id(fx_val)
+            if bid is not None:
+                return bid
+            sym_expr = fx_val._sympy_()
+            free = getattr(sym_expr, "free_symbols", None)
+            if free:
+                for sym in free:
+                    bid = env.get_block_id(sym)
+                    if bid is not None:
+                        return bid
+        elif isinstance(fx_val, _sp.Expr):
+            free = getattr(fx_val, "free_symbols", None)
+            if free:
+                for sym in free:
+                    bid = env.get_block_id(sym)
+                    if bid is not None:
+                        return bid
+
+        # 3. FX node name: "block_size_N" -> block_id N. Tile symnodes get
+        #    this name via device_ir._get_proxy_slot's debug_name.
+        node_name = getattr(fx_node_i, "name", None) or ""
+        if node_name.startswith("block_size_"):
+            try:
+                cand = int(node_name.removeprefix("block_size_").split("_")[0])
+                if 0 <= cand < len(env.block_sizes):
+                    return cand
+            except (ValueError, IndexError):
+                pass
+        elif node_name.startswith("rdim_"):
+            try:
+                cand = int(node_name.removeprefix("rdim_").split("_")[0])
+                if 0 <= cand < len(env.block_sizes):
+                    return cand
+            except (ValueError, IndexError):
+                pass
+
+        # 4. FX node args[0] may be the debug name string (when target is
+        #    _get_symnode).
+        args = getattr(fx_node_i, "args", ())
+        if args:
+            first = args[0]
+            if isinstance(first, str):
+                for prefix in ("block_size_", "rdim_"):
+                    if first.startswith(prefix):
+                        try:
+                            cand = int(first.removeprefix(prefix).split("_")[0])
+                            if 0 <= cand < len(env.block_sizes):
+                                return cand
+                        except (ValueError, IndexError):
+                            pass
+
+    return None
+
+
 @_decorators.codegen(load, "nki")
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import create
@@ -538,109 +633,131 @@ def _(state: CodegenState) -> ast.AST:
             return s
         return int(s._sympy_().subs(_bs_subs))
 
-    # NKI fix: when a SymInt subscript lost its BlockSizeOrigin (concretized by
-    # inductor), compute_shape eliminates the dimension.  Detect this case:
-    # if the tensor is 2D, subscript has a SymInt for dim 0, and output_shape
-    # has only 1 element, the first dim was incorrectly eliminated.  Re-insert
-    # it using the active outer tile loop's block_size.
-    if (
-        tensor.dim() == 2
-        and len(output_shape) == 1
-        and len(subscript) >= 2
-        and isinstance(subscript[0], torch.SymInt)
-    ):
-        # Find the tile loop block_id for dim 0 from active device loops
-        for bid in state.codegen.active_device_loops.keys():
-            if bid < len(env.block_sizes) and not env.block_sizes[bid].reduction:
-                bs_val = int(env.block_sizes[bid].from_config_assert(state.config))
-                # This is the outer tile loop; re-insert its block_size as dim 0
-                output_shape = [env.block_sizes[bid].var, *output_shape]
-                break
-
-    partition_dim = _resolve_dim(output_shape[0])
-    free_dims = [_resolve_dim(s) for s in output_shape[1:]]
-    dtype_str = backend.dtype_str(tensor.dtype)
-
-    # Build slices from the subscript list - process only actual tensor dimensions
+    # First pass: resolve block_id per (tensor_dim_idx, subscript_position).
+    # We use the FX subscript nodes (which carry live SymInts even when the
+    # materialized subscript value has been concretized to a hint integer)
+    # and the centralized ``_nki_subscript_block_id`` helper.
     fx_subscript = (
         state.fx_node.args[1]
         if state.fx_node is not None and len(state.fx_node.args) >= 2
         else None
     )
+    # Map: tensor_dim_idx -> block_id (int) or None. Length equals tensor.dim().
+    subscript_block_ids: list[int | None] = []
+    # Map: tensor_dim_idx -> subscript position i that produced it.
+    subscript_positions: list[int] = []
+    _tdi = 0
+    for i, sub_val in enumerate(subscript):
+        if sub_val is None:  # newaxis — doesn't consume a tensor dim
+            continue
+        if _tdi >= tensor.dim():
+            break
+        fx_node_i = fx_subscript[i] if fx_subscript is not None and i < len(fx_subscript) else None
+        bid = _nki_subscript_block_id(sub_val, fx_node_i, env)
+        # slice(None) subscripts over reduction blocks: look up by size-match.
+        if bid is None and isinstance(sub_val, slice):
+            dim_size = tensor.size(_tdi)
+            for _bid in range(len(env.block_sizes)):
+                bs_info = env.block_sizes[_bid]
+                if not bs_info.reduction:
+                    continue
+                block_size = bs_info.from_config_assert(state.config)
+                if block_size <= 1:
+                    continue
+                if isinstance(dim_size, int) and block_size > 0 and dim_size % block_size == 0:
+                    # Only match reduction blocks that are actually live.
+                    if _bid in state.codegen.active_device_loops:
+                        bid = _bid
+                        break
+        subscript_block_ids.append(bid)
+        subscript_positions.append(i)
+        _tdi += 1
+
+    # Re-infer any dims that compute_shape dropped. A dim gets dropped when its
+    # subscript SymInt was concretized to an integer (loses BlockSizeOrigin).
+    # Re-insert the block_size var in the right position so the downstream
+    # shape math (partition_dim, free_dims) stays correct.
+    if len(output_shape) < tensor.dim():
+        # Walk tensor_dim_idx left-to-right, matching output_shape consumption.
+        # A dim was dropped if its resolved block_id is known AND the next
+        # unconsumed output_shape entry doesn't match its block var.
+        new_output_shape: list[int | torch.SymInt] = []
+        os_idx = 0
+        for tdi in range(tensor.dim()):
+            bid = subscript_block_ids[tdi] if tdi < len(subscript_block_ids) else None
+            sub_pos = subscript_positions[tdi] if tdi < len(subscript_positions) else None
+            sub_val = subscript[sub_pos] if sub_pos is not None and sub_pos < len(subscript) else None
+            expected_var = env.block_sizes[bid].var if bid is not None else None
+
+            # For slice(None) subscripts, compute_shape always emits a dim —
+            # consume the next output_shape entry.
+            if isinstance(sub_val, slice):
+                if os_idx < len(output_shape):
+                    new_output_shape.append(output_shape[os_idx])
+                    os_idx += 1
+                else:
+                    # Shouldn't happen; fall back to tensor size.
+                    new_output_shape.append(tensor.size(tdi))
+                continue
+
+            # For SymInt-ish subscripts: if still symbolic, compute_shape
+            # kept the dim; if concretized, it was dropped.
+            if isinstance(sub_val, torch.SymInt):
+                if os_idx < len(output_shape) and (
+                    expected_var is None
+                    or output_shape[os_idx] is expected_var
+                    or (
+                        isinstance(output_shape[os_idx], torch.SymInt)
+                        and output_shape[os_idx]._sympy_() == expected_var._sympy_()
+                    )
+                ):
+                    new_output_shape.append(output_shape[os_idx])
+                    os_idx += 1
+                elif expected_var is not None:
+                    new_output_shape.append(expected_var)
+                elif os_idx < len(output_shape):
+                    new_output_shape.append(output_shape[os_idx])
+                    os_idx += 1
+                continue
+
+            # Integer subscript — dim is fully eliminated; skip.
+            if isinstance(sub_val, int):
+                continue
+
+            # Tensor indexer or other: keep what compute_shape said.
+            if os_idx < len(output_shape):
+                new_output_shape.append(output_shape[os_idx])
+                os_idx += 1
+
+        # Only apply re-inference if it produced at least as many dims as
+        # the original (belt-and-suspenders: we never want to drop MORE).
+        if len(new_output_shape) >= len(output_shape):
+            output_shape = new_output_shape
+
+    partition_dim = _resolve_dim(output_shape[0]) if output_shape else 1
+    free_dims = [_resolve_dim(s) for s in output_shape[1:]]
+    dtype_str = backend.dtype_str(tensor.dtype)
+
+    # Second pass: emit slice_parts using the resolved block_ids.
     slice_parts: list[str] = []
     partition_offset_var: str | None = None
-    _used_block_ids_load: set[int] = set()
-
-    # Track which subscript elements map to tensor dimensions
-    tensor_dim_idx = 0
-    for i, sub_val in enumerate(subscript):
-        # Skip None subscripts (newaxis/broadcasting dimensions)
-        if sub_val is None:
-            continue
-
-        # Stop if we've processed all tensor dimensions
-        if tensor_dim_idx >= tensor.dim():
-            break
-
-        block_id = None
-        # Try to get block_id from FX node metadata
-        if fx_subscript is not None and i < len(fx_subscript):
-            fx_node_i = fx_subscript[i]
-            if isinstance(fx_node_i, torch.fx.Node):
-                val = fx_node_i.meta.get("val")
-                if val is not None:
-                    block_id = env.get_block_id(val)
-
-        # NKI fix: when get_block_id fails for a SymInt subscript (concretized
-        # hint value instead of symbolic), try to match the active tile loop by
-        # checking which non-reduction block_id iterates over this dimension.
-        if block_id is None and isinstance(sub_val, torch.SymInt):
-            for bid in state.codegen.active_device_loops.keys():
-                if bid < len(env.block_sizes) and not env.block_sizes[bid].reduction:
-                    if bid not in _used_block_ids_load:
-                        block_id = bid
-                    break
-
-        # For slice(None), check if this is a reduction dimension
-        if block_id is None and isinstance(sub_val, slice):
-            # Check if this dimension matches a reduction block size
-            dim_size = tensor.size(tensor_dim_idx)
-            for bid in state.codegen.active_device_loops.keys():
-                if bid < len(env.block_sizes):
-                    block_size = env.block_sizes[bid].from_config_assert(state.config)
-                    # Skip trivial block_size=1 (matches everything via divisibility)
-                    if block_size <= 1:
-                        continue
-                    # Match by size - if dimension is divisible by block size, it's likely the reduction
-                    if isinstance(dim_size, int) and block_size > 0 and dim_size % block_size == 0:
-                        # Match for: dim 1 of 2D tensors, or dim 0 of 1D tensors
-                        if (tensor_dim_idx == 1 and tensor.dim() == 2) or (
-                            tensor_dim_idx == 0 and tensor.dim() == 1
-                        ):
-                            block_id = bid
-                            break
-
-        # Build the slice for this tensor dimension
-        if block_id is not None:
-            _used_block_ids_load.add(block_id)
+    for tdi in range(len(subscript_block_ids)):
+        block_id = subscript_block_ids[tdi]
         if block_id is not None and block_id in state.codegen.active_device_loops:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
-            if tensor_dim_idx == 0:
+            if tdi == 0:
                 partition_offset_var = offset_var
             slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
         else:
-            # Fixed slice for this dimension
-            size_i = tensor.size(tensor_dim_idx)
+            # Fixed slice for this dimension.
+            size_i = tensor.size(tdi)
             size_str = (
                 state.sympy_expr(size_i._sympy_())
                 if isinstance(size_i, torch.SymInt)
                 else str(size_i)
             )
             slice_parts.append(f"0:{size_str}")
-
-        # Advance to next tensor dimension
-        tensor_dim_idx += 1
 
     # 3D+ tensors: reshaped to 2D at kernel entry ([B,M,K] → [B*M, K]).
     # Combine the leading slice_parts into one flattened partition slice
@@ -840,47 +957,31 @@ def _(state: CodegenState) -> None:
     )
     slice_parts: list[str] = []
     partition_offset_var: str | None = None
-    _used_block_ids_store: set[int] = set()
     tensor_dim_idx = 0
     for i, sub_val in enumerate(subscript):
         if sub_val is None:
             continue
         if tensor_dim_idx >= tensor.dim():
             break
-        block_id = None
-        if fx_subscript is not None and i < len(fx_subscript):
-            fx_node_i = fx_subscript[i]
-            if isinstance(fx_node_i, torch.fx.Node):
-                val = fx_node_i.meta.get("val")
-                if val is not None:
-                    block_id = env.get_block_id(val)
+        fx_node_i = fx_subscript[i] if fx_subscript is not None and i < len(fx_subscript) else None
+        block_id = _nki_subscript_block_id(sub_val, fx_node_i, env)
 
-        # NKI fix: fallback for concretized SymInt subscripts
-        if block_id is None and isinstance(sub_val, torch.SymInt):
-            for bid in state.codegen.active_device_loops.keys():
-                if bid < len(env.block_sizes) and not env.block_sizes[bid].reduction:
-                    if bid not in _used_block_ids_store:
-                        block_id = bid
-                        break
-
-        # NKI fix: fallback for slice subscripts — match reduction blocks (skip block_size=1)
+        # slice(None) over a reduction dim: match by size as a last resort.
         if block_id is None and isinstance(sub_val, slice):
             dim_size = tensor.size(tensor_dim_idx) if tensor_dim_idx < tensor.dim() else None
             if dim_size is not None:
-                for bid in state.codegen.active_device_loops.keys():
-                    if bid < len(env.block_sizes):
-                        block_size = env.block_sizes[bid].from_config_assert(state.config)
-                        if block_size <= 1:
-                            continue
-                        if isinstance(dim_size, int) and block_size > 0 and dim_size % block_size == 0:
-                            if (tensor_dim_idx == 1 and tensor.dim() == 2) or (
-                                tensor_dim_idx == 0 and tensor.dim() == 1
-                            ):
-                                block_id = bid
-                                break
+                for _bid in range(len(env.block_sizes)):
+                    bs_info = env.block_sizes[_bid]
+                    if not bs_info.reduction:
+                        continue
+                    block_size = bs_info.from_config_assert(state.config)
+                    if block_size <= 1:
+                        continue
+                    if isinstance(dim_size, int) and block_size > 0 and dim_size % block_size == 0:
+                        if _bid in state.codegen.active_device_loops:
+                            block_id = _bid
+                            break
 
-        if block_id is not None:
-            _used_block_ids_store.add(block_id)
         if block_id is not None and block_id in state.codegen.active_device_loops:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)

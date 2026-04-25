@@ -653,6 +653,40 @@ class NKIOpOverrides:
         return shape
 
     @staticmethod
+    def _resolve_psum_alias(state: object, operand: object) -> object:
+        """Resolve a possibly SBUF-named operand through the PSUM alias map.
+
+        The FX-graph fusion pass (nki_fusion.annotate_psum_reuse) may have
+        tagged an upstream matmul so its final PSUM→SBUF copy is skipped.
+        _nki_dot registers an entry in ``device_function._nki_psum_aliases``
+        mapping the matmul's virtual SBUF result name to the real PSUM
+        buffer. This helper swaps the SBUF name for the PSUM name so the
+        consumer reads directly from PSUM (legal for Vector/Scalar ops).
+
+        Accepts AST nodes, strings, and arbitrary objects; only rewrites
+        when the name matches an alias. All other operands pass through.
+        """
+        aliases = getattr(state.device_function, "_nki_psum_aliases", None)
+        if not aliases:
+            return operand
+        import ast as _ast
+        if isinstance(operand, _ast.AST):
+            try:
+                name = _ast.unparse(operand)
+            except Exception:
+                return operand
+        elif isinstance(operand, str):
+            name = operand
+        else:
+            return operand
+        psum_name = aliases.get(name)
+        if psum_name is None:
+            return operand
+        # Return a plain string — callers always interpolate operands
+        # into f-strings via str()/ast.unparse(), so this is transparent.
+        return psum_name
+
+    @staticmethod
     def _nki_tensor_tensor(a: object, b: object, op: str, prefix: str) -> str:
         from .ast_extension import statement_from_string
         from .compile_environment import CompileEnvironment
@@ -663,6 +697,13 @@ class NKIOpOverrides:
         state = getattr(env, "_codegen_state", None)
         if state is None:
             return ""
+
+        # PSUM-reuse fusion: if either operand is a matmul result whose final
+        # PSUM→SBUF copy was elided, rewrite the operand to read from PSUM.
+        # Safe because nisa.tensor_tensor runs on the Vector/GpSimd Engine,
+        # which can read both SBUF and PSUM.
+        a = NKIOpOverrides._resolve_psum_alias(state, a)
+        b = NKIOpOverrides._resolve_psum_alias(state, b)
 
         def _emit_partition_broadcast(hbm_src: str, f_count: int, p_count: int,
                                       target_dtype_str: str,
@@ -1030,6 +1071,11 @@ class NKIOpOverrides:
         if state is None:
             return ""
 
+        # PSUM-reuse fusion: rewrite data operand to PSUM name if upstream
+        # matmul had its final copy elided. nisa.tensor_scalar runs on the
+        # Vector / Scalar / GpSimd Engine; all accept PSUM input.
+        data = NKIOpOverrides._resolve_psum_alias(state, data)
+
         def _scalar_for_emit(x: object) -> object:
             """Emit scalar as Python literal (1.0 not '1.0') for nisa.tensor_scalar."""
             if isinstance(x, str):
@@ -1391,6 +1437,14 @@ class NKIOpOverrides:
         if state is None:
             return ""
 
+        # PSUM-reuse fusion: rewrite input to PSUM name if upstream matmul
+        # had its final copy elided. nisa.activation runs on Scalar Engine
+        # which accepts PSUM input. Since the activation output must go to
+        # SBUF (store codegen expects SBUF), we force a new output buffer.
+        _orig_a_str = str(a) if not isinstance(a, (int, float)) else None
+        a = NKIOpOverrides._resolve_psum_alias(state, a)
+        _psum_aliased = _orig_a_str is not None and str(a) != _orig_a_str
+
         dst = str(a)
         dst_tile_vars = state.device_function.get_tile_list_vars(dst)
 
@@ -1404,7 +1458,7 @@ class NKIOpOverrides:
         _in_nested_loop_act = len(getattr(state.codegen, "active_device_loops", {})) >= 2
         _is_protected_act = (dst in getattr(state.device_function, "_nki_protected_vars", set())
                              and _in_nested_loop_act)
-        need_new_buffer = _is_second_level_copy or _is_protected_act
+        need_new_buffer = _is_second_level_copy or _is_protected_act or _psum_aliased
         if not need_new_buffer and cur_node is not None and len(cur_node.args) >= 1:
             input_node = cur_node.args[0]
             if hasattr(input_node, "users") and len(input_node.users) > 1:
@@ -1666,6 +1720,396 @@ class NKIOpOverrides:
 
     def copy(self, x: object) -> str:
         return self._nki_activation(x, "nl.copy", "nki_copy")
+
+    # -------------------------------------------------------------------------
+    # Fused ISA operations (Trn2/Trn3)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _nki_alloc_sbuf(
+        shape_list: list[int],
+        dtype_str: str,
+        prefix: str,
+        state: object,
+    ) -> str:
+        """Allocate a new SBUF buffer, register its shape, return var name."""
+        from .ast_extension import statement_from_string
+
+        var = state.device_function.new_var(prefix, dce=True)
+        shape_str = ", ".join(str(d) for d in shape_list)
+        state.device_function._nki_sbuf_shapes[var] = list(shape_list)
+        state.add_statement(
+            statement_from_string(
+                f"{var} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        return var
+
+    @staticmethod
+    def _nki_tensor_scalar_reduce(
+        data: object,
+        op0: str,
+        operand0: object,
+        reduce_op: str,
+        reduce_shape: list[int],
+        *,
+        reverse0: bool = False,
+    ) -> tuple[str, str]:
+        """Emit nisa.tensor_scalar_reduce and return (dst_var, reduce_res_var).
+
+        Trn2/Trn3 fused instruction: computes ``result = data <op0> operand0``
+        and simultaneously reduces result along the free axis into reduce_res.
+
+        Returns the pair (dst_var, reduce_res_var) so the caller can use both
+        the element-wise result and the reduction result.
+        """
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            return ("", "")
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return ("", "")
+
+        data_str = str(data)
+        data_shape = state.device_function._nki_sbuf_shapes.get(data_str)
+
+        cur_node = None
+        try:
+            from torch._inductor.virtualized import V
+            _cn = V.current_node
+            if hasattr(_cn, "meta"):
+                cur_node = _cn
+        except Exception:
+            pass
+
+        if data_shape is None and cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                data_shape = NKIOpOverrides._squeeze_shape_2d(list(val.shape))
+
+        dtype_str = "nl.float32"
+        if cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                dtype_str = env.backend.dtype_str(val.dtype)
+
+        # Allocate output tile for the element-wise result
+        dst_shape = data_shape if data_shape is not None else [1, 1]
+        dst_var = NKIOpOverrides._nki_alloc_sbuf(dst_shape, dtype_str, "nki_ts_reduce_dst", state)
+
+        # Allocate reduce_res tile [P, 1]
+        reduce_var = NKIOpOverrides._nki_alloc_sbuf(reduce_shape, "nl.float32", "nki_ts_reduce_res", state)
+
+        reverse_part = ", reverse0=True" if reverse0 else ""
+        operand_emit = operand0
+        if isinstance(operand0, str):
+            try:
+                operand_emit = float(operand0) if "." in operand0 or "e" in operand0.lower() else int(operand0)
+            except (ValueError, TypeError):
+                pass
+
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_scalar_reduce(dst={dst_var}, data={data_str}, "
+                f"op0={op0}, operand0={operand_emit}, "
+                f"reduce_op={reduce_op}, reduce_res={reduce_var}{reverse_part})"
+            )
+        )
+        return (dst_var, reduce_var)
+
+    @staticmethod
+    def _nki_activation_reduce(
+        data: object,
+        op: str,
+        reduce_op: str,
+        reduce_shape: list[int],
+        *,
+        bias: str | None = None,
+        scale: float | str | None = None,
+    ) -> tuple[str, str]:
+        """Emit nisa.activation_reduce and return (dst_var, reduce_res_var).
+
+        Trn2/Trn3 fused instruction: applies ``op`` activation to data (with
+        optional scale/bias) and simultaneously reduces the result along the
+        free axis into reduce_res.
+
+        Returns the pair (dst_var, reduce_res_var).
+        """
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            return ("", "")
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return ("", "")
+
+        data_str = str(data)
+        data_shape = state.device_function._nki_sbuf_shapes.get(data_str)
+
+        cur_node = None
+        try:
+            from torch._inductor.virtualized import V
+            _cn = V.current_node
+            if hasattr(_cn, "meta"):
+                cur_node = _cn
+        except Exception:
+            pass
+
+        if data_shape is None and cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                data_shape = NKIOpOverrides._squeeze_shape_2d(list(val.shape))
+
+        dtype_str = "nl.float32"
+        if cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                dtype_str = env.backend.dtype_str(val.dtype)
+
+        dst_shape = data_shape if data_shape is not None else [1, 1]
+        dst_var = NKIOpOverrides._nki_alloc_sbuf(dst_shape, dtype_str, "nki_act_reduce_dst", state)
+        reduce_var = NKIOpOverrides._nki_alloc_sbuf(reduce_shape, "nl.float32", "nki_act_reduce_res", state)
+
+        extra_parts = []
+        if bias is not None:
+            extra_parts.append(f"bias={bias}")
+        if scale is not None:
+            extra_parts.append(f"scale={scale!r}" if isinstance(scale, float) else f"scale={scale}")
+        extra_str = (", " + ", ".join(extra_parts)) if extra_parts else ""
+
+        state.add_statement(
+            statement_from_string(
+                f"nisa.activation_reduce(dst={dst_var}, op={op}, data={data_str}, "
+                f"reduce_op={reduce_op}, reduce_res={reduce_var}{extra_str})"
+            )
+        )
+        return (dst_var, reduce_var)
+
+    @staticmethod
+    def _nki_scalar_tensor_tensor(
+        data: object,
+        op0: str,
+        operand0: object,
+        op1: str,
+        operand1: object,
+        *,
+        reverse0: bool = False,
+        reverse1: bool = False,
+    ) -> str:
+        """Emit nisa.scalar_tensor_tensor and return the dst var name.
+
+        Trn2/Trn3 fused instruction: ``(data <op0> operand0) <op1> operand1``
+        where operand0 is a scalar/[P,1] tile and operand1 is a full tile.
+        Saves one SBUF round-trip versus chaining tensor_scalar + tensor_tensor.
+        """
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            return ""
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return ""
+
+        data_str = str(data)
+        operand1_str = str(operand1)
+        data_shape = state.device_function._nki_sbuf_shapes.get(data_str)
+
+        cur_node = None
+        try:
+            from torch._inductor.virtualized import V
+            _cn = V.current_node
+            if hasattr(_cn, "meta"):
+                cur_node = _cn
+        except Exception:
+            pass
+
+        if data_shape is None and cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                data_shape = NKIOpOverrides._squeeze_shape_2d(list(val.shape))
+
+        dtype_str = "nl.float32"
+        if cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                dtype_str = env.backend.dtype_str(val.dtype)
+
+        dst_shape = data_shape if data_shape is not None else [1, 1]
+        dst_var = NKIOpOverrides._nki_alloc_sbuf(dst_shape, dtype_str, "nki_stt", state)
+
+        operand0_emit = operand0
+        if isinstance(operand0, str):
+            try:
+                operand0_emit = float(operand0) if "." in operand0 or "e" in operand0.lower() else int(operand0)
+            except (ValueError, TypeError):
+                pass
+
+        extra = []
+        if reverse0:
+            extra.append("reverse0=True")
+        if reverse1:
+            extra.append("reverse1=True")
+        extra_str = (", " + ", ".join(extra)) if extra else ""
+
+        state.add_statement(
+            statement_from_string(
+                f"nisa.scalar_tensor_tensor(dst={dst_var}, data={data_str}, "
+                f"op0={op0}, operand0={operand0_emit}, "
+                f"op1={op1}, operand1={operand1_str}{extra_str})"
+            )
+        )
+        return dst_var
+
+    @staticmethod
+    def _nki_tensor_tensor_scan(
+        data0: object,
+        data1: object,
+        initial: object,
+        op0: str,
+        op1: str,
+        *,
+        reverse0: bool = False,
+        reverse1: bool = False,
+    ) -> str:
+        """Emit nisa.tensor_tensor_scan and return the dst var name.
+
+        Trn2/Trn3 fused scan instruction: computes a sequential scan across
+        the free axis where each output element depends on its predecessor.
+        Classic use-case: prefix-sum (op0=nl.add, op1=nl.add, initial=0).
+        """
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            return ""
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return ""
+
+        data0_str = str(data0)
+        data1_str = str(data1)
+        data_shape = state.device_function._nki_sbuf_shapes.get(data0_str)
+
+        cur_node = None
+        try:
+            from torch._inductor.virtualized import V
+            _cn = V.current_node
+            if hasattr(_cn, "meta"):
+                cur_node = _cn
+        except Exception:
+            pass
+
+        if data_shape is None and cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                data_shape = NKIOpOverrides._squeeze_shape_2d(list(val.shape))
+
+        dtype_str = "nl.float32"
+        if cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                dtype_str = env.backend.dtype_str(val.dtype)
+
+        dst_shape = data_shape if data_shape is not None else [1, 1]
+        dst_var = NKIOpOverrides._nki_alloc_sbuf(dst_shape, dtype_str, "nki_scan", state)
+
+        # initial can be a scalar constant or a tile name
+        initial_emit = initial
+        if isinstance(initial, str):
+            try:
+                initial_emit = float(initial) if "." in initial or "e" in initial.lower() else int(initial)
+            except (ValueError, TypeError):
+                pass
+
+        extra = []
+        if reverse0:
+            extra.append("reverse0=True")
+        if reverse1:
+            extra.append("reverse1=True")
+        extra_str = (", " + ", ".join(extra)) if extra else ""
+
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_tensor_scan(dst={dst_var}, data0={data0_str}, data1={data1_str}, "
+                f"initial={initial_emit}, op0={op0}, op1={op1}{extra_str})"
+            )
+        )
+        return dst_var
+
+    @staticmethod
+    def _nki_tensor_scalar_cumulative(
+        src: object,
+        op0: str,
+        op1: str,
+        imm0: float | str,
+        *,
+        imm1: float | str | None = None,
+        reduce_cmd: str = "nisa.reduce_cmd.reset_reduce",
+    ) -> str:
+        """Emit nisa.tensor_scalar_cumulative and return the dst var name.
+
+        Trn2/Trn3 cumulative instruction: applies ``op0`` with scalar ``imm0``
+        to each element of src, then performs cumulative ``op1`` into dst.
+        Example: cumulative sum-of-squares via op0=nl.multiply (x*x) + op1=nl.add.
+        """
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            return ""
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return ""
+
+        src_str = str(src)
+        data_shape = state.device_function._nki_sbuf_shapes.get(src_str)
+
+        cur_node = None
+        try:
+            from torch._inductor.virtualized import V
+            _cn = V.current_node
+            if hasattr(_cn, "meta"):
+                cur_node = _cn
+        except Exception:
+            pass
+
+        if data_shape is None and cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                data_shape = NKIOpOverrides._squeeze_shape_2d(list(val.shape))
+
+        dtype_str = "nl.float32"
+        if cur_node is not None:
+            val = cur_node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                dtype_str = env.backend.dtype_str(val.dtype)
+
+        dst_shape = data_shape if data_shape is not None else [1, 1]
+        dst_var = NKIOpOverrides._nki_alloc_sbuf(dst_shape, dtype_str, "nki_tsc", state)
+
+        imm0_emit = imm0 if isinstance(imm0, (int, float)) else repr(imm0)
+        extra = [f"reduce_cmd={reduce_cmd}"]
+        if imm1 is not None:
+            imm1_emit = imm1 if isinstance(imm1, (int, float)) else repr(imm1)
+            extra.insert(0, f"imm1={imm1_emit}")
+        extra_str = ", " + ", ".join(extra)
+
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_scalar_cumulative(dst={dst_var}, src={src_str}, "
+                f"op0={op0}, op1={op1}, imm0={imm0_emit}{extra_str})"
+            )
+        )
+        return dst_var
 
     # Index / scalar arithmetic — these operate on Python integers (tile offsets,
     # loop counters), not on SBUF tiles, so plain Python operators are correct.
@@ -2402,6 +2846,95 @@ class NKIBackend(Backend):
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
         return f"nl.zeros([0], {dtype})"
+
+    # -------------------------------------------------------------------------
+    # Fused ISA helpers exposed for external call-sites (e.g. reduction_strategy)
+    # -------------------------------------------------------------------------
+
+    def tensor_scalar_reduce_expr(
+        self,
+        data: str,
+        op0: str,
+        operand0: object,
+        reduce_op: str,
+        reduce_shape: list[int],
+        *,
+        reverse0: bool = False,
+    ) -> tuple[str, str]:
+        """Emit nisa.tensor_scalar_reduce, return (dst_var, reduce_res_var).
+
+        Wraps NKIOpOverrides._nki_tensor_scalar_reduce for use outside the
+        NKIOpOverrides class (e.g. from reduction_strategy.py).
+        """
+        return NKIOpOverrides._nki_tensor_scalar_reduce(
+            data, op0, operand0, reduce_op, reduce_shape, reverse0=reverse0
+        )
+
+    def activation_reduce_expr(
+        self,
+        data: str,
+        op: str,
+        reduce_op: str,
+        reduce_shape: list[int],
+        *,
+        bias: str | None = None,
+        scale: float | str | None = None,
+    ) -> tuple[str, str]:
+        """Emit nisa.activation_reduce, return (dst_var, reduce_res_var).
+
+        Wraps NKIOpOverrides._nki_activation_reduce for use outside the
+        NKIOpOverrides class (e.g. from reduction_strategy.py).
+        """
+        return NKIOpOverrides._nki_activation_reduce(
+            data, op, reduce_op, reduce_shape, bias=bias, scale=scale
+        )
+
+    def scalar_tensor_tensor_expr(
+        self,
+        data: str,
+        op0: str,
+        operand0: object,
+        op1: str,
+        operand1: str,
+        *,
+        reverse0: bool = False,
+        reverse1: bool = False,
+    ) -> str:
+        """Emit nisa.scalar_tensor_tensor, return the dst var name."""
+        return NKIOpOverrides._nki_scalar_tensor_tensor(
+            data, op0, operand0, op1, operand1, reverse0=reverse0, reverse1=reverse1
+        )
+
+    def tensor_tensor_scan_expr(
+        self,
+        data0: str,
+        data1: str,
+        initial: object,
+        op0: str,
+        op1: str,
+        *,
+        reverse0: bool = False,
+        reverse1: bool = False,
+    ) -> str:
+        """Emit nisa.tensor_tensor_scan, return the dst var name."""
+        return NKIOpOverrides._nki_tensor_tensor_scan(
+            data0, data1, initial, op0, op1, reverse0=reverse0, reverse1=reverse1
+        )
+
+    def tensor_scalar_cumulative_expr(
+        self,
+        src: str,
+        op0: str,
+        op1: str,
+        imm0: float | str,
+        *,
+        imm1: float | str | None = None,
+        reduce_cmd: str = "nisa.reduce_cmd.reset_reduce",
+    ) -> str:
+        """Emit nisa.tensor_scalar_cumulative, return the dst var name."""
+        return NKIOpOverrides._nki_tensor_scalar_cumulative(
+            src, op0, op1, imm0, imm1=imm1, reduce_cmd=reduce_cmd
+        )
 
     def inductor_op_overrides(self) -> InductorOpOverrides:
         return NKIOpOverrides()

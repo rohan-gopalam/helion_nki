@@ -351,6 +351,19 @@ def _(state: CodegenState) -> object:
     rhs_is_list = rhs_tile_vars is not None
     result_is_list = n_sub_m > 1
 
+    # PSUM-reuse fusion: if this hl.dot node was tagged by nki_fusion and
+    # the result is a single tile with no accumulator, skip the final
+    # PSUM→SBUF copy below and let the downstream Vector/Scalar consumer
+    # read from the PSUM buffer directly.
+    _fx_node = state.fx_node
+    _keep_in_psum = bool(
+        _fx_node is not None
+        and _fx_node.meta.get("nki_keep_in_psum", False)
+        and is_acc_none
+        and not result_is_list
+        and n_sub_n == 1
+    )
+
     mm_result = device_fn.new_var("_nki_dot_result")
     mm_result_tile_vars: list[str] = []
     if result_is_list:
@@ -363,7 +376,7 @@ def _(state: CodegenState) -> object:
                 )
             )
         device_fn.register_tile_list(mm_result, mm_result_tile_vars)
-    else:
+    elif not _keep_in_psum:
         state.add_statement(
             statement_from_string(
                 f"{mm_result} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
@@ -509,6 +522,10 @@ def _(state: CodegenState) -> object:
                     f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref('0', n_expr)})"
                 )
             )
+        if _keep_in_psum:
+            # PSUM reuse: downstream Vector/Scalar consumer reads mm_psum
+            # directly, so we skip the PSUM→SBUF copies entirely.
+            return
         state.add_statement(
             statement_from_string(
                 f"{mm_sbuf_tmp} = nl.ndarray([{actual_tile_m}, {N_sub}], nl.float32, buffer=nl.sbuf)"
@@ -547,6 +564,13 @@ def _(state: CodegenState) -> object:
         )
     else:
         _emit_all_m_stripes("0")
+
+    # Register PSUM alias so downstream Vector/Scalar ops read from PSUM.
+    if _keep_in_psum:
+        device_fn._nki_psum_aliases[mm_result] = mm_psum
+        device_fn._nki_fx_matmul_vars[_fx_node.name] = mm_result
+        device_fn._nki_sbuf_shapes[mm_result] = [actual_tile_m, N_tile]
+        device_fn._nki_sbuf_shapes[mm_psum] = [actual_tile_m, N_tile]
 
     if is_acc_none:
         return expr_from_string(mm_result)

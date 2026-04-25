@@ -268,6 +268,18 @@ class DeviceFunction:
         # Tile lists where tiles represent the FREE dimension (not partition).
         # These must be distributed along dim 1 when stored to a 2D buffer.
         self._nki_free_dim_tile_lists: set[str] = set()
+        # PSUM-reuse alias map: keys are the SBUF result variable names that
+        # _nki_dot *would* have created for a matmul; values are the PSUM
+        # buffer names the matmul actually writes to. Populated by _nki_dot
+        # when the matmul's FX node carries meta["nki_keep_in_psum"]=True.
+        # Consumer ops (_nki_tensor_tensor / _nki_tensor_scalar /
+        # _nki_activation) resolve a data operand through this map to read
+        # from PSUM directly and skip the intermediate SBUF copy.
+        self._nki_psum_aliases: dict[str, str] = {}
+        # FX-node-name -> SBUF result var, so a consumer (which only has
+        # its predecessor's FX node name via meta["nki_read_psum_from"])
+        # can look up the SBUF name that _nki_dot produced.
+        self._nki_fx_matmul_vars: dict[str, str] = {}
         self.dce_vars: list[str] = []
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}

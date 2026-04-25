@@ -859,7 +859,20 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     rhs_is_list = rhs_tile_vars is not None
     result_is_list = n_sub_m > 1
 
-    # Allocate result buffer(s) in SBUF — fully unrolled, no list comprehension
+    # PSUM-reuse fusion: if the fusion pass tagged this matmul node and the
+    # result is a single tile (no M/N sub-tiling, no bias add), skip the
+    # final PSUM→SBUF copy and expose the PSUM buffer via an alias. The
+    # single downstream Vector/Scalar consumer will read from PSUM directly.
+    _keep_in_psum = bool(
+        node.meta.get("nki_keep_in_psum", False)
+        and not result_is_list
+        and n_sub_n == 1
+        and not with_acc
+    )
+
+    # Allocate result buffer(s) in SBUF — fully unrolled, no list comprehension.
+    # Skip the SBUF allocation entirely when we're keeping the result in PSUM;
+    # consumers resolve the name through device_function._nki_psum_aliases.
     mm_result = state.device_function.new_var("_nki_mm_result")
     mm_result_tile_vars: list[str] = []
     if result_is_list:
@@ -872,7 +885,7 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
                 )
             )
         state.device_function.register_tile_list(mm_result, mm_result_tile_vars)
-    else:
+    elif not _keep_in_psum:
         state.add_statement(
             statement_from_string(
                 f"{mm_result} = nl.ndarray([{TILE_M}, {N_tile}], nl.float32, buffer=nl.sbuf)"
@@ -1072,6 +1085,11 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
                     f"moving={rhs_ref_0})"
                 )
             )
+        if _keep_in_psum:
+            # PSUM-reuse: skip the PSUM→SBUF copies and let the single
+            # downstream Vector/Scalar consumer read from mm_psum directly.
+            # The alias registration below happens once, after all stripes.
+            return
         state.add_statement(
             statement_from_string(
                 f"{mm_sbuf_tmp} = nl.ndarray([{TILE_M}, {N_sub}], nl.float32, buffer=nl.sbuf)"
@@ -1110,6 +1128,17 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         )
     else:
         _emit_all_m_stripes("0")
+
+    # If this matmul was tagged for PSUM reuse, register the alias so
+    # downstream Vector/Scalar consumers read from PSUM instead of SBUF.
+    if _keep_in_psum:
+        state.device_function._nki_psum_aliases[mm_result] = mm_psum
+        state.device_function._nki_fx_matmul_vars[node.name] = mm_result
+        # Register the shape under BOTH the SBUF virtual name and the PSUM
+        # name so shape lookups succeed whether the consumer sees the
+        # original operand or the alias-resolved PSUM name.
+        state.device_function._nki_sbuf_shapes[mm_result] = [TILE_M, N_tile]
+        state.device_function._nki_sbuf_shapes[mm_psum] = [TILE_M, N_tile]
 
     if not with_acc:
         return expr_from_string(mm_result)

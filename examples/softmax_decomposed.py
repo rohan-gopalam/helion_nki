@@ -70,7 +70,7 @@ def main() -> None:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     raw_kernel = getattr(mod, "_helion_softmax_decomposed")
-    out_dev = raw_kernel[(1,)](x_dev)
+    out_dev = raw_kernel[1](x_dev)
     xm.mark_step()
 
     out = out_dev.cpu()

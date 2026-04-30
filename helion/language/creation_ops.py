@@ -138,6 +138,85 @@ def _full_codegen(state: CodegenState) -> ast.AST:
     # NKI two-line pattern: ndarray then nisa.memset(dst, value=...)
     nki_memset = getattr(backend, "full_memset_stmt", None)
     if nki_memset is not None and shape_dims:
+        # 2D accumulator layout normalization for NKI. ``hl.full([1, N])``
+        # inside a tile loop is almost always a reduction accumulator
+        # (per-row scalars); reductions with keepdim=True produce [N, 1]
+        # SBUF layout. Transpose the allocation to [N, 1] so element-wise
+        # ops line up without a numpy-broadcast to [N, N].
+        #
+        # More aggressive guard: fire when users include a REDUCTION op
+        # (amax/amin/sum/mean/etc) which produces [N, 1] that we'd want
+        # to combine with this accumulator. Pure [1, N] broadcast vectors
+        # (e.g. bias for matmul) don't see reduction users.
+        fx_node = state.fx_node
+        if fx_node is not None and backend.name == "nki" and len(shape_dims) == 2:
+            try:
+                resolved = [int(d) for d in shape_dims]
+            except (TypeError, ValueError):
+                resolved = None
+            if resolved is not None and resolved[0] == 1 and resolved[1] > 1:
+                # Heuristic: if this hl.full is combined with a reduction
+                # result (amax/amin/sum/mean) anywhere in the kernel body
+                # (possibly in a nested _for_loop / _if subgraph), the
+                # reduction's SBUF layout will be [N, 1]. Scan the ENTIRE
+                # device_ir for reduction ops whose dim=-1 reduction target
+                # produces a [N] vector that would combine with our full.
+                _reduction_ops = (
+                    "amax", "amin", "max_dim", "min_dim",
+                    "sum.dim_intlist", "mean.dim",
+                )
+                transpose = False
+                try:
+                    from .._compiler.host_function import HostFunction as _HF
+                    import sympy as _sp_r
+                    device_ir = _HF.current().device_ir
+                    env = CompileEnvironment.current()
+                    _bs_subs: dict[_sp_r.Symbol, int] = {}
+                    if state.config is not None:
+                        for _bs in env.block_sizes:
+                            _cfg = _bs.from_config(state.config)
+                            if isinstance(_cfg, int):
+                                _bs_subs[_bs.symbol()] = _cfg
+                    for ginfo in device_ir.graphs:
+                        g = ginfo.graph
+                        for n in g.nodes:
+                            if n.op != "call_function":
+                                continue
+                            t_name = str(getattr(n.target, "__name__", n.target)).lower()
+                            if not any(r in t_name for r in _reduction_ops):
+                                continue
+                            # Resolve symbolic shape to concrete ints via
+                            # block-size substitution so we can compare
+                            # against resolved[1] (our N).
+                            val = n.meta.get("val")
+                            if not isinstance(val, torch.Tensor):
+                                continue
+                            import sympy as _sp_r
+                            vs: list[int] = []
+                            for d in val.shape:
+                                if isinstance(d, int):
+                                    vs.append(d)
+                                elif isinstance(d, torch.SymInt):
+                                    try:
+                                        vs.append(int(d._sympy_().subs(_bs_subs)))
+                                    except Exception:
+                                        try:
+                                            vs.append(env.size_hint(d))
+                                        except Exception:
+                                            vs.append(-1)
+                                else:
+                                    vs.append(-1)
+                            if resolved[1] in vs:
+                                transpose = True
+                                break
+                        if transpose:
+                            break
+                except Exception:
+                    pass
+
+                if transpose:
+                    shape_dims = [shape_dims[1], shape_dims[0]]
+
         var = state.device_function.new_var("_nki_full", dce=True)
         ndarray_expr = backend.full_expr(shape_dims, "0", fake_value.dtype)
         state.add_statement(statement_from_string(f"{var} = {ndarray_expr}"))

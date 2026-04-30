@@ -705,6 +705,108 @@ class NKIOpOverrides:
         a = NKIOpOverrides._resolve_psum_alias(state, a)
         b = NKIOpOverrides._resolve_psum_alias(state, b)
 
+        # Layout reconcile: when one operand is [1, N] (FX-declared shape
+        # that wasn't transposed) and the other is [N, 1] (reduction
+        # output or transposed accumulator) AND the FX val for the output
+        # has a single non-trivial dim (logically a vector), transpose
+        # the [N, 1] operand to [1, N] so tensor_tensor sees matching
+        # shapes. This catches the downstream-use-of-transposed-accumulator
+        # case without over-broadcasting.
+        def _layout_reconcile_transpose(name: object, target_shape: list[int],
+                                         dtype: str) -> object:
+            """If ``name`` SBUF is [N, 1] and target_shape is [1, N], emit
+            nc_transpose and return the new var name (as a string)."""
+            if not isinstance(name, str):
+                name_str = str(name)
+            else:
+                name_str = name
+            cur_shape = state.device_function._nki_sbuf_shapes.get(name_str)
+            if (
+                cur_shape is not None
+                and len(cur_shape) == 2
+                and len(target_shape) == 2
+                and cur_shape[0] == target_shape[1]
+                and cur_shape[1] == target_shape[0]
+                and cur_shape[0] > 1
+                and target_shape[0] > 0
+                and target_shape[1] > 0
+            ):
+                from .ast_extension import statement_from_string as _sfs
+                tr_psum = state.device_function.new_var("_tr_psum", dce=True)
+                tr_sbuf = state.device_function.new_var("_tr_sbuf", dce=True)
+                state.device_function._nki_sbuf_shapes[tr_sbuf] = list(target_shape)
+                state.device_function._nki_sbuf_dtypes[tr_sbuf] = dtype
+                state.add_statement(
+                    _sfs(
+                        f"{tr_psum} = nl.ndarray([{target_shape[0]}, {target_shape[1]}], "
+                        f"{dtype}, buffer=nl.psum)"
+                    )
+                )
+                state.add_statement(
+                    _sfs(f"nisa.nc_transpose(dst={tr_psum}, data={name_str})")
+                )
+                state.add_statement(
+                    _sfs(
+                        f"{tr_sbuf} = nl.ndarray([{target_shape[0]}, {target_shape[1]}], "
+                        f"{dtype}, buffer=nl.sbuf)"
+                    )
+                )
+                state.add_statement(
+                    _sfs(f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})")
+                )
+                return tr_sbuf
+            return name
+
+        # Layout reconcile: when one operand is [1, N] and the other is
+        # [N, 1], they are both semantically 1D vectors. Reconcile by
+        # transposing one to match the other. Prefer [1, N] direction
+        # since downstream stores typically expect row-major.
+        def _lookup_shape(name: object) -> list[int] | None:
+            s = state.device_function._nki_sbuf_shapes.get(str(name))
+            if s is not None:
+                return s
+            # Strip _copy suffixes
+            _lk = str(name)
+            while "_copy" in _lk:
+                _lk = _lk[:_lk.rfind("_copy")]
+                s = state.device_function._nki_sbuf_shapes.get(_lk)
+                if s is not None:
+                    return s
+            return None
+
+        a_shape_r = _lookup_shape(a)
+        b_shape_r = _lookup_shape(b)
+        if (
+            a_shape_r is not None and b_shape_r is not None
+            and len(a_shape_r) == 2 and len(b_shape_r) == 2
+            and a_shape_r[0] != b_shape_r[0]
+            and a_shape_r[0] == b_shape_r[1]
+            and a_shape_r[1] == b_shape_r[0]
+            and max(a_shape_r[0], a_shape_r[1]) > 1
+            and max(b_shape_r[0], b_shape_r[1]) > 1
+            and 1 in {a_shape_r[0], a_shape_r[1]}
+            and 1 in {b_shape_r[0], b_shape_r[1]}
+        ):
+            # Both are 1D vectors in different layouts. Transpose the
+            # [N, 1] one to [1, N] to match its partner.
+            try:
+                from torch._inductor.virtualized import V as _V_tr
+                _cn = _V_tr.current_node
+                _cn_val = _cn.meta.get("val") if _cn is not None else None
+            except Exception:
+                _cn_val = None
+            if isinstance(_cn_val, torch.Tensor):
+                _rdt = env.backend.dtype_str(_cn_val.dtype)
+            else:
+                _rdt = "nl.float32"
+            # Pick target: prefer the [1, N] layout (row-major)
+            if a_shape_r[0] == 1:
+                target = a_shape_r
+                b = _layout_reconcile_transpose(b, target, _rdt)
+            else:
+                target = b_shape_r
+                a = _layout_reconcile_transpose(a, target, _rdt)
+
         def _emit_partition_broadcast(hbm_src: str, f_count: int, p_count: int,
                                       target_dtype_str: str,
                                       src_var_name: str = "") -> str | None:
@@ -878,9 +980,115 @@ class NKIOpOverrides:
                             )
                         )
                 else:
-                    # Check for partition broadcast before emitting tensor_tensor
-                    _new_a_shape = state.device_function._nki_sbuf_shapes.get(str(a))
-                    _new_b_shape = state.device_function._nki_sbuf_shapes.get(b_str)
+                    # Check for partition broadcast before emitting tensor_tensor.
+                    # Use the copy-stripping lookup so _nki_full_copy_0 etc.
+                    # resolve to their original var's shape.
+                    def _lookup_inner(name: str) -> list[int] | None:
+                        shape = state.device_function._nki_sbuf_shapes.get(name)
+                        if shape is not None:
+                            return shape
+                        _lk = name
+                        while "_copy" in _lk:
+                            _lk = _lk[:_lk.rfind("_copy")]
+                            shape = state.device_function._nki_sbuf_shapes.get(_lk)
+                            if shape is not None:
+                                return shape
+                        return None
+                    _new_a_shape = _lookup_inner(str(a))
+                    _new_b_shape = _lookup_inner(b_str)
+
+                    # SBUF-replicate broadcast helper (mirrors the outer
+                    # path). Used for [1,F]×[P,1] and similar pure-SBUF
+                    # mid-kernel allocations that have no HBM source.
+                    def _inner_sbuf_replicate(src_var: str, src_shape: list[int],
+                                              p_target: int, f_target: int,
+                                              dtype: str) -> str:
+                        from .ast_extension import (
+                            create as _create,
+                            expr_from_string as _efrom,
+                        )
+                        out_var = state.device_function.new_var("_nki_sbuf_bcast", dce=True)
+                        state.device_function._nki_sbuf_shapes[out_var] = [p_target, f_target]
+                        state.device_function._nki_sbuf_dtypes[out_var] = dtype
+                        state.add_statement(
+                            statement_from_string(
+                                f"{out_var} = nl.ndarray([{p_target}, {f_target}], {dtype}, buffer=nl.sbuf)"
+                            )
+                        )
+                        src_p, src_f = src_shape[0], src_shape[1]
+                        if src_p == 1 and src_f == f_target:
+                            p_loop = state.device_function.new_var("_p_bcast")
+                            state.add_statement(_create(
+                                ast.For,
+                                target=_create(ast.Name, id=p_loop, ctx=ast.Store()),
+                                iter=_efrom(f"nl.affine_range({p_target})"),
+                                body=[statement_from_string(
+                                    f"nisa.tensor_copy(dst={out_var}[{p_loop}:{p_loop}+1, 0:{f_target}], "
+                                    f"src={src_var})"
+                                )],
+                                orelse=[],
+                            ))
+                        elif src_p == p_target and src_f == 1:
+                            f_loop = state.device_function.new_var("_f_bcast")
+                            state.add_statement(_create(
+                                ast.For,
+                                target=_create(ast.Name, id=f_loop, ctx=ast.Store()),
+                                iter=_efrom(f"nl.affine_range({f_target})"),
+                                body=[statement_from_string(
+                                    f"nisa.tensor_copy(dst={out_var}[0:{p_target}, {f_loop}:{f_loop}+1], "
+                                    f"src={src_var})"
+                                )],
+                                orelse=[],
+                            ))
+                        else:
+                            # Scalar or already-matching; do a straight copy
+                            state.add_statement(statement_from_string(
+                                f"nisa.tensor_copy(dst={out_var}, src={src_var})"
+                            ))
+                        return out_var
+
+                    # Full numpy broadcast: [1,F]×[P,1] or similar. Only
+                    # apply when the FX-derived new_dst allocation shape
+                    # ALSO matches the broadcast target (i.e. downstream
+                    # codegen agrees the result is [P, F], not [1, F] or
+                    # [P, 1]). Without this guard, we over-broadcast and
+                    # break downstream tensor_scalar calls that assume
+                    # operand0 is scalar-like AND accumulator stores that
+                    # expect [1, F] or [P, 1] shape.
+                    # Additional guard: the shape_list (FX-derived output
+                    # shape) must match the broadcast target AND the dst
+                    # must not be reused as an accumulator (i.e. the op is
+                    # assigning a new var, not updating an existing one).
+                    _ptgt_check = max(_new_a_shape[0] or 0, _new_b_shape[0] or 0) if _new_a_shape and _new_b_shape else 0
+                    _ftgt_check = max(_new_a_shape[1] or 0, _new_b_shape[1] or 0) if _new_a_shape and _new_b_shape else 0
+                    _full_inner = (
+                        _new_a_shape is not None and _new_b_shape is not None
+                        and len(_new_a_shape) >= 2 and len(_new_b_shape) >= 2
+                        and {_new_a_shape[0], _new_b_shape[0]} == {1, _ptgt_check}
+                        and {_new_a_shape[1], _new_b_shape[1]} == {1, _ftgt_check}
+                        and _ptgt_check > 1
+                        and _ftgt_check > 1
+                        and len(shape_list) >= 2
+                        and shape_list[0] == _ptgt_check
+                        and shape_list[1] == _ftgt_check
+                    )
+                    if _full_inner:
+                        _ptgt = max(_new_a_shape[0], _new_b_shape[0])
+                        _ftgt = max(_new_a_shape[1], _new_b_shape[1])
+                        _dt = dtype_str
+                        _abc = (
+                            str(a) if _new_a_shape == [_ptgt, _ftgt]
+                            else _inner_sbuf_replicate(str(a), _new_a_shape, _ptgt, _ftgt, _dt)
+                        )
+                        _bbc = (
+                            b_str if _new_b_shape == [_ptgt, _ftgt]
+                            else _inner_sbuf_replicate(b_str, _new_b_shape, _ptgt, _ftgt, _dt)
+                        )
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_tensor(dst={new_dst}, data1={_abc}, data2={_bbc}, op={op})"
+                        ))
+                        return new_dst
+
                     _new_mismatch = (
                         _new_a_shape and _new_b_shape
                         and len(_new_a_shape) >= 2 and len(_new_b_shape) >= 2
@@ -941,8 +1149,27 @@ class NKIOpOverrides:
         # nisa.tensor_tensor requires matching partition counts on trn1, so we must
         # explicitly broadcast the [1, F] operand to [P, F] via per-partition DMA.
         # Handle both cases: a=[P,F] b=[1,F] AND a=[1,F] b=[P,F].
-        a_sbuf_shape = state.device_function._nki_sbuf_shapes.get(dst)
-        b_sbuf_shape = state.device_function._nki_sbuf_shapes.get(b_str)
+        def _lookup_sbuf_shape(name: str) -> list[int] | None:
+            """SBUF shape lookup with copy-var suffix stripping.
+
+            ``_nki_full_copy_0`` is a read-only copy of ``_nki_full``; we
+            register the shape on the original but need to find it when
+            the op references the copy.  Strip ``_copy``/``_copy_N``
+            suffixes and retry.
+            """
+            shape = state.device_function._nki_sbuf_shapes.get(name)
+            if shape is not None:
+                return shape
+            _lk = name
+            while "_copy" in _lk:
+                _lk = _lk[:_lk.rfind("_copy")]
+                shape = state.device_function._nki_sbuf_shapes.get(_lk)
+                if shape is not None:
+                    return shape
+            return None
+
+        a_sbuf_shape = _lookup_sbuf_shape(dst)
+        b_sbuf_shape = _lookup_sbuf_shape(b_str)
         _has_partition_mismatch = (
             dst_tile_vars is None
             and b_tile_vars is None
@@ -955,6 +1182,38 @@ class NKIOpOverrides:
         # Which operand needs broadcasting (the one with partition=1)
         _a_needs_broadcast = _has_partition_mismatch and a_sbuf_shape[0] == 1
         b_needs_broadcast = _has_partition_mismatch and b_sbuf_shape[0] == 1
+
+        # Free-dim broadcast: [P, 1] × [P, F] or vice versa. NKI
+        # tensor_tensor also requires matching free-dim extents.
+        _has_free_mismatch = (
+            dst_tile_vars is None
+            and b_tile_vars is None
+            and a_sbuf_shape is not None
+            and b_sbuf_shape is not None
+            and len(a_sbuf_shape) >= 2
+            and len(b_sbuf_shape) >= 2
+            and a_sbuf_shape[0] == b_sbuf_shape[0]
+            and a_sbuf_shape[1] != b_sbuf_shape[1]
+        )
+        _a_needs_free_broadcast = _has_free_mismatch and a_sbuf_shape[1] == 1
+        _b_needs_free_broadcast = _has_free_mismatch and b_sbuf_shape[1] == 1
+
+        # Full numpy-style: [1, F] × [P, 1] → [P, F] (or reverse). Emit
+        # two SBUF-replicating copies to produce matching-shape operands.
+        _has_full_bcast = (
+            dst_tile_vars is None
+            and b_tile_vars is None
+            and a_sbuf_shape is not None
+            and b_sbuf_shape is not None
+            and len(a_sbuf_shape) >= 2
+            and len(b_sbuf_shape) >= 2
+            and {a_sbuf_shape[0], b_sbuf_shape[0]} == {1, max(a_sbuf_shape[0], b_sbuf_shape[0])}
+            and {a_sbuf_shape[1], b_sbuf_shape[1]} == {1, max(a_sbuf_shape[1], b_sbuf_shape[1])}
+            and 1 in (a_sbuf_shape[0], b_sbuf_shape[0])
+            and 1 in (a_sbuf_shape[1], b_sbuf_shape[1])
+            and (a_sbuf_shape[0] != 1 or b_sbuf_shape[0] != 1)
+            and (a_sbuf_shape[1] != 1 or b_sbuf_shape[1] != 1)
+        )
 
         def _emit_broadcast_op(bcast_src_name: str, bcast_src_shape: list,
                                data1_name: str, data2_name: str,
@@ -989,11 +1248,153 @@ class NKIOpOverrides:
             if isinstance(_out_val, torch.Tensor):
                 _bcast_dtype_str = env.backend.dtype_str(_out_val.dtype)
 
+        def _emit_sbuf_replicate(src_var: str, src_shape: list[int],
+                                  p_target: int, f_target: int,
+                                  dtype_str: str) -> str:
+            """Replicate an SBUF [1, F] or [P, 1] or [1, 1] source into a
+            [p_target, f_target] SBUF tile using per-partition tensor_copy.
+
+            Handles the pure-SBUF broadcast case (no HBM source required).
+            """
+            from .ast_extension import create as _create, expr_from_string as _efrom
+            out_var = state.device_function.new_var("_nki_sbuf_bcast", dce=True)
+            state.device_function._nki_sbuf_shapes[out_var] = [p_target, f_target]
+            state.device_function._nki_sbuf_dtypes[out_var] = dtype_str
+            state.add_statement(
+                statement_from_string(
+                    f"{out_var} = nl.ndarray([{p_target}, {f_target}], "
+                    f"{dtype_str}, buffer=nl.sbuf)"
+                )
+            )
+            src_p, src_f = src_shape[0], src_shape[1]
+            if src_p == 1 and src_f == f_target:
+                # [1, F] → [P, F]: replicate the row into every partition.
+                p_loop = state.device_function.new_var("_p_bcast")
+                state.add_statement(
+                    _create(
+                        ast.For,
+                        target=_create(ast.Name, id=p_loop, ctx=ast.Store()),
+                        iter=_efrom(f"nl.affine_range({p_target})"),
+                        body=[
+                            statement_from_string(
+                                f"nisa.tensor_copy(dst={out_var}[{p_loop}:{p_loop}+1, 0:{f_target}], "
+                                f"src={src_var})"
+                            )
+                        ],
+                        orelse=[],
+                    )
+                )
+            elif src_p == p_target and src_f == 1:
+                # [P, 1] → [P, F]: replicate the column across the free dim.
+                # We use a per-free-index nisa.tensor_copy from [P,1] src
+                # to [P,f:f+1] dst slice.
+                f_loop = state.device_function.new_var("_f_bcast")
+                state.add_statement(
+                    _create(
+                        ast.For,
+                        target=_create(ast.Name, id=f_loop, ctx=ast.Store()),
+                        iter=_efrom(f"nl.affine_range({f_target})"),
+                        body=[
+                            statement_from_string(
+                                f"nisa.tensor_copy(dst={out_var}[0:{p_target}, {f_loop}:{f_loop}+1], "
+                                f"src={src_var})"
+                            )
+                        ],
+                        orelse=[],
+                    )
+                )
+            elif src_p == 1 and src_f == 1:
+                # Scalar tile → full: memset to the single value... but
+                # we don't have the value here. Fall back to nested copy.
+                p_loop = state.device_function.new_var("_p_bcast")
+                f_loop = state.device_function.new_var("_f_bcast")
+                state.add_statement(
+                    _create(
+                        ast.For,
+                        target=_create(ast.Name, id=p_loop, ctx=ast.Store()),
+                        iter=_efrom(f"nl.affine_range({p_target})"),
+                        body=[
+                            statement_from_string(
+                                f"nisa.tensor_copy(dst={out_var}[{p_loop}:{p_loop}+1, 0:{f_target}], "
+                                f"src={src_var})"
+                            )
+                        ],
+                        orelse=[],
+                    )
+                )
+            return out_var
+
+        # Full numpy broadcast: [1, F] × [P, 1] → [P, F]. Replicate both
+        # operands to the full [P, F] shape before tensor_tensor.
+        # GUARD: only fire if the current FX node's output val confirms a
+        # [P, F] result. If the FX trace thinks the output is [1, F] or
+        # [P, 1] (kernel accumulator), broadcasting would break semantics.
+        _allow_full_bcast = _has_full_bcast
+        if _allow_full_bcast and cur_node is not None:
+            _cn_val = cur_node.meta.get("val")
+            if isinstance(_cn_val, torch.Tensor):
+                _cn_shape = NKIOpOverrides._squeeze_shape_2d(
+                    [env.size_hint(d) if isinstance(d, torch.SymInt) else int(d) for d in _cn_val.shape]
+                )
+                _ptgt = max(a_sbuf_shape[0], b_sbuf_shape[0])
+                _ftgt = max(a_sbuf_shape[1], b_sbuf_shape[1])
+                # Must match the broadcast target shape.
+                if not (len(_cn_shape) >= 2 and _cn_shape[0] == _ptgt and _cn_shape[1] == _ftgt):
+                    _allow_full_bcast = False
+
+        if _allow_full_bcast:
+            p_target = max(a_sbuf_shape[0], b_sbuf_shape[0])
+            f_target = max(a_sbuf_shape[1], b_sbuf_shape[1])
+            a_bcast = dst if a_sbuf_shape == [p_target, f_target] else _emit_sbuf_replicate(
+                dst, a_sbuf_shape, p_target, f_target, _bcast_dtype_str
+            )
+            b_bcast = b_str if b_sbuf_shape == [p_target, f_target] else _emit_sbuf_replicate(
+                b_str, b_sbuf_shape, p_target, f_target, _bcast_dtype_str
+            )
+            new_dst_full = state.device_function.new_var(prefix, dce=True)
+            state.device_function._nki_sbuf_shapes[new_dst_full] = [p_target, f_target]
+            state.device_function._nki_sbuf_dtypes[new_dst_full] = _bcast_dtype_str
+            state.add_statement(
+                statement_from_string(
+                    f"{new_dst_full} = nl.ndarray([{p_target}, {f_target}], "
+                    f"{_bcast_dtype_str}, buffer=nl.sbuf)"
+                )
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={new_dst_full}, data1={a_bcast}, "
+                    f"data2={b_bcast}, op={op})"
+                )
+            )
+            return new_dst_full
+
         if b_needs_broadcast:
             p_count = a_sbuf_shape[0]
+            # Try HBM-source broadcast first; it's cheaper when available.
             if _emit_broadcast_op(b_str, b_sbuf_shape, dst, b_str, dst, p_count,
                                    _bcast_dtype_str):
                 return dst
+            # Fall back to SBUF replication for mid-kernel allocations
+            # (e.g. reductions, hl.full outputs) that have no HBM origin.
+            b_bcast = _emit_sbuf_replicate(
+                b_str, b_sbuf_shape, p_count, b_sbuf_shape[1], _bcast_dtype_str
+            )
+            new_dst_b = state.device_function.new_var(prefix, dce=True)
+            state.device_function._nki_sbuf_shapes[new_dst_b] = [p_count, b_sbuf_shape[1]]
+            state.device_function._nki_sbuf_dtypes[new_dst_b] = _bcast_dtype_str
+            state.add_statement(
+                statement_from_string(
+                    f"{new_dst_b} = nl.ndarray([{p_count}, {b_sbuf_shape[1]}], "
+                    f"{_bcast_dtype_str}, buffer=nl.sbuf)"
+                )
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={new_dst_b}, data1={a}, "
+                    f"data2={b_bcast}, op={op})"
+                )
+            )
+            return new_dst_b
         elif _a_needs_broadcast:
             # a=[1,F] needs broadcast to match b=[P,F]; also need new dest buffer
             p_count = b_sbuf_shape[0]
@@ -1009,6 +1410,43 @@ class NKIOpOverrides:
             if _emit_broadcast_op(dst, a_sbuf_shape, dst, b_str, new_dst2, p_count,
                                    _bcast_dtype_str):
                 return new_dst2
+            a_bcast = _emit_sbuf_replicate(
+                dst, a_sbuf_shape, p_count, a_sbuf_shape[1], _bcast_dtype_str
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={new_dst2}, data1={a_bcast}, "
+                    f"data2={b_str}, op={op})"
+                )
+            )
+            return new_dst2
+        elif _has_free_mismatch:
+            # Free-dim mismatch: either [P,1] or [P,F] shapes; replicate
+            # the [P,1] operand across the free axis.
+            p_target = a_sbuf_shape[0]
+            f_target = max(a_sbuf_shape[1], b_sbuf_shape[1])
+            a_bcast = dst if a_sbuf_shape[1] == f_target else _emit_sbuf_replicate(
+                dst, a_sbuf_shape, p_target, f_target, _bcast_dtype_str
+            )
+            b_bcast = b_str if b_sbuf_shape[1] == f_target else _emit_sbuf_replicate(
+                b_str, b_sbuf_shape, p_target, f_target, _bcast_dtype_str
+            )
+            new_dst_f = state.device_function.new_var(prefix, dce=True)
+            state.device_function._nki_sbuf_shapes[new_dst_f] = [p_target, f_target]
+            state.device_function._nki_sbuf_dtypes[new_dst_f] = _bcast_dtype_str
+            state.add_statement(
+                statement_from_string(
+                    f"{new_dst_f} = nl.ndarray([{p_target}, {f_target}], "
+                    f"{_bcast_dtype_str}, buffer=nl.sbuf)"
+                )
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={new_dst_f}, data1={a_bcast}, "
+                    f"data2={b_bcast}, op={op})"
+                )
+            )
+            return new_dst_f
 
         if dst_tile_vars is not None:
             for i, dv in enumerate(dst_tile_vars):
@@ -1046,7 +1484,33 @@ class NKIOpOverrides:
                     val = cg.get_var_constant_value(x)
                     if val is not None:
                         return val
+            # Kernel-parameter scalar (e.g. ``alpha: float`` passed to
+            # the kernel). Recognize by matching the var name against
+            # registered Python-scalar arguments on DeviceFunction.
+            if state is not None:
+                dev_fn = state.device_function
+                scalar_args = getattr(dev_fn, "_nki_scalar_arg_names", None)
+                if scalar_args is not None and x in scalar_args:
+                    # Return the name itself as a "numeric-like" token so
+                    # callers emit it verbatim. Keep as string so
+                    # tensor_scalar gets it as operand0=<name>.
+                    return x
         return x
+
+    @classmethod
+    def _is_scalar_param_name(cls, x: object) -> bool:
+        """Return True if ``x`` names a Python-scalar kernel parameter."""
+        if not isinstance(x, str):
+            return False
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            return False
+        dev_fn = state.device_function
+        scalar_args = getattr(dev_fn, "_nki_scalar_arg_names", None)
+        return scalar_args is not None and x in scalar_args
 
     @classmethod
     def _is_scalar_operand(cls, x: object) -> bool:
@@ -1093,15 +1557,19 @@ class NKIOpOverrides:
 
         # Multi-user protection: if dst is a second-level copy var or the FX input has
         # multiple users, tensor_scalar must NOT modify the dst in-place.
+        # Check ALL tensor args, not just args[0] — reverse0=True ops (e.g.
+        # 1 - probs) pass probs as args[1], and if probs has multiple users
+        # we still need to allocate a new dst to avoid overwriting it.
         from torch._inductor.virtualized import V as _V_ts
         _ts_node = _V_ts.current_node
         _ts_is_copy = "_copy_" in dst and dst[-1:].isdigit()
-        _ts_multi_user = _ts_is_copy or (
-            _ts_node is not None
-            and len(_ts_node.args) >= 1
-            and hasattr(_ts_node.args[0], "users")
-            and len(_ts_node.args[0].users) > 1
-        )
+        _ts_any_arg_multi_user = False
+        if _ts_node is not None:
+            for _arg in getattr(_ts_node, "args", ()):
+                if hasattr(_arg, "users") and len(_arg.users) > 1:
+                    _ts_any_arg_multi_user = True
+                    break
+        _ts_multi_user = _ts_is_copy or _ts_any_arg_multi_user
         if _ts_multi_user and dst_tile_vars is None:
             _ts_shape = state.device_function._nki_sbuf_shapes.get(dst)
             if _ts_shape is None and _ts_is_copy:
@@ -1124,7 +1592,54 @@ class NKIOpOverrides:
                         f"{_ts_new_dst} = nl.ndarray([{_ts_shape_str}], {_ts_dtype}, buffer=nl.sbuf)"
                     )
                 )
-                _operand_emit_ts = _scalar_for_emit(operand0)
+
+                # Layout reconcile: operand0 must be [P, 1] layout for
+                # partition-scalar broadcast. Transpose [1, P] → [P, 1] if
+                # needed. Look up operand0's SBUF shape.
+                def _ts_lookup_shape_mu(name: str) -> list[int] | None:
+                    s = state.device_function._nki_sbuf_shapes.get(name)
+                    if s is not None:
+                        return s
+                    _lk = name
+                    while "_copy" in _lk:
+                        _lk = _lk[:_lk.rfind("_copy")]
+                        s = state.device_function._nki_sbuf_shapes.get(_lk)
+                        if s is not None:
+                            return s
+                    return None
+
+                _operand_str_mu = str(operand0) if not isinstance(operand0, str) else operand0
+                _op0_shape_mu = _ts_lookup_shape_mu(_operand_str_mu)
+                _operand_for_emit_mu = operand0
+                if (
+                    _op0_shape_mu is not None
+                    and len(_op0_shape_mu) == 2
+                    and len(_ts_shape) == 2
+                    and _op0_shape_mu[0] == 1
+                    and _op0_shape_mu[1] > 1
+                    and _op0_shape_mu[1] == _ts_shape[0]
+                ):
+                    _dt_mu = state.device_function._nki_sbuf_dtypes.get(
+                        _operand_str_mu, "nl.float32")
+                    _tr_psum_mu = state.device_function.new_var("_ts_tr_psum", dce=True)
+                    _tr_sbuf_mu = state.device_function.new_var("_ts_tr_sbuf", dce=True)
+                    state.device_function._nki_sbuf_shapes[_tr_sbuf_mu] = [_op0_shape_mu[1], 1]
+                    state.device_function._nki_sbuf_dtypes[_tr_sbuf_mu] = _dt_mu
+                    state.add_statement(statement_from_string(
+                        f"{_tr_psum_mu} = nl.ndarray([{_op0_shape_mu[1]}, 1], {_dt_mu}, buffer=nl.psum)"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.nc_transpose(dst={_tr_psum_mu}, data={_operand_str_mu})"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"{_tr_sbuf_mu} = nl.ndarray([{_op0_shape_mu[1]}, 1], {_dt_mu}, buffer=nl.sbuf)"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.tensor_copy(dst={_tr_sbuf_mu}, src={_tr_psum_mu})"
+                    ))
+                    _operand_for_emit_mu = _tr_sbuf_mu
+
+                _operand_emit_ts = _scalar_for_emit(_operand_for_emit_mu)
                 state.add_statement(
                     statement_from_string(
                         f"nisa.tensor_scalar(dst={_ts_new_dst}, data={data}, "
@@ -1164,7 +1679,57 @@ class NKIOpOverrides:
                 "tensor_scalar does not support non-tile-list data with tile-list operand0",
             )
 
-        operand_emit = _scalar_for_emit(operand0)
+        # Layout reconcile: tensor_scalar needs operand0 in [P, 1] layout
+        # (per-partition scalar). When operand0 is a SBUF tensor in [1, N]
+        # layout but semantically represents one value per partition (e.g.
+        # lse [1, N] used as per-row scalar in [N, V] × [N, 1] broadcast),
+        # transpose [1, N] → [N, 1] so tensor_scalar can consume it.
+        def _ts_lookup_shape(name: str) -> list[int] | None:
+            s = state.device_function._nki_sbuf_shapes.get(name)
+            if s is not None:
+                return s
+            _lk = name
+            while "_copy" in _lk:
+                _lk = _lk[:_lk.rfind("_copy")]
+                s = state.device_function._nki_sbuf_shapes.get(_lk)
+                if s is not None:
+                    return s
+            return None
+
+        operand_str = str(operand0) if not isinstance(operand0, str) else operand0
+        op0_shape = _ts_lookup_shape(operand_str)
+        dst_shape = _ts_lookup_shape(dst)
+        operand_for_emit = operand0
+        if (
+            op0_shape is not None
+            and dst_shape is not None
+            and len(op0_shape) == 2
+            and len(dst_shape) == 2
+            and op0_shape[0] == 1
+            and op0_shape[1] > 1
+            and op0_shape[1] == dst_shape[0]
+        ):
+            # Need [P, 1] but have [1, P] — emit nc_transpose
+            _dt = state.device_function._nki_sbuf_dtypes.get(operand_str, "nl.float32")
+            tr_psum = state.device_function.new_var("_ts_tr_psum", dce=True)
+            tr_sbuf = state.device_function.new_var("_ts_tr_sbuf", dce=True)
+            state.device_function._nki_sbuf_shapes[tr_sbuf] = [op0_shape[1], 1]
+            state.device_function._nki_sbuf_dtypes[tr_sbuf] = _dt
+            state.add_statement(statement_from_string(
+                f"{tr_psum} = nl.ndarray([{op0_shape[1]}, 1], {_dt}, buffer=nl.psum)"
+            ))
+            state.add_statement(statement_from_string(
+                f"nisa.nc_transpose(dst={tr_psum}, data={operand_str})"
+            ))
+            state.add_statement(statement_from_string(
+                f"{tr_sbuf} = nl.ndarray([{op0_shape[1]}, 1], {_dt}, buffer=nl.sbuf)"
+            ))
+            state.add_statement(statement_from_string(
+                f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})"
+            ))
+            operand_for_emit = tr_sbuf
+
+        operand_emit = _scalar_for_emit(operand_for_emit)
         state.add_statement(
             statement_from_string(
                 "nisa.tensor_scalar("
@@ -1373,6 +1938,14 @@ class NKIOpOverrides:
             return operand
 
         operand_str = str(operand)
+
+        # Python-scalar kernel arg (e.g. ``temperature: float``). Emit
+        # ``(1.0 / name)`` as a bare expression; the caller will use it
+        # in a tensor_scalar as the scalar operand.
+        scalar_args = getattr(state.device_function, "_nki_scalar_arg_names", set())
+        if operand_str in scalar_args:
+            return f"(1.0 / {operand_str})"
+
         operand_tile_vars = state.device_function.get_tile_list_vars(operand_str)
         if operand_tile_vars is not None:
             for ov in operand_tile_vars:
@@ -1599,6 +2172,184 @@ class NKIOpOverrides:
     def neg(self, a: object) -> str:
         """neg(x) = -x via tensor_scalar multiply by -1."""
         return self._nki_tensor_scalar(a, -1.0, "nl.multiply")
+
+    def where(self, mask: object, a: object, b: object) -> str:
+        """NKI ``torch.where`` lowering.
+
+        Uses ``nisa.tensor_copy_predicated`` (Trn2+) to conditionally select
+        between the two operands. ``mask`` is treated as a predicate tile:
+        where mask is truthy (non-zero), pick ``a``; else pick ``b``.
+
+        Strategy:
+
+        1. Allocate an output SBUF tile in the consumer's expected dtype.
+        2. Initialize it from ``b`` (the "false" branch) via a normal copy.
+        3. Overwrite selected positions with ``a`` using
+           ``nisa.tensor_copy_predicated(src=a, dst=out, predicate=mask)``.
+
+        Falls back to ``BackendUnsupported`` on trn1, where
+        ``tensor_copy_predicated`` is not available. The scalar cases (b
+        constant or a constant) use ``memset``/``nisa.tensor_scalar`` to
+        materialize the scalar in the output buffer before the predicated
+        overwrite.
+        """
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+        from torch._inductor.virtualized import V
+
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki":
+            raise exc.BackendUnsupported(env.backend.name, "NKI-only where")
+        state = getattr(env, "_codegen_state", None)
+        if state is None:
+            raise exc.BackendUnsupported(
+                "nki", "where requires active codegen state"
+            )
+
+        # Resolve PSUM aliases on tensor operands so upstream PSUM results
+        # are read directly.
+        a = NKIOpOverrides._resolve_psum_alias(state, a)
+        b = NKIOpOverrides._resolve_psum_alias(state, b)
+        mask = NKIOpOverrides._resolve_psum_alias(state, mask)
+
+        # Determine output shape/dtype from the current FX node.
+        cur_node = V.current_node
+        out_val = cur_node.meta.get("val") if cur_node is not None else None
+        if not isinstance(out_val, torch.Tensor):
+            raise exc.BackendUnsupported(
+                "nki", "where: output shape unknown (no FX val metadata)"
+            )
+
+        import sympy as _sp_w
+        _bs_subs_w: dict[_sp_w.Symbol, int] = {}
+        if state.config is not None:
+            for _bs in env.block_sizes:
+                _cfg = _bs.from_config(state.config)
+                if isinstance(_cfg, int):
+                    _bs_subs_w[_bs.symbol()] = _cfg
+
+        def _resolve_dim(d: object) -> int:
+            if isinstance(d, int):
+                return d
+            if isinstance(d, torch.SymInt):
+                try:
+                    return int(d._sympy_().subs(_bs_subs_w))
+                except (TypeError, ValueError):
+                    return env.size_hint(d)
+            return int(d)
+
+        resolved_shape = [_resolve_dim(d) for d in out_val.shape]
+        out_shape = NKIOpOverrides._squeeze_shape_2d(resolved_shape)
+        if len(out_shape) < 2:
+            out_shape = [1] + list(out_shape) if len(out_shape) == 1 else [1, 1]
+        out_dtype_str = env.backend.dtype_str(out_val.dtype)
+
+        def _emit_str(x: object) -> str:
+            if isinstance(x, ast.AST):
+                return ast.unparse(x)
+            return str(x)
+
+        mask_str = _emit_str(mask)
+        a_str = _emit_str(a)
+        b_str = _emit_str(b)
+
+        # Allocate output buffer.
+        dst_var = state.device_function.new_var("_nki_where_out", dce=True)
+        state.device_function._nki_sbuf_shapes[dst_var] = list(out_shape)
+        state.device_function._nki_sbuf_dtypes[dst_var] = out_dtype_str
+        state.add_statement(
+            statement_from_string(
+                f"{dst_var} = nl.ndarray([{out_shape[0]}, {out_shape[1]}], "
+                f"{out_dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+
+        def _try_as_scalar(name: str) -> tuple[bool, object]:
+            """Return (True, value) if ``name`` resolves to a host scalar.
+
+            Handles literal numbers ("0.0"), kernel-parameter scalars
+            (``_nki_scalar_arg_names``), and lifted constant vars
+            (``v_N = 0.0``).
+            """
+            try:
+                return True, float(name)
+            except (TypeError, ValueError):
+                pass
+            scalar_args = getattr(state.device_function, "_nki_scalar_arg_names", set())
+            if name in scalar_args:
+                return True, name  # emit name as-is
+            cg = getattr(state, "codegen", None)
+            if cg is not None and hasattr(cg, "get_var_constant_value"):
+                val = cg.get_var_constant_value(name)
+                if val is not None:
+                    return True, val
+            return False, None
+
+        is_scalar_b, b_val = _try_as_scalar(b_str)
+
+        # Materialize the "false" branch into dst first.
+        if is_scalar_b:
+            if isinstance(b_val, float) and b_val == 0.0 and env.backend.dtype_str(out_val.dtype) != "nl.int32":
+                state.add_statement(
+                    statement_from_string(f"nisa.memset({dst_var}, value=0)")
+                )
+            else:
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.memset({dst_var}, value={b_val})"
+                    )
+                )
+        else:
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_copy(dst={dst_var}, src={b_str})"
+                )
+            )
+
+        # tensor_copy_predicated requires predicate dtype uint8/16/32.
+        # The masks produced by comparison ops (nl.less/greater/etc.) are
+        # int32 by default; cast to uint32 via a bitcast-style tensor_copy
+        # into a uint32 SBUF tile so we don't lose the bit pattern.
+        mask_shape = state.device_function._nki_sbuf_shapes.get(mask_str)
+        if mask_shape is None:
+            # Try to derive from FX meta
+            mask_shape = list(out_shape)
+        mask_cast_var = state.device_function.new_var("_nki_pred_u32", dce=True)
+        state.device_function._nki_sbuf_shapes[mask_cast_var] = list(mask_shape)
+        state.device_function._nki_sbuf_dtypes[mask_cast_var] = "nl.uint32"
+        state.add_statement(
+            statement_from_string(
+                f"{mask_cast_var} = nl.ndarray([{mask_shape[0]}, {mask_shape[1]}], "
+                f"nl.uint32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={mask_cast_var}, src={mask_str})"
+            )
+        )
+        pred_var = mask_cast_var
+
+        # Now predicated-copy the "true" branch into dst wherever mask is set.
+        a_is_scalar, a_val = _try_as_scalar(a_str)
+
+        if a_is_scalar:
+            # tensor_copy_predicated supports a scalar src starting Trn2.
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_copy_predicated(dst={dst_var}, "
+                    f"src={a_val}, predicate={pred_var})"
+                )
+            )
+        else:
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_copy_predicated(dst={dst_var}, "
+                    f"src={a_str}, predicate={pred_var})"
+                )
+            )
+
+        return dst_var
 
     def constant(self, value: int | float | bool, dtype: torch.dtype) -> str:
         """Return string repr for _unpack_opsvalue; _is_scalar_operand treats numeric strings as scalars."""
@@ -2112,9 +2863,86 @@ class NKIOpOverrides:
         return dst_var
 
     # Index / scalar arithmetic — these operate on Python integers (tile offsets,
-    # loop counters), not on SBUF tiles, so plain Python operators are correct.
+    # loop counters), not on SBUF tiles, so plain Python operators are correct
+    # for the scalar/scalar case.  NKI does not provide tile-valued floordiv /
+    # mod, so we keep Python semantics; tile-tile forms are rare in practice.
     @staticmethod
     def floordiv(a: object, b: object) -> str:
+        # When ``a`` is an SBUF tile and ``b`` is a scalar constant,
+        # emit (a * (1.0/b)) then floor, producing the integer floor div.
+        # The result is an int32 tile. Uses two nisa.tensor_scalar calls
+        # plus one nisa.activation(floor).
+        a_scalar = NKIOpOverrides._is_scalar_operand(a)
+        b_scalar = NKIOpOverrides._is_scalar_operand(b)
+        if a_scalar and b_scalar:
+            return f"{a} // {b}"
+        if not a_scalar and b_scalar:
+            # Tile // scalar: multiply by 1/scalar, floor, cast to int.
+            from .ast_extension import statement_from_string
+            from .compile_environment import CompileEnvironment
+            env = CompileEnvironment.current()
+            state = getattr(env, "_codegen_state", None)
+            if state is None:
+                return f"{a} // {b}"
+            try:
+                b_val = float(NKIOpOverrides._resolve_scalar_operand(b))
+            except (TypeError, ValueError):
+                return f"{a} // {b}"
+            if b_val == 0.0:
+                return f"{a} // {b}"
+            a_str = str(a)
+            src_shape = state.device_function._nki_sbuf_shapes.get(a_str)
+            if src_shape is None:
+                # indices_N from loop_index_statements aren't registered
+                # in _nki_sbuf_shapes. Try FX node's val to derive shape,
+                # or assume a [1, block_size] iota layout.
+                try:
+                    from torch._inductor.virtualized import V as _V_fd
+                    _cn = _V_fd.current_node
+                    if _cn is not None:
+                        val = _cn.meta.get("val")
+                        if isinstance(val, torch.Tensor):
+                            src_shape = NKIOpOverrides._squeeze_shape_2d(
+                                [env.size_hint(d) if isinstance(d, torch.SymInt) else int(d) for d in val.shape]
+                            )
+                            if len(src_shape) == 1:
+                                src_shape = [1, src_shape[0]]
+                except Exception:
+                    pass
+            if src_shape is None or len(src_shape) < 2:
+                return f"{a} // {b}"
+            tmp_var = state.device_function.new_var("_nki_floordiv_f32", dce=True)
+            out_var = state.device_function.new_var("_nki_floordiv_i32", dce=True)
+            state.device_function._nki_sbuf_shapes[tmp_var] = list(src_shape)
+            state.device_function._nki_sbuf_shapes[out_var] = list(src_shape)
+            state.device_function._nki_sbuf_dtypes[tmp_var] = "nl.float32"
+            state.device_function._nki_sbuf_dtypes[out_var] = "nl.int32"
+            inv = 1.0 / b_val
+            state.add_statement(
+                statement_from_string(
+                    f"{tmp_var} = nl.ndarray([{src_shape[0]}, {src_shape[1]}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_scalar(dst={tmp_var}, data={a_str}, "
+                    f"op0=nl.multiply, operand0={inv})"
+                )
+            )
+            # Cast float result to int32: NKI's tensor_copy performs a
+            # fp32 → int32 truncation. For non-negative iota values (the
+            # common case: tile.index), truncation equals floor.
+            state.add_statement(
+                statement_from_string(
+                    f"{out_var} = nl.ndarray([{src_shape[0]}, {src_shape[1]}], nl.int32, buffer=nl.sbuf)"
+                )
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_copy(dst={out_var}, src={tmp_var})"
+                )
+            )
+            return out_var
         return f"{a} // {b}"
 
     @staticmethod
@@ -2126,28 +2954,331 @@ class NKIOpOverrides:
         return f"{a} % {b}"
 
     @staticmethod
+    def _nki_scalar_arith(a: object, b: object, nl_op: str | None, py_op: str) -> str:
+        """Arithmetic on tile-or-scalar operands.
+
+        When both operands are host scalars, fall back to Python ``py_op``.
+        When one is a tile and ``nl_op`` is provided, emit tensor_scalar.
+        When one is a tile and ``nl_op`` is None (e.g. mod — NKI has no
+        direct mod op on tiles), fall back to Python ``py_op``; the caller
+        is responsible for ensuring this only runs on tile-index scalars.
+        """
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        state = getattr(env, "_codegen_state", None)
+        a_scalar = NKIOpOverrides._is_scalar_operand(a)
+        b_scalar = NKIOpOverrides._is_scalar_operand(b)
+        if a_scalar and b_scalar:
+            return f"{a} {py_op} {b}"
+        if nl_op is None or state is None:
+            return f"{a} {py_op} {b}"
+        # Tile-op: reuse the general binary path for consistency.
+        if b_scalar and not a_scalar:
+            return NKIOpOverrides._nki_tensor_scalar(a, b, nl_op)
+        if a_scalar and not b_scalar:
+            return NKIOpOverrides._nki_tensor_scalar(b, a, nl_op, reverse0=True)
+        return NKIOpOverrides._nki_tensor_tensor(a, b, nl_op, "_nki_scalar_arith")
+
+    @staticmethod
     def lt(a: object, b: object) -> str:
-        return f"{a} < {b}"
+        return NKIOpOverrides._nki_compare(a, b, "nl.less", "<")
 
     @staticmethod
     def le(a: object, b: object) -> str:
-        return f"{a} <= {b}"
+        return NKIOpOverrides._nki_compare(a, b, "nl.less_equal", "<=")
 
     @staticmethod
     def gt(a: object, b: object) -> str:
-        return f"{a} > {b}"
+        return NKIOpOverrides._nki_compare(a, b, "nl.greater", ">")
 
     @staticmethod
     def ge(a: object, b: object) -> str:
-        return f"{a} >= {b}"
+        return NKIOpOverrides._nki_compare(a, b, "nl.greater_equal", ">=")
 
     @staticmethod
     def eq(a: object, b: object) -> str:
-        return f"{a} == {b}"
+        return NKIOpOverrides._nki_compare(a, b, "nl.equal", "==")
 
     @staticmethod
     def ne(a: object, b: object) -> str:
-        return f"{a} != {b}"
+        return NKIOpOverrides._nki_compare(a, b, "nl.not_equal", "!=")
+
+    @staticmethod
+    def _nki_compare(a: object, b: object, nl_op: str, py_op: str) -> str:
+        """Elementwise comparison on NKI tiles.
+
+        When either operand is an SBUF tile, emits a tensor_tensor /
+        tensor_scalar call with a boolean ``op``. When both operands are
+        host scalars (Python ints or compile-time constants), falls back
+        to the Python operator so downstream codegen can use the result
+        as a bare Python value (e.g. in slice bounds).
+        """
+        from .ast_extension import statement_from_string
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        state = getattr(env, "_codegen_state", None)
+
+        a_scalar = NKIOpOverrides._is_scalar_operand(a)
+        b_scalar = NKIOpOverrides._is_scalar_operand(b)
+
+        # Both host scalars: emit Python-level comparison.
+        if a_scalar and b_scalar:
+            return f"{a} {py_op} {b}"
+
+        if state is None:
+            return f"{a} {py_op} {b}"
+
+        # Resolve PSUM aliases for tensor operands.
+        if not a_scalar:
+            a = NKIOpOverrides._resolve_psum_alias(state, a)
+        if not b_scalar:
+            b = NKIOpOverrides._resolve_psum_alias(state, b)
+
+        def _emit_str(x: object) -> str:
+            if isinstance(x, ast.AST):
+                return ast.unparse(x)
+            return str(x)
+
+        a_str = _emit_str(a)
+        b_str = _emit_str(b)
+
+        # Determine output shape — prefer the FX-inferred output shape when
+        # available (handles cross-axis broadcasts like [1,N] == [M,1] → [M,N]).
+        def _cmp_lookup_shape(name: str) -> list[int] | None:
+            s = state.device_function._nki_sbuf_shapes.get(name)
+            if s is not None:
+                return s
+            _lk = name
+            while "_copy" in _lk:
+                _lk = _lk[:_lk.rfind("_copy")]
+                s = state.device_function._nki_sbuf_shapes.get(_lk)
+                if s is not None:
+                    return s
+            return None
+
+        shape = None
+        dtype_str = "nl.int32"  # bool-like (0/1) stored as int
+        # Prefer FX output shape for cross-axis broadcast (e.g. [1,N]×[M,1])
+        try:
+            from torch._inductor.virtualized import V
+            cur = V.current_node
+            val = cur.meta.get("val") if cur is not None else None
+            if isinstance(val, torch.Tensor):
+                import sympy as _sp_cmp
+                _bs_subs_c: dict[_sp_cmp.Symbol, int] = {}
+                if state.config is not None:
+                    for _bs in env.block_sizes:
+                        _cfg = _bs.from_config(state.config)
+                        if isinstance(_cfg, int):
+                            _bs_subs_c[_bs.symbol()] = _cfg
+                _fx_shape = []
+                for _d in val.shape:
+                    if isinstance(_d, int):
+                        _fx_shape.append(_d)
+                    elif isinstance(_d, torch.SymInt):
+                        try:
+                            _fx_shape.append(int(_d._sympy_().subs(_bs_subs_c)))
+                        except (TypeError, ValueError):
+                            _fx_shape.append(env.size_hint(_d))
+                    else:
+                        _fx_shape.append(int(_d))
+                shape = NKIOpOverrides._squeeze_shape_2d(_fx_shape)
+        except Exception:
+            pass
+        if shape is None:
+            # Fallback: prefer the tensor operand's known SBUF shape.
+            a_tshape = b_tshape = None
+            if not a_scalar:
+                a_tshape = _cmp_lookup_shape(_emit_str(a))
+            if not b_scalar:
+                b_tshape = _cmp_lookup_shape(_emit_str(b))
+            if a_tshape is not None and b_tshape is None:
+                shape = a_tshape
+            elif b_tshape is not None and a_tshape is None:
+                shape = b_tshape
+            elif a_tshape is not None and b_tshape is not None:
+                if len(a_tshape) >= 2 and len(b_tshape) >= 2:
+                    shape = [max(a_tshape[0], b_tshape[0]), max(a_tshape[1], b_tshape[1])]
+                else:
+                    shape = a_tshape
+        if shape is None:
+            shape = [1, 1]
+        elif len(shape) == 1:
+            shape = [1, int(shape[0])]
+
+        dst_var = state.device_function.new_var("_nki_cmp", dce=True)
+        state.device_function._nki_sbuf_shapes[dst_var] = list(shape)
+        state.device_function._nki_sbuf_dtypes[dst_var] = dtype_str
+        state.add_statement(
+            statement_from_string(
+                f"{dst_var} = nl.ndarray([{shape[0]}, {shape[1]}], {dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        if a_scalar and not b_scalar:
+            # (scalar op tensor)  — use tensor_scalar with reverse
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_scalar(dst={dst_var}, data={b_str}, "
+                    f"op0={nl_op}, operand0={a_str}, reverse0=True)"
+                )
+            )
+        elif b_scalar and not a_scalar:
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_scalar(dst={dst_var}, data={a_str}, "
+                    f"op0={nl_op}, operand0={b_str})"
+                )
+            )
+        else:
+            # Check if we need cross-axis broadcast to produce output shape.
+            # E.g. [1, N] op [1, N] output [N, N] means one operand is
+            # partition-axis and the other is free-axis. Emit an SBUF
+            # replicate to produce matching-shape operands.
+            a_sh = _cmp_lookup_shape(a_str)
+            b_sh = _cmp_lookup_shape(b_str)
+            # ``indices_*`` names come from nisa.iota without a shape registration;
+            # they're always [1, N] row vectors (N == output free dim).
+            if a_sh is None and a_str.startswith("indices_") and len(shape) == 2:
+                a_sh = [1, shape[1]]
+            if b_sh is None and b_str.startswith("indices_") and len(shape) == 2:
+                b_sh = [1, shape[1]]
+            data1_name = a_str
+            data2_name = b_str
+            if (
+                a_sh is not None and b_sh is not None
+                and len(a_sh) == 2 and len(b_sh) == 2
+                and list(a_sh) == list(b_sh)
+                and len(shape) == 2
+                and shape[0] != a_sh[0]
+                and shape[1] == a_sh[1]
+                and a_sh[0] == 1
+                and shape[0] > 1
+            ):
+                # Both [1, N] but output is [P, N]: broadcast one to [P, N]
+                # along partition (replicate the row), and transpose the
+                # other to [P, 1] then broadcast to [P, N].
+                # We choose: a stays [1, N] broadcast → [P, N]
+                #           b transposed [1, N] → [N, 1], broadcast [N, N]
+                # Actually simpler: replicate a row-wise to [P, N], and
+                # transpose-then-broadcast b to [P, N] as well.
+                # However the most common case is v_indices × completion_id.
+                # v_indices is the same for every partition — replicate.
+                # completion_id has one value per partition — needs transpose.
+                # Heuristic: if a name starts with "indices_" it's the iota/v_idx row
+                # and should be replicated; the other is partition-semantics
+                # and should be transposed.
+                from .ast_extension import (
+                    create as _create,
+                    expr_from_string as _efrom,
+                )
+                def _replicate_row(src: str, p_tgt: int, f_tgt: int, dt: str) -> str:
+                    # Use nl.broadcast_to which uses nc_stream_shuffle for
+                    # partition-dim broadcast (NKI-friendly).
+                    out = state.device_function.new_var("_cmp_bcast", dce=True)
+                    state.device_function._nki_sbuf_shapes[out] = [p_tgt, f_tgt]
+                    state.device_function._nki_sbuf_dtypes[out] = dt
+                    state.add_statement(statement_from_string(
+                        f"{out} = nl.broadcast_to({src}, shape=({p_tgt}, {f_tgt}))"
+                    ))
+                    return out
+
+                def _transpose_to_partition(src: str, p_tgt: int, f_tgt: int, dt: str) -> str:
+                    # [1, N] → [N, 1] via transpose, then broadcast to [N, F_tgt]
+                    # nc_transpose requires float dtype. For int types, cast
+                    # to bfloat16, transpose, cast back.
+                    _int_dtypes = {"nl.int32", "nl.int16", "nl.int8", "nl.uint32",
+                                   "nl.uint16", "nl.uint8"}
+                    if dt in _int_dtypes:
+                        # Cast src to float32 in SBUF first
+                        cast_in = state.device_function.new_var("_cmp_cast_in", dce=True)
+                        state.device_function._nki_sbuf_shapes[cast_in] = [1, p_tgt]
+                        state.device_function._nki_sbuf_dtypes[cast_in] = "nl.float32"
+                        state.add_statement(statement_from_string(
+                            f"{cast_in} = nl.ndarray([1, {p_tgt}], nl.float32, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.memset({cast_in}, value=0)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_tensor(dst={cast_in}, data1={cast_in}, data2={src}, op=nl.add)"
+                        ))
+                        # Transpose in float space
+                        tr_psum = state.device_function.new_var("_cmp_tr_psum", dce=True)
+                        state.add_statement(statement_from_string(
+                            f"{tr_psum} = nl.ndarray([{p_tgt}, 1], nl.float32, buffer=nl.psum)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.nc_transpose(dst={tr_psum}, data={cast_in})"
+                        ))
+                        # Cast back to int in SBUF
+                        tr_sbuf = state.device_function.new_var("_cmp_tr_sbuf", dce=True)
+                        state.device_function._nki_sbuf_shapes[tr_sbuf] = [p_tgt, 1]
+                        state.device_function._nki_sbuf_dtypes[tr_sbuf] = dt
+                        state.add_statement(statement_from_string(
+                            f"{tr_sbuf} = nl.ndarray([{p_tgt}, 1], {dt}, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})"
+                        ))
+                    else:
+                        tr_psum = state.device_function.new_var("_cmp_tr_psum", dce=True)
+                        tr_sbuf = state.device_function.new_var("_cmp_tr_sbuf", dce=True)
+                        state.device_function._nki_sbuf_shapes[tr_sbuf] = [p_tgt, 1]
+                        state.device_function._nki_sbuf_dtypes[tr_sbuf] = dt
+                        state.add_statement(statement_from_string(
+                            f"{tr_psum} = nl.ndarray([{p_tgt}, 1], {dt}, buffer=nl.psum)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.nc_transpose(dst={tr_psum}, data={src})"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"{tr_sbuf} = nl.ndarray([{p_tgt}, 1], {dt}, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})"
+                        ))
+                    # Broadcast to [P, F]
+                    out = state.device_function.new_var("_cmp_bcast", dce=True)
+                    state.device_function._nki_sbuf_shapes[out] = [p_tgt, f_tgt]
+                    state.device_function._nki_sbuf_dtypes[out] = dt
+                    state.add_statement(statement_from_string(
+                        f"{out} = nl.ndarray([{p_tgt}, {f_tgt}], {dt}, buffer=nl.sbuf)"
+                    ))
+                    f_loop = state.device_function.new_var("_cp_f")
+                    state.add_statement(_create(
+                        ast.For,
+                        target=_create(ast.Name, id=f_loop, ctx=ast.Store()),
+                        iter=_efrom(f"nl.affine_range({f_tgt})"),
+                        body=[statement_from_string(
+                            f"nisa.tensor_copy(dst={out}[0:{p_tgt}, {f_loop}:{f_loop}+1], "
+                            f"src={tr_sbuf})"
+                        )],
+                        orelse=[],
+                    ))
+                    return out
+
+                # Pick which operand to replicate vs transpose.
+                # iota-named or repeat-patterns go row-wise; others go partition-wise.
+                a_dt = state.device_function._nki_sbuf_dtypes.get(a_str, "nl.int32")
+                b_dt = state.device_function._nki_sbuf_dtypes.get(b_str, "nl.int32")
+                if a_str.startswith("indices_"):
+                    data1_name = _replicate_row(a_str, shape[0], shape[1], a_dt)
+                    data2_name = _transpose_to_partition(b_str, shape[0], shape[1], b_dt)
+                elif b_str.startswith("indices_"):
+                    data1_name = _transpose_to_partition(a_str, shape[0], shape[1], a_dt)
+                    data2_name = _replicate_row(b_str, shape[0], shape[1], b_dt)
+                else:
+                    # Default: replicate a, transpose b
+                    data1_name = _replicate_row(a_str, shape[0], shape[1], a_dt)
+                    data2_name = _transpose_to_partition(b_str, shape[0], shape[1], b_dt)
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={dst_var}, data1={data1_name}, data2={data2_name}, op={nl_op})"
+                )
+            )
+        return dst_var
 
     @staticmethod
     def and_(a: object, b: object) -> str:
@@ -2172,6 +3303,27 @@ class NKIOpOverrides:
     @staticmethod
     def pow(a: object, b: object) -> str:
         return f"{a} ** {b}"
+
+    # Inductor sometimes queries these alternate names.
+    @staticmethod
+    def bitwise_left_shift(a: object, b: object) -> str:
+        return NKIOpOverrides.lshift(a, b)
+
+    @staticmethod
+    def bitwise_right_shift(a: object, b: object) -> str:
+        return NKIOpOverrides.rshift(a, b)
+
+    @staticmethod
+    def bitwise_or(a: object, b: object) -> str:
+        return NKIOpOverrides.or_(a, b)
+
+    @staticmethod
+    def bitwise_and(a: object, b: object) -> str:
+        return NKIOpOverrides.and_(a, b)
+
+    @staticmethod
+    def bitwise_xor(a: object, b: object) -> str:
+        return NKIOpOverrides.xor(a, b)
 
 
 def _validate_nki_tensor_shape(shape: tuple, name: str, env: object) -> None:
@@ -2303,10 +3455,23 @@ class NKIBackend(Backend):
             torch.int8: "nl.int8",
             torch.int16: "nl.int16",
             torch.int32: "nl.int32",
-            torch.int64: "nl.int64",
+            # NKI does not expose int64. Widen nothing at compile time; the
+            # launcher (default_nki_launcher) and fake-tensor path cast
+            # int64 args to int32 before they reach here, and intermediate
+            # int64 FX values end up as int32 in generated code.
+            torch.int64: "nl.int32",
             torch.uint8: "nl.uint8",
             torch.bool: "nl.bool_",
         }
+        # FP8 (Trn2+). Some PyTorch builds lack certain fp8 aliases; guard.
+        for _torch_name, _nki_name in (
+            ("float8_e4m3fn", "nl.float8_e4m3fn"),
+            ("float8_e4m3", "nl.float8_e4m3"),
+            ("float8_e5m2", "nl.float8_e5m2"),
+        ):
+            _td = getattr(torch, _torch_name, None)
+            if _td is not None:
+                _DTYPE_MAP[_td] = _nki_name
         if dtype not in _DTYPE_MAP:
             raise exc.BackendUnsupported(self.name, f"dtype {dtype}")
         return _DTYPE_MAP[dtype]
@@ -2320,16 +3485,16 @@ class NKIBackend(Backend):
     def function_decorator(self) -> str:
         from .compile_environment import CompileEnvironment
         from helion.runtime.settings import get_neuron_target
-        
+
         # Grab the active compilation environment
         env = CompileEnvironment.current()
-        
+
         # Extract the config (falling back safely if it's nested in state)
         config = getattr(env, "config", None)
         if config is None:
             state = getattr(env, "_codegen_state", None)
             config = getattr(state, "config", None) if state else None
-            
+
         config_target = getattr(config, "platform_target", None)
         if config_target is None:
             settings = getattr(env, "settings", None)
@@ -2337,12 +3502,13 @@ class NKIBackend(Backend):
                 state = getattr(env, "_codegen_state", None)
                 settings = getattr(state, "settings", None) if state else None
             config_target = getattr(settings, "platform_target", None)
-        
-        # Resolve the actual hardware target string
-        resolved_target = get_neuron_target(config_target)
-        
-        # Bake the hardware target into the generated AST
-        return f'nki.jit(platform_target="{resolved_target}")'
+
+        # Resolve the target for our own downstream use (ISA gating, etc.), but
+        # the NKI runtime reads NEURON_PLATFORM_TARGET_OVERRIDE directly — the
+        # 'platform_target' kwarg on nki.jit is deprecated and now raises.
+        get_neuron_target(config_target)
+
+        return "nki.jit"
 
     @property
     def constexpr_type(self) -> str:
@@ -2351,6 +3517,9 @@ class NKIBackend(Backend):
     @property
     def default_launcher_name(self) -> str:
         return "_default_nki_launcher"
+
+    def inductor_op_overrides(self) -> InductorOpOverrides:
+        return NKIOpOverrides()
 
     @property
     def library_imports(self) -> dict[str, str]:
@@ -2389,17 +3558,82 @@ class NKIBackend(Backend):
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         if block_size_var == "1":
-            return f"{offset_var} + nl.zeros([1], {dtype})"
-        # Slice-based tile model: index is the scalar tile start offset.
-        return offset_var
+            return f"nl.full([1, 1], {offset_var}, dtype={dtype})"
+        # Generate a [1, block_size] SBUF tile of offsets via nisa.iota.
+        # The resulting variable supplants the scalar-offset default: any
+        # downstream code that uses tile.index as a per-position tensor
+        # (e.g. masks, gathers) sees an SBUF-resident vector instead of
+        # a Python int. block_size_var is always a literal int at this
+        # point because NKI requires compile-time tile sizes.
+        return self._nki_iota_index_expr(
+            offset_var=offset_var, block_size_var=block_size_var, dtype=dtype
+        )
 
     def loop_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
         if block_size_var == "1":
-            return f"{offset_var} + nl.zeros([1], {dtype})"
-        # Slice-based tile model: index is the scalar tile start offset.
+            return f"nl.full([1, 1], {offset_var}, dtype={dtype})"
+        return self._nki_iota_index_expr(
+            offset_var=offset_var, block_size_var=block_size_var, dtype=dtype
+        )
+
+    def _nki_iota_index_expr(
+        self, offset_var: str, block_size_var: str, dtype: str
+    ) -> str:
+        # Kept for backward-compat. The actual iota emission now happens via
+        # ``loop_index_statements`` / ``grid_index_statements`` so alloc +
+        # nisa.iota + ``index_var = idx_var`` are placed together inside the
+        # for loop body where ``offset_var`` is in scope.
         return offset_var
+
+    def loop_index_statements(
+        self,
+        *,
+        offset_var: str,
+        block_size_var: str,
+        dtype: str,
+        axis: int,
+        index_var: str,
+    ) -> list[str]:
+        """Emit the statements that bind ``index_var`` to an SBUF iota tile.
+
+        NKI has no ``nl.arange``; the equivalent for per-position tile
+        indices is ``nisa.iota`` which fills an SBUF tile with an integer
+        pattern. We allocate a fresh ``[1, block_size]`` tile and iota-fill
+        it with ``offset_var`` as the start. The assignment
+        ``index_var = <iota tile>`` keeps the generated code symmetric
+        with other backends (``indices_N = ...``) so downstream codegen
+        (masks, gather subscripts) finds the expected variable.
+        """
+        if block_size_var == "1":
+            return [
+                f"{index_var} = nl.full([1, 1], {offset_var}, dtype={dtype})",
+            ]
+        return [
+            f"{index_var} = nl.ndarray([1, {block_size_var}], {dtype}, buffer=nl.sbuf)",
+            f"nisa.iota(dst={index_var}, pattern=[[1, {block_size_var}]], "
+            f"offset={offset_var}, channel_multiplier=0)",
+        ]
+
+    # grid_index_statements mirrors loop_index_statements; the top-level grid
+    # path has ``offset_var`` in scope at the location of the assignment.
+    def grid_index_statements(
+        self,
+        *,
+        offset_var: str,
+        block_size_var: str,
+        dtype: str,
+        axis: int,
+        index_var: str,
+    ) -> list[str]:
+        return self.loop_index_statements(
+            offset_var=offset_var,
+            block_size_var=block_size_var,
+            dtype=dtype,
+            axis=axis,
+            index_var=index_var,
+        )
 
     def cast_expr(self, expr_str: str, dtype_str: str) -> str:
         # For simple cases where we can't emit statements, return as-is.
@@ -2509,11 +3743,27 @@ class NKIBackend(Backend):
         if len(resolved) == 1:
             resolved.append(1)
 
+        dtype_str = self.dtype_str(target_dtype)
+        src_name = ast.unparse(x) if isinstance(x, ast.AST) else str(x)
+
+        # Prefer the source SBUF tile's ACTUAL registered shape (e.g. the
+        # matmul result [128, 128]) over the FX-derived abstract shape
+        # (which may include an unsquashed batch/head dim that exceeds the
+        # 128-partition NKI limit). If the src has a registered SBUF shape
+        # and it's smaller than the FX-derived one, use it.
+        src_sbuf_shape = state.device_function._nki_sbuf_shapes.get(src_name)
+        if (
+            src_sbuf_shape is not None
+            and len(src_sbuf_shape) == 2
+            and len(resolved) == 2
+            and resolved[0] > 128  # FX-derived partition dim exceeds hw cap
+            and src_sbuf_shape[0] <= 128
+        ):
+            resolved = list(src_sbuf_shape)
+
         shape_parts = [str(d) for d in resolved]
         shape_str = ", ".join(shape_parts)
 
-        dtype_str = self.dtype_str(target_dtype)
-        src_name = ast.unparse(x) if isinstance(x, ast.AST) else str(x)
         cast_var = state.device_function.new_var("_nki_cast", dce=True)
 
         # Register the cast var's shape so downstream casts and stores can look it up
@@ -2555,12 +3805,19 @@ class NKIBackend(Backend):
         # Use memset when the source is provably a Python scalar constant:
         # - integer dtype (tensor size, loop bound, etc.) on any buffer shape
         # - literal number like "1.0" or "128"
+        # - a kernel-parameter scalar (e.g. ``alpha: float`` passed in).
         # Float NKI tensor expressions always go through tensor_tensor.
+        _is_scalar_arg = (
+            src_tile_vars is None
+            and _no_sbuf_shape
+            and _no_brackets
+            and src_name in getattr(state.device_function, "_nki_scalar_arg_names", set())
+        )
         src_is_scalar = (
             src_tile_vars is None
             and _no_sbuf_shape
             and _no_brackets
-            and (_is_integer_dtype or _is_numeric_literal)
+            and (_is_integer_dtype or _is_numeric_literal or _is_scalar_arg)
         )
 
         # Emit: cast_var = nl.ndarray(shape, target_dtype, buffer=nl.sbuf)
@@ -2578,13 +3835,20 @@ class NKIBackend(Backend):
                 )
             )
         elif src_tile_vars is not None:
+            # Each tile is [NKI_PARTITION_MAX=128, free]; the overall shape is
+            # [n_tiles * 128, free]. Cast per-tile using the PER-TILE shape, not
+            # the global shape.
             cast_tile_vars = []
+            _NKI_PARTITION_MAX = 128
+            per_tile_partition = min(resolved[0], _NKI_PARTITION_MAX) if len(resolved) >= 2 else resolved[0]
+            per_tile_free = resolved[1] if len(resolved) >= 2 else 1
+            per_tile_shape_str = f"{per_tile_partition}, {per_tile_free}"
             for i, tv in enumerate(src_tile_vars):
                 ctv = f"{cast_var}_{i}"
                 cast_tile_vars.append(ctv)
                 state.codegen.add_statement(
                     statement_from_string(
-                        f"{ctv} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+                        f"{ctv} = nl.ndarray([{per_tile_shape_str}], {dtype_str}, buffer=nl.sbuf)"
                     )
                 )
                 state.codegen.add_statement(
@@ -2595,6 +3859,8 @@ class NKIBackend(Backend):
                         f"nisa.tensor_tensor(dst={ctv}, data1={ctv}, data2={tv}, op=nl.add)"
                     )
                 )
+                # Register per-tile shape
+                state.device_function._nki_sbuf_shapes[ctv] = [per_tile_partition, per_tile_free]
             state.device_function.register_tile_list(cast_var, cast_tile_vars)
         else:
             state.codegen.add_statement(
@@ -2658,11 +3924,20 @@ class NKIBackend(Backend):
         )
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
-        raise exc.BackendUnsupported(
-            self.name,
-            "trn1 does not support tensor comparison ops needed for where/masking. "
-            "Use slice-based approaches (separate DMA copies) instead.",
-        )
+        # Delegate to NKIOpOverrides.where, which emits
+        # nisa.tensor_copy_predicated on Trn2+. This path fires when
+        # codegen calls where_expr directly (rarely) rather than going
+        # through the Inductor OpsHandler (which already dispatches to
+        # NKIOpOverrides.where via getattr).
+        from .ast_extension import statement_from_string
+
+        state = self._nki_codegen_state()
+        if state is None:
+            raise exc.BackendUnsupported(
+                self.name, "where_expr requires active codegen state"
+            )
+        overrides = self.inductor_op_overrides()
+        return overrides.where(mask, true_val, false_val)
 
     def broadcast_to_expr(self, expr: str, shape: str) -> str:
         # No nisa.* API for broadcast_to is documented in NKI; add statement-based path when available.
@@ -2713,7 +3988,9 @@ class NKIBackend(Backend):
             env = CompileEnvironment.current()
 
             if dim == 0:
-                _NKI_PARTITION_REDUCE_OPS = {"sum": "nl.add", "max": "nl.maximum", "mean": "nl.add"}
+                # tensor_partition_reduce supports: add, max, bitwise_or, bitwise_and.
+                # Use nl.max (not nl.maximum) per NKI naming convention.
+                _NKI_PARTITION_REDUCE_OPS = {"sum": "nl.add", "max": "nl.max", "mean": "nl.add"}
                 part_op = _NKI_PARTITION_REDUCE_OPS.get(reduction_type)
                 if part_op is None:
                     raise exc.BackendUnsupported(

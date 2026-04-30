@@ -265,6 +265,26 @@ class DeviceFunction:
         self._variable_renames: dict[str, list[str]] = {}
         self._nki_tile_lists: dict[str, list[str]] = {}  # var → [var_0, var_1, ...]
         self._nki_sbuf_shapes: dict[str, list[int]] = {}  # var → [p, f]
+        # Names of kernel parameters that are Python scalars (float, int,
+        # bool) — used by NKIOpOverrides to route binary ops to
+        # tensor_scalar instead of tensor_tensor when the operand is a
+        # host scalar.  Populated in codegen_function_def when building
+        # the parameter list.
+        self._nki_scalar_arg_names: set[str] = set()
+        # Per-SBUF-var dtype tracking, used by broadcast / comparison codegen
+        # to allocate matching output buffers and pass through nc_transpose /
+        # nc_matmul constraints that require dst.dtype == data.dtype.
+        self._nki_sbuf_dtypes: dict[str, str] = {}
+        # HBM-source tracking: maps an SBUF var back to the HBM expression it
+        # was DMA-loaded from, so partition-broadcast codegen can re-DMA with
+        # a per-partition layout instead of tiling the existing SBUF tile.
+        self._nki_hbm_sources: dict[str, str] = {}
+        # Loop-carry buffers that must not be modified in-place inside nested
+        # device loops.
+        self._nki_protected_vars: set[str] = set()
+        # Per-output-tensor return buffer info for multi-output kernels.
+        # Keyed by id(tensor). Keys are ints; values map to buf_name etc.
+        self._nki_return_buffers: dict[int, dict] = {}
         # Tile lists where tiles represent the FREE dimension (not partition).
         # These must be distributed along dim 1 when stored to a 2D buffer.
         self._nki_free_dim_tile_lists: set[str] = set()
@@ -622,6 +642,10 @@ class DeviceFunction:
             )
             self.arguments.append(arg)
             self._expr_args[sym] = arg
+            # NKI: register Python-scalar kernel parameters so the
+            # NKIOpOverrides cast / binary-op paths can detect them and
+            # route to memset/tensor_scalar instead of tensor_tensor.
+            self._nki_scalar_arg_names.add(arg.name)
         return self._expr_args[sym]
 
     def constexpr_arg(self, name: str, value: object | None = None) -> bool:
@@ -779,12 +803,41 @@ class DeviceFunction:
 
         tensor_shape_preamble: list[ast.AST] = []
         if backend.name == "nki":
+            env = CompileEnvironment.current()
             # Normalize tensor argument views at kernel entry to the compile-time
             # shape expected by codegen. This keeps raw NKI kernel invocation
             # compatible with equivalent higher-rank view inputs.
+            def _nki_shape_part(s: object) -> str:
+                # Emit compile-time-known ints where possible. NKI requires
+                # concrete shape literals in ndarray allocations / reshapes;
+                # symbolic shape names (e.g. 'group_offsets_size_0') aren't
+                # defined inside the @nki.jit kernel.
+                if isinstance(s, int):
+                    return str(s)
+                if isinstance(s, torch.SymInt):
+                    try:
+                        return str(env.size_hint(s))
+                    except Exception:
+                        pass
+                return self.literal_expr(s)
+
+            # Collect names of non-tensor scalar parameters (e.g.
+            # ``alpha: float``, ``scale: float``) so binary ops can
+            # route ``tile * alpha`` to ``tensor_scalar`` instead of
+            # ``tensor_tensor``.
+            for arg in param_args:
+                if not isinstance(arg, TensorArg):
+                    name = getattr(arg, "name", None)
+                    if isinstance(name, str):
+                        self._nki_scalar_arg_names.add(name)
+
             for arg in param_args:
                 if isinstance(arg, TensorArg):
-                    shape_parts = [self.literal_expr(s) for s in arg.fake_value.size()]
+                    # int64 args are cast to int32 at the launcher (see
+                    # default_nki_launcher) and also in _to_fake_tensor so
+                    # the traced kernel is declared with int32. No in-kernel
+                    # cast needed here.
+                    shape_parts = [_nki_shape_part(s) for s in arg.fake_value.size()]
                     if arg.fake_value.dim() == 1:
                         # Reshape [N] → [1, N] so the large dimension is the
                         # free axis.  This avoids tile-list fragmentation for
@@ -987,5 +1040,45 @@ class HelionTritonPrinter(TritonPrinter):
         return f"{self._print(expr.args[0])} + 0.0"
 
 
+class HelionNKIPrinter(HelionTritonPrinter):
+    """Python-only expression printer for the NKI backend.
+
+    TritonPrinter emits ``triton_helpers.div_floor_integer`` and
+    ``triton_helpers.remainder_integer`` for FloorDiv / Mod on runtime
+    integer expressions, both of which are unresolvable inside a
+    @nki.jit kernel. We override to emit plain ``(a) // (b)`` and
+    ``(a) % (b)`` which evaluate the same way on host-Python integers
+    and are accepted by the NKI parser.
+    """
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        x, y = expr.args
+        return f"({self._print(x)} // {self._print(y)})"
+
+    def _print_Mod(self, expr: sympy.Expr) -> str:
+        x, y = expr.args
+        return f"({self._print(x)} % {self._print(y)})"
+
+    # sympy.floor(a / b) over int-valued args maps to a floordiv too.
+    def _print_floor(self, expr: sympy.Expr) -> str:
+        (arg,) = expr.args
+        if arg.is_Rational or (
+            isinstance(arg, sympy.Mul)
+            and len(arg.args) == 2
+            and arg.args[1].is_Pow
+        ):
+            # a / b style — fall through to default, which may still
+            # produce a helper. We keep this guard conservative.
+            pass
+        return super()._print_floor(expr)  # type: ignore[misc]
+
+
 def texpr(expr: sympy.Expr) -> str:
+    try:
+        from .compile_environment import CompileEnvironment
+        env = CompileEnvironment.current()
+        if env.backend.name == "nki":
+            return HelionNKIPrinter().doprint(expr)
+    except Exception:
+        pass
     return HelionTritonPrinter().doprint(expr)

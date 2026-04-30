@@ -334,12 +334,16 @@ def _(state: CodegenState) -> object:
     n_sub_k = max(1, K_tile // TILE_K)
     n_sub_n = max(1, N_tile // N_sub) if N_tile > TILE_N else 1
 
-    # trn1 requires both nc_matmul inputs to have the same non-float32 dtype.
-    # nc_transpose always produces float32 (PSUM), so cast back to input dtype
-    # when inputs are fp16/bf16 (same fix as in aten_lowering._nki_dot).
+    # NKI nc_transpose requires dst.dtype == data.dtype (validated on gen3+).
+    # We therefore allocate the transpose-result PSUM tile with the lhs dtype
+    # (not fp32 hardcoded). When lhs and rhs differ, the transposed
+    # stationary operand is explicitly cast to the rhs (moving) dtype for
+    # nc_matmul.
+    lhs_dtype = lhs_proxy.dtype
     rhs_dtype = rhs_proxy.dtype
-    need_cast_after_transpose = rhs_dtype != torch.float32
     matmul_dtype_str = env.backend.dtype_str(rhs_dtype)
+    transpose_dtype_str = env.backend.dtype_str(lhs_dtype)
+    need_cast_after_transpose = lhs_dtype != rhs_dtype
 
     lhs_name = ast.unparse(lhs_ast)
     rhs_name = ast.unparse(rhs_ast)
@@ -451,13 +455,13 @@ def _(state: CodegenState) -> object:
                     iter=expr_from_string(f"nl.affine_range({n_sub_k})"),
                     body=[
                         statement_from_string(
-                            f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], nl.float32, buffer=nl.psum)"
+                            f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.psum)"
                         ),
                         statement_from_string(
                             f"nisa.nc_transpose(dst={lhs_t_psum}, data={_lhs_k_slice(m_i, sub_k_var)})"
                         ),
                         statement_from_string(
-                            f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], nl.float32, buffer=nl.sbuf)"
+                            f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.sbuf)"
                         ),
                         statement_from_string(
                             f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
@@ -467,9 +471,8 @@ def _(state: CodegenState) -> object:
                                 statement_from_string(
                                     f"{lhs_t_cast} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {matmul_dtype_str}, buffer=nl.sbuf)"
                                 ),
-                                statement_from_string(f"nisa.memset({lhs_t_cast}, value=0)"),
                                 statement_from_string(
-                                    f"nisa.tensor_tensor(dst={lhs_t_cast}, data1={lhs_t_cast}, data2={lhs_t_sbuf}, op=nl.add)"
+                                    f"nisa.tensor_copy(dst={lhs_t_cast}, src={lhs_t_sbuf})"
                                 ),
                             ]
                             if need_cast_after_transpose
@@ -485,7 +488,7 @@ def _(state: CodegenState) -> object:
         else:
             state.add_statement(
                 statement_from_string(
-                    f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], nl.float32, buffer=nl.psum)"
+                    f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.psum)"
                 )
             )
             state.add_statement(
@@ -495,7 +498,7 @@ def _(state: CodegenState) -> object:
             )
             state.add_statement(
                 statement_from_string(
-                    f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], nl.float32, buffer=nl.sbuf)"
+                    f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.sbuf)"
                 )
             )
             state.add_statement(
@@ -510,11 +513,8 @@ def _(state: CodegenState) -> object:
                     )
                 )
                 state.add_statement(
-                    statement_from_string(f"nisa.memset({lhs_t_cast}, value=0)")
-                )
-                state.add_statement(
                     statement_from_string(
-                        f"nisa.tensor_tensor(dst={lhs_t_cast}, data1={lhs_t_cast}, data2={lhs_t_sbuf}, op=nl.add)"
+                        f"nisa.tensor_copy(dst={lhs_t_cast}, src={lhs_t_sbuf})"
                     )
                 )
             state.add_statement(

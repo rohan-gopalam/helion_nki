@@ -43,10 +43,11 @@ def _example_scripts() -> list[Path]:
 
 def main() -> None:
     env = os.environ.copy()
+    # helion is now installed editable; PYTHONPATH override not required. Keep
+    # the prefix append for users running from a checkout without install.
     env["PYTHONPATH"] = f"{_REPO}/helion_nki:{env.get('PYTHONPATH', '')}"
     env["HELION_BACKEND"] = "nki"
-    env.setdefault("NEURON_COMPILE_CACHE_URL", "")
-    env.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn1")
+    env.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
     if _REPO not in sys.path:
         sys.path.insert(0, _REPO)
 

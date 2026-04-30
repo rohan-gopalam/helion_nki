@@ -82,11 +82,16 @@ def get_neuron_target(config_target: str | None = None) -> str:
     try:
         # Query the actual driver on the machine
         output = subprocess.check_output(["neuron-ls"], text=True).lower()
+        # Order matters: check most specific (trn2/trn3) before trn1,
+        # since "trn1" is a substring of some longer names.
+        if "trn3" in output:
+            return "trn3"
+        if "trn2" in output:
+            return "trn2"
         if "trn1" in output:
             return "trn1"
         if "inf2" in output:
             return "inf2"
-        # Easy to extend for "trn2" later
     except (FileNotFoundError, subprocess.CalledProcessError):
         # FileNotFoundError: neuron-ls isn't installed (e.g., CPU head node)
         # CalledProcessError: driver is in a bad state

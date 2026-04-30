@@ -544,14 +544,31 @@ class CompileEnvironment:
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
+        # NKI does not support int64 tensors. Silently promote the fake's
+        # dtype to int32 so the traced kernel code uses int32 throughout.
+        # The launcher (default_nki_launcher) performs the matching
+        # int64→int32 cast on the real tensor before launch.
+        fake_dtype = tensor.dtype
+        if self.backend_name == "nki" and fake_dtype == torch.int64:
+            fake_dtype = torch.int32
         if self.settings.static_shapes:
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
-                dtype=tensor.dtype,
+                dtype=fake_dtype,
                 device=tensor.device,
             )
         else:
+            if fake_dtype != tensor.dtype:
+                # Fake-tensor converter infers dtype from the real tensor's
+                # metadata; pre-cast via an empty tensor of the target dtype
+                # so the fake-propagation sees int32.
+                tensor = torch.empty_strided(
+                    tensor.size(),
+                    tensor.stride(),
+                    dtype=fake_dtype,
+                    device=tensor.device,
+                )
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )

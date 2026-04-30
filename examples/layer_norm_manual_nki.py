@@ -20,7 +20,7 @@ _LNC = 2
 layernorm_tkg_mod.SHARDING_THRESHOLD = 10**9
 
 
-@nki.jit(platform_target="trn1")
+@nki.jit
 def _manual_layer_norm_fwd(x, weight, bias, eps):
     x = x.reshape([1, _BLOCK_M, _N])
     weight = weight.reshape([1, _N])

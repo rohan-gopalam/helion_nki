@@ -152,6 +152,13 @@ def default_nki_launcher(
         if isinstance(arg, torch.Tensor):
             if first_tensor_device is None:
                 first_tensor_device = arg.device
+            # NKI does not support int64 tensors (rejected by
+            # _torch_to_neuron_dtype). Auto-cast to int32 here so kernels
+            # using integer-index tensors (e.g. cross_entropy labels, jagged
+            # offsets) compile without requiring user-side changes. int32 is
+            # wide enough for any realistic tensor dim or vocab index.
+            if arg.dtype == torch.int64:
+                arg = arg.to(torch.int32)
             moved_args.append(arg.to(xla_device))
         else:
             moved_args.append(arg)
@@ -160,7 +167,21 @@ def default_nki_launcher(
     import sys
     print("        [Profile] Starting nki_kernel (XLA trace/compile)...", file=sys.stderr)
     t_nki_start = time.time()
-    result = nki_kernel[grid](*moved_args, **kwargs)
+    # New NKI API: kernel[N] sets LNC (Logical NeuronCore count, 1 or 2), not a
+    # launch grid. Helion always compiles a single NKI program that handles all
+    # tiling internally, so we default to LNC=1. Users can override with
+    # HELION_NKI_LNC=2 on trn2+ machines.
+    lnc = int(os.environ.get("HELION_NKI_LNC", "1"))
+    # Auto-switch to LNC=2 if kernel contains nl.dynamic_range (neuronx-cc
+    # IXGM verifier rejects LNC=1 + dynamic_range in XLA mode).
+    try:
+        import inspect as _inspect
+        _src = _inspect.getsource(nki_kernel)
+        if "dynamic_range" in _src and lnc < 2:
+            lnc = 2
+    except (TypeError, OSError):
+        pass
+    result = nki_kernel[lnc](*moved_args, **kwargs)
     t_nki_end = time.time()
     print(f"        [Profile] nki_kernel took {t_nki_end - t_nki_start:.2f} seconds.", file=sys.stderr)
     

@@ -942,7 +942,16 @@ def _(state: CodegenState) -> ast.AST:
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
             if tdi == 0:
                 partition_offset_var = offset_var
-            slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
+            # Check if this block is inside a dynamic_range loop - if so, we
+            # can't use offset_var in a slice (it's a register). Mark this
+            # subscript with a sentinel token that the DMA emit will recognize
+            # and substitute with .ap(scalar_offset=counter).
+            _dyn_loops = getattr(state.device_function, "_nki_dyn_loops", {})
+            if block_id in _dyn_loops:
+                _counter = _dyn_loops[block_id]["counter"]
+                slice_parts.append(f"__DYN_AP__{_counter}__{int(block_size)}")
+            else:
+                slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
             is_scalar_dim.append(False)
         else:
             # Detect "tile_index ± constant" subscripts (common in
@@ -1040,6 +1049,135 @@ def _(state: CodegenState) -> ast.AST:
         partition_dim = _resolve_dim(output_shape[0])
         free_dims = [_resolve_dim(s) for s in output_shape[1:]]
 
+    def _build_hbm_src(name_str: str, parts: list[str]) -> str:
+        """Build an HBM src expression, converting __DYN_AP__counter__size
+        sentinels to .ap(pattern=..., scalar_offset=counter, indirect_dim=N)
+        when any dim is dynamic.
+        """
+        has_dyn = any(p.startswith("__DYN_AP__") for p in parts)
+        if not has_dyn:
+            return f"{name_str}[{', '.join(parts)}]"
+        # Compute strides and pattern for .ap(). Use tensor.shape to get
+        # full strides.
+        # For each dim: if dynamic, use scalar_offset; else use static slice.
+        # NKI .ap accepts a pattern [[stride, count], ...] and a single
+        # scalar_offset + indirect_dim.
+        # We only support one dynamic dim for now.
+        dyn_dim_idx = None
+        dyn_counter = None
+        dyn_size = 0
+        for i, p in enumerate(parts):
+            if p.startswith("__DYN_AP__"):
+                assert dyn_dim_idx is None, "multiple dynamic dims not yet supported"
+                dyn_dim_idx = i
+                # Format: __DYN_AP__counter__size
+                _, counter_name, size_str = p.split("__", 2)[1:] + [""]
+                # Actually format: f"__DYN_AP__{_counter}__{int(block_size)}"
+                _rest = p[len("__DYN_AP__"):]
+                counter_name, size_str = _rest.rsplit("__", 1)
+                dyn_counter = counter_name
+                dyn_size = int(size_str)
+        # For .ap() we need the pattern as [[stride_for_each_axis, count_for_each_axis], ...]
+        # Tensor shape dims beyond the slice are unused, but we need strides for
+        # multi-dim source. Assume 2D source [P, F]:
+        # If dyn dim is 0 (partition): pattern=[[F, dyn_size], [1, static_free_count]]
+        # If dyn dim is 1 (free): pattern=[[F_total, P_static_count], [1, dyn_size]]
+        # Get tensor shape
+        tensor_shape = list(tensor.shape)
+        # Flatten 3D+ shapes to 2D (Helion does this at kernel entry)
+        if len(tensor_shape) > 2:
+            while len(tensor_shape) > 2 and tensor_shape[0] == 1:
+                tensor_shape = tensor_shape[1:]
+            if len(tensor_shape) > 2:
+                _flat = 1
+                for d in tensor_shape[:-1]:
+                    _d_i = int(d) if isinstance(d, int) else _resolve_dim(d)
+                    _flat *= _d_i
+                tensor_shape = [_flat, tensor_shape[-1]]
+        # Resolve symints to ints
+        tensor_shape = [int(d) if isinstance(d, int) else _resolve_dim(d) for d in tensor_shape]
+        # Build pattern based on where dyn_dim_idx is
+        if len(tensor_shape) == 2:
+            P_total, F_total = tensor_shape
+            if dyn_dim_idx == 0:
+                # partition is dynamic, free is static from parts[1]
+                # parts[1] is like "0:F" or "offset_0:offset_0+128"
+                free_part = parts[1]
+                if ":" in free_part:
+                    f_start, f_end = free_part.split(":", 1)
+                    f_start = f_start.strip()
+                    f_end = f_end.strip()
+                    # Try to compute count
+                    _plus = f_end.find("+")
+                    if _plus >= 0:
+                        _f_count_str = f_end[_plus+1:].strip()
+                        try:
+                            f_count = int(_f_count_str)
+                        except ValueError:
+                            f_count = 1
+                    else:
+                        try:
+                            f_count = int(f_end) - int(f_start)
+                        except (ValueError, TypeError):
+                            f_count = 1
+                    # Use scalar_offset for partition (indirect_dim=0)
+                    # free offset goes into pattern's base offset (or 'offset' param)
+                    pattern = f"[[{F_total}, {dyn_size}], [1, {f_count}]]"
+                    # free slice start
+                    try:
+                        f_off_int = int(f_start)
+                        return (
+                            f"{name_str}.ap(pattern={pattern}, "
+                            f"scalar_offset={dyn_counter}, indirect_dim=0, "
+                            f"offset={f_off_int})"
+                        )
+                    except ValueError:
+                        return (
+                            f"{name_str}.ap(pattern={pattern}, "
+                            f"scalar_offset={dyn_counter}, indirect_dim=0)"
+                        )
+            elif dyn_dim_idx == 1:
+                # free is dynamic; partition is static from parts[0]
+                part_part = parts[0]
+                if ":" in part_part:
+                    p_start, p_end = part_part.split(":", 1)
+                    p_start = p_start.strip()
+                    p_end = p_end.strip()
+                    _plus = p_end.find("+")
+                    if _plus >= 0:
+                        _p_count_str = p_end[_plus+1:].strip()
+                        try:
+                            p_count = int(_p_count_str)
+                        except ValueError:
+                            p_count = 1
+                    else:
+                        try:
+                            p_count = int(p_end) - int(p_start)
+                        except (ValueError, TypeError):
+                            p_count = 1
+                    # partition-offset goes into pattern's stride×count
+                    # For pattern [[F, P_count], [1, dyn_size]], scalar_offset
+                    # indexes the last dim (free).
+                    pattern = f"[[{F_total}, {p_count}], [1, {dyn_size}]]"
+                    try:
+                        p_off_int = int(p_start)
+                        # p_off_int is start partition row
+                        return (
+                            f"{name_str}.ap(pattern={pattern}, "
+                            f"scalar_offset={dyn_counter}, indirect_dim=1, "
+                            f"offset={p_off_int * F_total})"
+                        )
+                    except ValueError:
+                        # partition offset is symbolic; fold into scalar_offset
+                        return (
+                            f"{name_str}.ap(pattern={pattern}, "
+                            f"scalar_offset={dyn_counter}, indirect_dim=1)"
+                        )
+        # Fallback: error clearly
+        raise NotImplementedError(
+            f"Dynamic DMA slice not supported for shape {tensor_shape} parts {parts}"
+        )
+
     if partition_dim > NKI_PARTITION_MAX and free_dims in ([], [1]):
         # 1D / [1, N] path: allocate a single [1, partition_dim] SBUF.
         # The DMA will copy partition_dim elements from HBM into the free
@@ -1054,11 +1192,15 @@ def _(state: CodegenState) -> ast.AST:
         if tensor.dim() == 1:
             # Source tensor reshaped to [1, N] at kernel entry.
             orig_slice = slice_parts[0] if slice_parts else f"0:{partition_dim}"
-            hbm_src_1d = f"{name}[0:1, {orig_slice}]"
+            if orig_slice.startswith("__DYN_AP__"):
+                # fall through to ap builder with a 2-part slice
+                hbm_src_1d = _build_hbm_src(name, ["0:1", orig_slice])
+            else:
+                hbm_src_1d = f"{name}[0:1, {orig_slice}]"
         else:
             # 2D+ source tensor: use the full multi-D slice so partition_dim
             # elements are read from the partition axis of HBM.
-            hbm_src_1d = f"{name}[{', '.join(slice_parts)}]"
+            hbm_src_1d = _build_hbm_src(name, slice_parts)
         state.codegen.add_statement(
             statement_from_string(
                 f"nisa.dma_copy(dst={sbuf_name}, src={hbm_src_1d})"
@@ -1127,12 +1269,20 @@ def _(state: CodegenState) -> ast.AST:
                 f"{sbuf_name} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
             )
         )
-        slice_str = ", ".join(slice_parts)
-        # For 1D tensors reshaped to [1, N] at kernel entry, the DMA source
-        # needs 2D indexing. Prepend "0:1" for the partition dimension.
-        if tensor.dim() == 1 and len(slice_parts) == 1:
-            slice_str = f"0:1, {slice_str}"
-        hbm_src_expr = f"{name}[{slice_str}]"
+        # Handle dynamic loop subscripts via .ap()
+        _has_dyn_2d = any(p.startswith("__DYN_AP__") for p in slice_parts)
+        if _has_dyn_2d:
+            if tensor.dim() == 1 and len(slice_parts) == 1:
+                hbm_src_expr = _build_hbm_src(name, ["0:1", slice_parts[0]])
+            else:
+                hbm_src_expr = _build_hbm_src(name, slice_parts)
+        else:
+            slice_str = ", ".join(slice_parts)
+            # For 1D tensors reshaped to [1, N] at kernel entry, the DMA source
+            # needs 2D indexing. Prepend "0:1" for the partition dimension.
+            if tensor.dim() == 1 and len(slice_parts) == 1:
+                slice_str = f"0:1, {slice_str}"
+            hbm_src_expr = f"{name}[{slice_str}]"
         state.codegen.add_statement(
             statement_from_string(
                 f"nisa.dma_copy(dst={sbuf_name}, src={hbm_src_expr})"
@@ -1262,7 +1412,13 @@ def _(state: CodegenState) -> None:
             # allocation based on the value's SBUF shape.
             if tensor_dim_idx == 0 and tensor.dim() != 1:
                 partition_offset_var = offset_var
-            slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
+            # Check dynamic loop
+            _dyn_loops_st = getattr(device_fn, "_nki_dyn_loops", {})
+            if block_id in _dyn_loops_st:
+                _counter_st = _dyn_loops_st[block_id]["counter"]
+                slice_parts.append(f"__DYN_AP__{_counter_st}__{int(block_size)}")
+            else:
+                slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
             is_scalar_dim_s.append(False)
         else:
             size_i = tensor.size(tensor_dim_idx) if tensor_dim_idx < tensor.dim() else sub_val
@@ -1609,11 +1765,81 @@ def _(state: CodegenState) -> None:
                 )
             )
         else:
-            state.codegen.add_statement(
-                statement_from_string(
-                    f"nisa.dma_copy(dst={name}[{slice_str}], src={{value}})", value=final_value
+            # If slice contains dynamic sentinels, rewrite to .ap()
+            _has_dyn_store = "__DYN_AP__" in slice_str
+            if _has_dyn_store:
+                _dst_parts = [p.strip() for p in slice_str.split(",")]
+                # Inline the same builder logic as _build_hbm_src (can't use it
+                # here because it closes over `tensor` / `_resolve_dim` in load).
+                _dyn_idx = None
+                _dyn_counter = None
+                _dyn_size = 0
+                for _i, _p in enumerate(_dst_parts):
+                    if _p.startswith("__DYN_AP__"):
+                        assert _dyn_idx is None, "multi-dyn store not supported"
+                        _dyn_idx = _i
+                        _rest = _p[len("__DYN_AP__"):]
+                        _dyn_counter, _size_str = _rest.rsplit("__", 1)
+                        _dyn_size = int(_size_str)
+                _t_shape = list(tensor.shape)
+                if len(_t_shape) > 2:
+                    while len(_t_shape) > 2 and _t_shape[0] == 1:
+                        _t_shape = _t_shape[1:]
+                    if len(_t_shape) > 2:
+                        _flat = 1
+                        for _d in _t_shape[:-1]:
+                            _flat *= int(_d) if isinstance(_d, int) else int(env.size_hint(_d))
+                        _t_shape = [_flat, _t_shape[-1]]
+                _t_shape = [int(_d) if isinstance(_d, int) else int(env.size_hint(_d)) for _d in _t_shape]
+                if len(_t_shape) == 2:
+                    _P, _F = _t_shape
+                    if _dyn_idx == 1:
+                        _part_part = _dst_parts[0]
+                        if ":" in _part_part:
+                            _ps, _pe = _part_part.split(":", 1)
+                            _ps = _ps.strip()
+                            _plus = _pe.find("+")
+                            if _plus >= 0:
+                                _pc = int(_pe[_plus+1:].strip())
+                            else:
+                                _pc = 1
+                            _pat = f"[[{_F}, {_pc}], [1, {_dyn_size}]]"
+                            try:
+                                _p_off_int = int(_ps)
+                                _dst_expr = f"{name}.ap(pattern={_pat}, scalar_offset={_dyn_counter}, indirect_dim=1, offset={_p_off_int * _F})"
+                            except ValueError:
+                                _dst_expr = f"{name}.ap(pattern={_pat}, scalar_offset={_dyn_counter}, indirect_dim=1)"
+                    elif _dyn_idx == 0:
+                        _free_part = _dst_parts[1]
+                        if ":" in _free_part:
+                            _fs, _fe = _free_part.split(":", 1)
+                            _fs = _fs.strip()
+                            _plus = _fe.find("+")
+                            if _plus >= 0:
+                                _fc = int(_fe[_plus+1:].strip())
+                            else:
+                                _fc = 1
+                            _pat = f"[[{_F}, {_dyn_size}], [1, {_fc}]]"
+                            try:
+                                _f_off_int = int(_fs)
+                                _dst_expr = f"{name}.ap(pattern={_pat}, scalar_offset={_dyn_counter}, indirect_dim=0, offset={_f_off_int})"
+                            except ValueError:
+                                _dst_expr = f"{name}.ap(pattern={_pat}, scalar_offset={_dyn_counter}, indirect_dim=0)"
+                    else:
+                        _dst_expr = f"{name}[{slice_str}]"
+                else:
+                    _dst_expr = f"{name}[{slice_str}]"
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"nisa.dma_copy(dst={_dst_expr}, src={{value}})", value=final_value
+                    )
                 )
-            )
+            else:
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"nisa.dma_copy(dst={name}[{slice_str}], src={{value}})", value=final_value
+                    )
+                )
 
 
 @_decorators.get_masked_value(load)

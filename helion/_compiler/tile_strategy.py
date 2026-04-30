@@ -1412,6 +1412,61 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 if isinstance(bs_info.size, (int, torch.SymInt)):
                     ends[i] = bs_info.size
                     proxy_ends[i] = bs_info.size
+                elif bs_info.size is None and len(block_ids) == 1:
+                    # Dynamic bound: emit register setup + SBUF counter.
+                    # The loop body will rewrite offset_var uses to reference
+                    # the counter tile.
+                    from .ast_extension import statement_from_string
+                    import ast as _ast_mod
+                    end_ast = ends[i]
+                    end_expr_str = (
+                        _ast_mod.unparse(end_ast)
+                        if isinstance(end_ast, _ast_mod.AST)
+                        else str(end_ast)
+                    )
+                    bnd_sbuf = state.device_function.new_var("_dyn_bnd_sbuf")
+                    bnd_reg = state.device_function.new_var("_dyn_bnd_reg")
+                    counter_var = state.device_function.new_var("_dyn_counter")
+                    state.add_statement(statement_from_string(
+                        f"{bnd_sbuf} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                    ))
+                    # Source may be SBUF or HBM - for SBUF tile_tensor result,
+                    # use tensor_copy; for HBM, dma_copy. Most Helion patterns
+                    # give SBUF (from .amax() on a tile).
+                    state.add_statement(statement_from_string(
+                        f"nisa.tensor_copy(dst={bnd_sbuf}, src={end_expr_str})"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"{bnd_reg} = nisa.register_alloc()"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.register_load({bnd_reg}, {bnd_sbuf})"
+                    ))
+                    # Init counter to -step (int32 SBUF tile). We increment
+                    # at the start of each iteration, so iter 1 counter = 0,
+                    # iter 2 counter = step, etc.
+                    step_init = int(block_sizes[i]) if isinstance(block_sizes[i], (int, bool)) else 1
+                    state.add_statement(statement_from_string(
+                        f"{counter_var} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.memset({counter_var}, value={-step_init})"
+                    ))
+                    # Stash state on device_function so load/store/iota can
+                    # detect we're inside a dynamic loop and rewrite.
+                    if not hasattr(state.device_function, "_nki_dyn_loops"):
+                        state.device_function._nki_dyn_loops = {}
+                    step_int = int(block_sizes[i]) if isinstance(block_sizes[i], (int, bool)) else 1
+                    _offset_var = self.offset_var(block_idx)
+                    state.device_function._nki_dyn_loops[block_idx] = {
+                        "reg": bnd_reg,
+                        "counter": counter_var,
+                        "step": step_int,
+                        "bound_sbuf": bnd_sbuf,
+                        "offset_var": _offset_var,
+                    }
+                    state.device_function._nki_dyn_range_end_var = bnd_reg
+                    state.device_function._nki_dyn_current_block_id = block_idx
             # Clamp block_size to loop extent: NKI's dma_copy uses
             # [offset:offset+block_size] which can go OOB when block_size
             # exceeds tensor dim (e.g. x_offsets[33] with block_size=64).
@@ -1522,8 +1577,24 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
             if mask_statement is not None:
                 extra_body.append(mask_statement)
+            # If this block is dynamic, prepend counter-increment at the
+            # START of the loop body (counter was init to -step, so first
+            # iteration brings it to 0 before index use).
+            _dyn_loops_sa = getattr(state.device_function, "_nki_dyn_loops", {})
+            _counter_inc_stmt = None
+            if block_idx in _dyn_loops_sa:
+                from .ast_extension import statement_from_string
+                _counter = _dyn_loops_sa[block_idx]["counter"]
+                _step = _dyn_loops_sa[block_idx]["step"]
+                _counter_inc_stmt = statement_from_string(
+                    f"nisa.tensor_scalar(dst={_counter}, data={_counter}, op0=nl.add, operand0={_step})"
+                )
             # pyrefly: ignore [unsupported-operation]
-            body[:] = [*extra_body, *body]
+            if _counter_inc_stmt is not None:
+                # Put increment BEFORE iota/mask so indices use the updated counter.
+                body[:] = [_counter_inc_stmt, *extra_body, *body]
+            else:
+                body[:] = [*extra_body, *body]
             body = [for_node]
         assert for_node is not None
         return DeviceLoopState(

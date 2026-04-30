@@ -3442,9 +3442,24 @@ class NKIBackend(Backend):
         end: str,
         step: str | None,
     ) -> str | None:
-        """NKI: use nl.sequential_range with literal step (no tl.range / constexpr)."""
+        """NKI: use nl.sequential_range with literal step (no tl.range / constexpr).
+
+        When this loop has a dynamic (tensor-valued) bound, the tile_strategy
+        has pre-emitted a register setup and stashed the register var name on
+        ``device_function._nki_dyn_range_end_var``. Use dynamic_range instead.
+        """
         begin_part = begin if begin is not None else "0"
         step_part = step if step is not None else "1"
+        from .compile_environment import CompileEnvironment
+        _env = CompileEnvironment.current()
+        _state = getattr(_env, "_codegen_state", None)
+        _dyn_reg = None
+        if _state is not None:
+            _dyn_reg = getattr(_state.device_function, "_nki_dyn_range_end_var", None)
+        if _dyn_reg is not None:
+            # Consume once so nested loops don't reuse.
+            _state.device_function._nki_dyn_range_end_var = None
+            return f"nl.dynamic_range({begin_part}, {_dyn_reg}, {step_part})"
         return f"nl.sequential_range({begin_part}, {end}, {step_part})"
 
     def dtype_str(self, dtype: torch.dtype) -> str:
@@ -3606,6 +3621,32 @@ class NKIBackend(Backend):
         with other backends (``indices_N = ...``) so downstream codegen
         (masks, gather subscripts) finds the expected variable.
         """
+        # If offset_var belongs to a dynamic_range loop, we can't use it as
+        # a static iota offset (it's a register). Instead: iota(offset=0)
+        # then add the SBUF counter tile.
+        from .compile_environment import CompileEnvironment
+        _env = CompileEnvironment.current()
+        _state = getattr(_env, "_codegen_state", None)
+        _dyn_counter = None
+        if _state is not None:
+            _dyn_loops = getattr(_state.device_function, "_nki_dyn_loops", {})
+            for _blk_info in _dyn_loops.values():
+                if _blk_info.get("offset_var") == offset_var:
+                    _dyn_counter = _blk_info["counter"]
+                    break
+        if _dyn_counter is not None:
+            if block_size_var == "1":
+                return [
+                    f"{index_var} = nl.ndarray([1, 1], {dtype}, buffer=nl.sbuf)",
+                    f"nisa.memset({index_var}, value=0)",
+                    f"nisa.tensor_scalar(dst={index_var}, data={index_var}, op0=nl.add, operand0={_dyn_counter})",
+                ]
+            return [
+                f"{index_var} = nl.ndarray([1, {block_size_var}], {dtype}, buffer=nl.sbuf)",
+                f"nisa.iota(dst={index_var}, pattern=[[1, {block_size_var}]], "
+                f"offset=0, channel_multiplier=0)",
+                f"nisa.tensor_scalar(dst={index_var}, data={index_var}, op0=nl.add, operand0={_dyn_counter})",
+            ]
         if block_size_var == "1":
             return [
                 f"{index_var} = nl.full([1, 1], {offset_var}, dtype={dtype})",

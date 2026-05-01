@@ -608,6 +608,213 @@ def _nki_shifted_tile_subscript(
     return None
 
 
+def _nki_indirect_gather(
+    fx_node: object,
+    state: "CodegenState",
+    env: "CompileEnvironment",
+    tensor: torch.Tensor,
+    slice_parts_so_far: list[str],
+) -> str | None:
+    """Detect ``base_per_partition + tile_index`` subscript patterns and emit
+    a `.ap(pattern=..., vector_offset=base_tile, indirect_dim=0)` that gathers
+    a contiguous slice per partition.
+
+    Matches patterns like ``starts[:, None] + tile.index[None, :]`` where
+    ``starts`` has been loaded into an SBUF tile. We extract ``starts`` via
+    the FX graph, find its emitted SBUF var name through state's code map,
+    and use it as the .ap() vector_offset.
+
+    Returns the per-dim slice string OR None if the pattern doesn't match.
+    Currently only supports 1D target tensor (after kernel-entry reshape
+    to [1, N]): the pattern emits a single-dim slice that replaces the
+    trailing dim.
+    """
+    if not isinstance(fx_node, torch.fx.Node):
+        return None
+    target = getattr(fx_node, "target", None)
+    target_name = str(target) if target else ""
+    if not ("add.Tensor" in target_name or target is torch.ops.aten.add.Tensor):
+        return None
+    args = fx_node.args
+    if len(args) != 2:
+        return None
+    # One arg should be tile.index (or tile.index with newaxis), the other
+    # should be a tile-like [P] SBUF variable.
+    # FX shape check: args[0].meta['val'] is [P, 1], args[1].meta['val'] is [1, F]
+    # (or permuted). Result is [P, F].
+    lhs, rhs = args
+    if not (isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)):
+        return None
+    lhs_val = lhs.meta.get("val")
+    rhs_val = rhs.meta.get("val")
+    if not (isinstance(lhs_val, torch.Tensor) and isinstance(rhs_val, torch.Tensor)):
+        return None
+    # Detect broadcast pattern: lhs [P, 1], rhs [1, F]
+    if lhs_val.ndim != 2 or rhs_val.ndim != 2:
+        return None
+    # Resolve symints
+    import sympy as _sp_ig
+    _bs_subs_ig: dict[_sp_ig.Symbol, int] = {}
+    if state.config is not None:
+        for _bs in env.block_sizes:
+            _cfg = _bs.from_config(state.config)
+            if isinstance(_cfg, int):
+                _bs_subs_ig[_bs.symbol()] = _cfg
+
+    def _res(d: object) -> int:
+        if isinstance(d, int):
+            return d
+        if isinstance(d, torch.SymInt):
+            try:
+                return int(d._sympy_().subs(_bs_subs_ig))
+            except Exception:
+                return int(env.size_hint(d))
+        return 1
+
+    lhs_p, lhs_f = _res(lhs_val.shape[0]), _res(lhs_val.shape[1])
+    rhs_p, rhs_f = _res(rhs_val.shape[0]), _res(rhs_val.shape[1])
+    # Expect lhs [P, 1] and rhs [1, F]
+    if lhs_f != 1 or rhs_p != 1:
+        # Try swap
+        if rhs_f == 1 and lhs_p == 1:
+            lhs, rhs = rhs, lhs
+            lhs_val, rhs_val = rhs_val, lhs_val
+            lhs_p, lhs_f = _res(lhs_val.shape[0]), _res(lhs_val.shape[1])
+            rhs_p, rhs_f = _res(rhs_val.shape[0]), _res(rhs_val.shape[1])
+        else:
+            return None
+    P = lhs_p
+    F = rhs_f
+    if P <= 0 or F <= 0:
+        return None
+    # Need to find SBUF var names for lhs (base) and rhs (tile_index).
+    # Helion assigns var names during codegen. We look up via
+    # state.codegen.name_for_fx_node or similar.
+    # For now, try to walk: the lhs/rhs FX nodes should have been codegen'd
+    # already, and their result is an SBUF tile with a known name.
+    try:
+        lhs_ast = state.codegen.get_fx_node_ast(lhs)
+        import ast as _ast_ig
+        lhs_name = _ast_ig.unparse(lhs_ast) if isinstance(lhs_ast, _ast_ig.AST) else str(lhs_ast)
+    except (AttributeError, Exception):
+        return None
+    # lhs_name should be the SBUF var containing base [P, 1] ints (or [1, P]).
+    # For ``.ap(vector_offset=base_tile, indirect_dim=0)`` the tile must be
+    # uint32 [P, 1].
+    # Emit a cast to uint32 + transpose if needed.
+    lhs_shape_lookup = state.device_function._nki_sbuf_shapes.get(lhs_name)
+    if lhs_shape_lookup is None:
+        # Try stripping _copy suffixes
+        _lk = lhs_name
+        while "_copy" in _lk:
+            _lk = _lk[:_lk.rfind("_copy")]
+            lhs_shape_lookup = state.device_function._nki_sbuf_shapes.get(_lk)
+            if lhs_shape_lookup is not None:
+                break
+    if lhs_shape_lookup is None:
+        return None
+    # Lay out as [P, 1] (partition axis has P elements)
+    # If lhs_shape_lookup is [1, P], need nc_transpose to [P, 1]
+    from .._compiler.ast_extension import statement_from_string
+    device_fn = state.device_function
+    if lhs_shape_lookup == [P, 1]:
+        vec_offset_var = lhs_name
+    elif lhs_shape_lookup == [1, P]:
+        # Transpose [1, P] -> [P, 1]
+        tr_psum = device_fn.new_var("_ig_tr_psum", dce=True)
+        tr_sbuf = device_fn.new_var("_ig_tr_sbuf", dce=True)
+        # Use int32 dtype (or whatever lhs has)
+        _dt = device_fn._nki_sbuf_dtypes.get(lhs_name, "nl.int32")
+        # Transpose requires float; cast if int
+        if _dt in ("nl.int32", "nl.int16", "nl.uint32", "nl.uint16"):
+            # Cast to float32 for transpose
+            cast_in = device_fn.new_var("_ig_cast_in", dce=True)
+            state.codegen.add_statement(statement_from_string(
+                f"{cast_in} = nl.ndarray([1, {P}], nl.float32, buffer=nl.sbuf)"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"nisa.memset({cast_in}, value=0)"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"nisa.tensor_tensor(dst={cast_in}, data1={cast_in}, data2={lhs_name}, op=nl.add)"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"{tr_psum} = nl.ndarray([{P}, 1], nl.float32, buffer=nl.psum)"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"nisa.nc_transpose(dst={tr_psum}, data={cast_in})"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"{tr_sbuf} = nl.ndarray([{P}, 1], nl.uint32, buffer=nl.sbuf)"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})"
+            ))
+        else:
+            state.codegen.add_statement(statement_from_string(
+                f"{tr_psum} = nl.ndarray([{P}, 1], {_dt}, buffer=nl.psum)"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"nisa.nc_transpose(dst={tr_psum}, data={lhs_name})"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"{tr_sbuf} = nl.ndarray([{P}, 1], nl.uint32, buffer=nl.sbuf)"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})"
+            ))
+        vec_offset_var = tr_sbuf
+    else:
+        return None
+    # Get tile.index block_id from rhs to find the counter for the dynamic loop
+    # rhs_val shape [1, F] - find the block that has size F
+    _tile_bid = None
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        try:
+            _bs_val = _bs.from_config_assert(state.config)
+            if int(_bs_val) == F and _bid in state.codegen.active_device_loops:
+                _tile_bid = _bid
+                break
+        except Exception:
+            pass
+    if _tile_bid is None:
+        return None
+    # If this tile is dynamic, include counter in vector_offset
+    _dyn_loops = getattr(device_fn, "_nki_dyn_loops", {})
+    # Build pattern for .ap()
+    # x_data is 1D reshaped to [1, N]. We want per-partition gather of F
+    # contiguous elements starting at vec_offset.
+    # Pattern: [[N, P], [1, F]] with vector_offset over the partition dim.
+    _tensor_shape = list(tensor.shape)
+    if len(_tensor_shape) == 1:
+        N_total = int(_tensor_shape[0])
+    elif len(_tensor_shape) == 2:
+        N_total = int(_tensor_shape[1])
+    else:
+        return None
+    pattern = f"[[{N_total}, {P}], [1, {F}]]"
+    # For dynamic loops, add counter to vector_offset (starts + counter)
+    if _tile_bid in _dyn_loops:
+        _counter = _dyn_loops[_tile_bid]["counter"]
+        # Compute vec_offset_combined = vec_offset_var + counter (per partition)
+        combined_var = device_fn.new_var("_ig_base_plus_counter", dce=True)
+        state.codegen.add_statement(statement_from_string(
+            f"{combined_var} = nl.ndarray([{P}, 1], nl.uint32, buffer=nl.sbuf)"
+        ))
+        # Copy vec_offset to combined_var
+        state.codegen.add_statement(statement_from_string(
+            f"nisa.tensor_copy(dst={combined_var}, src={vec_offset_var})"
+        ))
+        # Add counter (scalar)
+        state.codegen.add_statement(statement_from_string(
+            f"nisa.tensor_scalar(dst={combined_var}, data={combined_var}, op0=nl.add, operand0={_counter})"
+        ))
+        vec_offset_var = combined_var
+    # Emit an .ap() expression inline as the slice_part
+    return f"__AP_VEC_OFFSET__{vec_offset_var}__{pattern}__"
+
+
 def _nki_subscript_block_id(
     sub_val: object,
     fx_node_i: object,
@@ -964,6 +1171,19 @@ def _(state: CodegenState) -> ast.AST:
                 is_scalar_dim.append(False)
                 continue
 
+            # Detect "base_per_partition + tile_index" pattern for indirect
+            # gather (e.g. starts[:, None] + tile.index[None, :]). This is
+            # the common jagged pattern: for each partition, a contiguous
+            # F-element slice starting at base[p].
+            # Emit .ap(pattern=..., vector_offset=base_tile, indirect_dim=0).
+            _gather = _nki_indirect_gather(
+                fx_node_tdi_check, state, env, tensor, slice_parts
+            )
+            if _gather is not None:
+                slice_parts.append(_gather)
+                is_scalar_dim.append(False)
+                continue
+
             # Fixed slice for this dimension.
             size_i = tensor.size(tdi)
             size_str = (
@@ -1053,7 +1273,25 @@ def _(state: CodegenState) -> ast.AST:
         """Build an HBM src expression, converting __DYN_AP__counter__size
         sentinels to .ap(pattern=..., scalar_offset=counter, indirect_dim=N)
         when any dim is dynamic.
+        Also handles __AP_VEC_OFFSET__var__pattern__ for indirect gather.
         """
+        # Handle vector_offset gather first
+        for _p in parts:
+            if _p.startswith("__AP_VEC_OFFSET__"):
+                _rest = _p[len("__AP_VEC_OFFSET__"):]
+                # Format: var__pattern__
+                parts_split = _rest.rsplit("__", 2)
+                # Actually encoding: var__PATTERN__ — only 2 __ separators
+                # but pattern may contain __ too. Use a safer split.
+                # Split at first __ only (var)
+                _vp = _rest.split("__", 1)
+                if len(_vp) == 2:
+                    var_name, rest2 = _vp
+                    # rest2 ends with "__", strip
+                    pattern_str = rest2.rstrip("_")
+                else:
+                    continue
+                return f"{name_str}.ap(pattern={pattern_str}, vector_offset={var_name}, indirect_dim=0)"
         has_dyn = any(p.startswith("__DYN_AP__") for p in parts)
         if not has_dyn:
             return f"{name_str}[{', '.join(parts)}]"

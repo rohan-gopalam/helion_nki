@@ -133,7 +133,8 @@ def _full_codegen(state: CodegenState) -> ast.AST:
     fake_value = state.fake_value
     assert isinstance(fake_value, torch.Tensor)
     shape_dims = state.device_function.tile_strategy.shape_dims(fake_value.size())
-    backend = CompileEnvironment.current().backend
+    env = CompileEnvironment.current()
+    backend = env.backend
 
     # NKI two-line pattern: ndarray then nisa.memset(dst, value=...)
     nki_memset = getattr(backend, "full_memset_stmt", None)
@@ -231,8 +232,35 @@ def _full_codegen(state: CodegenState) -> ast.AST:
             )
         # Register SBUF shape for multi-user detection on copy vars
         if hasattr(state.device_function, "_nki_sbuf_shapes"):
+
+            def _resolve_nki_shape_dim(dim: object) -> int:
+                if isinstance(dim, int):
+                    return dim
+                if isinstance(dim, torch.SymInt):
+                    import sympy as _sp_shape
+
+                    _shape_subs: dict[_sp_shape.Symbol, int] = {}
+                    if state.config is not None:
+                        for _bs_shape in env.block_sizes:
+                            _cfg_shape = _bs_shape.from_config(state.config)
+                            if isinstance(_cfg_shape, int):
+                                _shape_subs[_bs_shape.symbol()] = _cfg_shape
+                    return int(dim._sympy_().subs(_shape_subs))
+                if isinstance(dim, str):
+                    for (
+                        block_id,
+                    ), var_name in state.device_function.block_size_var_cache.items():
+                        if var_name == dim:
+                            return int(
+                                env.block_sizes[block_id].from_config_assert(
+                                    state.config
+                                )
+                            )
+                    return int(dim)
+                return int(dim)
+
             try:
-                resolved = [int(d) for d in shape_dims]
+                resolved = [_resolve_nki_shape_dim(d) for d in shape_dims]
                 if len(resolved) == 1:
                     resolved.append(1)  # full_expr adds trailing 1 for 1D
                 if len(resolved) >= 2:

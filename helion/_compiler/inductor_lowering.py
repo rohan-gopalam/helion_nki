@@ -1182,7 +1182,9 @@ class GraphInterpreter(LoweringContext, Interpreter):
                             user for user in n.users if user.target == getitem
                         ]
                         if len(getitem_users) > 0:
-                            return self._collect_multi_outputs(n, result)
+                            multi_outputs = self._collect_multi_outputs(n, result)
+                            self.cg.record_fx_node_ast(n, multi_outputs)
+                            return multi_outputs
 
                     if result is None:
                         return None
@@ -1208,6 +1210,7 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(repr(result.value), n)
                                 )
+                        self.cg.record_fx_node_ast(n, result)
                         return result
                     if not isinstance(result, (ast.Name, ast.Constant)):
                         self.cg.add_statement(create(ast.Expr, value=result))

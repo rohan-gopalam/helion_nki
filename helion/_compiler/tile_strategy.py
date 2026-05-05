@@ -1424,18 +1424,19 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         if isinstance(end_ast, _ast_mod.AST)
                         else str(end_ast)
                     )
-                    bnd_sbuf = state.device_function.new_var("_dyn_bnd_sbuf")
                     bnd_reg = state.device_function.new_var("_dyn_bnd_reg")
                     counter_var = state.device_function.new_var("_dyn_counter")
-                    state.add_statement(statement_from_string(
-                        f"{bnd_sbuf} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
-                    ))
-                    # Source may be SBUF or HBM - for SBUF tile_tensor result,
-                    # use tensor_copy; for HBM, dma_copy. Most Helion patterns
-                    # give SBUF (from .amax() on a tile).
-                    state.add_statement(statement_from_string(
-                        f"nisa.tensor_copy(dst={bnd_sbuf}, src={end_expr_str})"
-                    ))
+                    counter_float_var = state.device_function.new_var("_dyn_counter_f")
+                    if end_expr_str in state.device_function._nki_sbuf_shapes:
+                        bnd_sbuf = end_expr_str
+                    else:
+                        bnd_sbuf = state.device_function.new_var("_dyn_bnd_sbuf")
+                        state.add_statement(statement_from_string(
+                            f"{bnd_sbuf} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={bnd_sbuf}, src={end_expr_str})"
+                        ))
                     state.add_statement(statement_from_string(
                         f"{bnd_reg} = nisa.register_alloc()"
                     ))
@@ -1452,6 +1453,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     state.add_statement(statement_from_string(
                         f"nisa.memset({counter_var}, value={-step_init})"
                     ))
+                    state.add_statement(statement_from_string(
+                        f"{counter_float_var} = nl.ndarray([1, 1], nl.float32, buffer=nl.sbuf)"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.memset({counter_float_var}, value={float(-step_init)})"
+                    ))
                     # Stash state on device_function so load/store/iota can
                     # detect we're inside a dynamic loop and rewrite.
                     if not hasattr(state.device_function, "_nki_dyn_loops"):
@@ -1461,6 +1468,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     state.device_function._nki_dyn_loops[block_idx] = {
                         "reg": bnd_reg,
                         "counter": counter_var,
+                        "counter_float": counter_float_var,
                         "step": step_int,
                         "bound_sbuf": bnd_sbuf,
                         "offset_var": _offset_var,
@@ -1585,14 +1593,25 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             if block_idx in _dyn_loops_sa:
                 from .ast_extension import statement_from_string
                 _counter = _dyn_loops_sa[block_idx]["counter"]
+                _counter_float = _dyn_loops_sa[block_idx].get("counter_float")
                 _step = _dyn_loops_sa[block_idx]["step"]
                 _counter_inc_stmt = statement_from_string(
                     f"nisa.tensor_scalar(dst={_counter}, data={_counter}, op0=nl.add, operand0={_step})"
                 )
+                if _counter_float is not None:
+                    _counter_inc_stmt = [
+                        _counter_inc_stmt,
+                        statement_from_string(
+                            f"nisa.tensor_scalar(dst={_counter_float}, data={_counter_float}, op0=nl.add, operand0={float(_step)})"
+                        ),
+                    ]
             # pyrefly: ignore [unsupported-operation]
             if _counter_inc_stmt is not None:
                 # Put increment BEFORE iota/mask so indices use the updated counter.
-                body[:] = [_counter_inc_stmt, *extra_body, *body]
+                if isinstance(_counter_inc_stmt, list):
+                    body[:] = [*_counter_inc_stmt, *extra_body, *body]
+                else:
+                    body[:] = [_counter_inc_stmt, *extra_body, *body]
             else:
                 body[:] = [*extra_body, *body]
             body = [for_node]

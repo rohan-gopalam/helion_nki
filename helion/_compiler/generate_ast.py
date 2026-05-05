@@ -61,6 +61,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         # Track var=const for NKI tensor_scalar (avoids tensor_tensor when one op is scalar)
         self._var_to_constant: dict[str, int | float | bool] = {}
+        self.fx_node_to_ast: dict[object, ast.AST | tuple[ast.AST, ...]] = {}
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -103,6 +104,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def get_var_constant_value(self, var_name: str) -> int | float | bool | None:
         """Return constant value if var was assigned a literal, else None."""
         return self._var_to_constant.get(var_name)
+
+    def record_fx_node_ast(self, node: object, value: object) -> None:
+        if isinstance(value, ast.AST):
+            self.fx_node_to_ast[node] = value
+        elif isinstance(value, tuple) and all(isinstance(v, ast.AST) for v in value):
+            self.fx_node_to_ast[node] = value
+
+    def ast_for_fx_node(self, node: object) -> ast.AST | tuple[ast.AST, ...] | None:
+        return self.fx_node_to_ast.get(node)
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
         import_stmt = statement_from_string(

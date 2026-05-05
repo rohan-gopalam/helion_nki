@@ -46,6 +46,13 @@ class CodegenInterface(ABC):
         self.add_statement(statement_from_string(f"{varname} = {{expr}}", expr=expr))
         return create(ast.Name, id=varname, ctx=ast.Load())
 
+    def record_fx_node_ast(self, node: object, value: object) -> None:
+        """Record the final lowered AST value for an FX node if supported."""
+
+    def ast_for_fx_node(self, node: object) -> ast.AST | tuple[ast.AST, ...] | None:
+        """Return the final lowered AST value for an FX node if available."""
+        return None
+
 
 def extract_helper_function(helper_fn: object) -> types.FunctionType:
     """Extract the actual function from a Kernel object or return as-is.

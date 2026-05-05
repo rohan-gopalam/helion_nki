@@ -5,6 +5,83 @@
 
 ---
 
+## 2026-05-05 Addendum: Dynamic Loops
+
+Dynamic loops for direct Helion-to-NKI lowering are now implemented and covered by
+focused runtime tests on Trn2.
+
+What changed:
+- Tensor-valued `hl.tile` stop bounds lower to `nl.dynamic_range`.
+- Bound values already resident in SBUF are passed directly to `nisa.register_load`;
+  this avoids the extra SBUF-to-SBUF copy that caused neuronx-cc
+  `NCC_IBIR013 Requested Output index 0 out of bounds`.
+- Dynamic loop counters are maintained as both int32 SBUF tiles for AP
+  `scalar_offset` and float32 SBUF tiles for iota-derived tile indices.
+- Dynamic loop-carried tensor values update their outer SBUF buffers in place when
+  the inner graph output is a copy of an outer loop value. This fixes the dominance
+  failure where a post-loop reduction read an accumulator allocated inside
+  `nl.dynamic_range`.
+- NKI load lowering can now apply `extra_mask` using `nisa.tensor_copy_predicated`
+  for regular SBUF loads.
+
+Proof:
+
+```bash
+PATH=/opt/aws_neuronx_venv_pytorch_2_9/bin:$PATH \
+PYTHONPATH=/home/ubuntu/helion/helion_nki \
+HELION_BACKEND=nki \
+NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+TORCHINDUCTOR_CACHE_DIR=/tmp/helion_nki_dynloops_cache8 \
+/opt/aws_neuronx_venv_pytorch_2_9/bin/python -m pytest -q \
+  test/test_nki_dynamic_loops.py -x -s
+```
+
+Verified result on 2026-05-05: `4 passed, 6 warnings`.
+
+The test file covers:
+- codegen-only checks for `@nki.jit`, `nl.dynamic_range`, register setup, and AP use;
+- runtime dynamic partition-dimension copies;
+- runtime dynamic free-dimension copies;
+- runtime loop-carried dynamic reductions.
+
+Full-suite check after installing the missing dev test dependencies into the
+active Neuron venv (`expecttest`, `hypothesis`, `pytest-timeout`):
+
+```bash
+PATH=/opt/aws_neuronx_venv_pytorch_2_9/bin:$PATH \
+PYTHONPATH=/home/ubuntu/helion/helion_nki \
+HELION_BACKEND=nki \
+NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+TORCHINDUCTOR_CACHE_DIR=/tmp/helion_nki_fullsuite_after_deps_cache \
+/opt/aws_neuronx_venv_pytorch_2_9/bin/python -m pytest -ra --tb=short \
+  --junitxml=/tmp/helion_nki_full_pytest_after_deps.xml test
+```
+
+Verified result on 2026-05-05: `22 passed, 1164 skipped, 6 warnings`.
+No failures, no collection errors, and no NVIDIA/CUDA-only failures were observed
+in the NKI full-suite run.
+
+Coverage caveat: only `test/test_nki_dynamic_loops.py` is explicitly NKI-enabled
+(`4` tests). The other `18` passing tests are backend-independent utility checks
+from `test/test_aot_autotuning.py` and `test/test_codegen_comments.py`; they do
+not exercise NKI code generation or Trainium execution. Most of the historical
+Helion suite is still intentionally skipped under `HELION_BACKEND=nki`.
+
+Direct jagged-lowering follow-up:
+- `examples/jagged_dense_add.py` now pre-fills the output from `y` before the
+  dynamic jagged loop, avoiding a tensor-valued range start (`hl.tile(max_nnz,
+  out.size(1))`) that NKI does not support.
+- The jagged path now reaches dynamic range, vector-offset gather, and predicated
+  masked load codegen, but a small varied-length runtime smoke still fails at
+  `max_nnz = nnz.amax()` because the logical 1D int32 length tile is lowered through
+  `nisa.tensor_partition_reduce`; neuronx-cc rejects that reduction with
+  `NCC_IXCG864 ISA check failed`.
+
+Tooling note: `ruff` was not installed in the active venv or on PATH. I ran
+`python -m py_compile` over touched Python files and `git diff --check`.
+
+---
+
 ## Table of Contents
 
 1. [Environment Setup](#1-environment-setup)

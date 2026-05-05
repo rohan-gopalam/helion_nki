@@ -878,8 +878,26 @@ class NKIOpOverrides:
         #    like "_nki_full_copy" are accumulators and should remain in-place.)
         from torch._inductor.virtualized import V
 
-        cur_node = V.current_node
+        cur_node = V.current_node or state.fx_node
         _is_second_level_copy = "_copy_" in dst and dst[-1:].isdigit()
+        if _is_second_level_copy and cur_node is not None:
+            _users = getattr(cur_node, "users", {})
+            _is_loop_output = (
+                len(_users) == 1
+                and any(getattr(user, "op", None) == "output" for user in _users)
+            )
+            if _is_loop_output and b_tile_vars is None and dst_tile_vars is None:
+                _base_dst = dst
+                _sbuf_shapes = state.device_function._nki_sbuf_shapes
+                while _base_dst not in _sbuf_shapes and "_copy" in _base_dst:
+                    _base_dst = _base_dst[:_base_dst.rfind("_copy")]
+                if _base_dst in _sbuf_shapes and _base_dst != dst:
+                    state.add_statement(
+                        statement_from_string(
+                            f"nisa.tensor_tensor(dst={_base_dst}, data1={_base_dst}, data2={b}, op={op})"
+                        )
+                    )
+                    return _base_dst
         # (debug removed)
         a_node_has_other_users = _is_second_level_copy or (
             cur_node is not None
@@ -960,6 +978,28 @@ class NKIOpOverrides:
                     # Use the larger partition count for the result shape
                     max_p = max(shape_list[0], b_sbuf_shape_alloc[0])
                     shape_list = [max_p] + list(shape_list[1:])
+                if (
+                    b_sbuf_shape_alloc is not None
+                    and len(shape_list) >= 2
+                    and len(b_sbuf_shape_alloc) >= 2
+                    and shape_list[1] != b_sbuf_shape_alloc[1]
+                ):
+                    max_f = max(shape_list[1], b_sbuf_shape_alloc[1])
+                    shape_list = [shape_list[0], max_f, *list(shape_list[2:])]
+                if (
+                    b_sbuf_shape_alloc is not None
+                    and len(shape_list) >= 2
+                    and len(b_sbuf_shape_alloc) >= 2
+                    and {shape_list[0], b_sbuf_shape_alloc[0]}
+                    == {1, max(shape_list[0], b_sbuf_shape_alloc[0])}
+                    and {shape_list[1], b_sbuf_shape_alloc[1]}
+                    == {1, max(shape_list[1], b_sbuf_shape_alloc[1])}
+                ):
+                    shape_list = [
+                        max(shape_list[0], b_sbuf_shape_alloc[0]),
+                        max(shape_list[1], b_sbuf_shape_alloc[1]),
+                        *list(shape_list[2:]),
+                    ]
 
                 shape_str = ", ".join(str(d) for d in shape_list)
                 new_dst = state.device_function.new_var(prefix, dce=True)
@@ -1561,8 +1601,28 @@ class NKIOpOverrides:
         # 1 - probs) pass probs as args[1], and if probs has multiple users
         # we still need to allocate a new dst to avoid overwriting it.
         from torch._inductor.virtualized import V as _V_ts
-        _ts_node = _V_ts.current_node
+        _ts_node = _V_ts.current_node or state.fx_node
         _ts_is_copy = "_copy_" in dst and dst[-1:].isdigit()
+        if _ts_is_copy and _ts_node is not None and dst_tile_vars is None:
+            _ts_users = getattr(_ts_node, "users", {})
+            _ts_is_loop_output = (
+                len(_ts_users) == 1
+                and any(getattr(user, "op", None) == "output" for user in _ts_users)
+            )
+            if _ts_is_loop_output:
+                _ts_base_dst = dst
+                _ts_sbuf_shapes = state.device_function._nki_sbuf_shapes
+                while _ts_base_dst not in _ts_sbuf_shapes and "_copy" in _ts_base_dst:
+                    _ts_base_dst = _ts_base_dst[:_ts_base_dst.rfind("_copy")]
+                if _ts_base_dst in _ts_sbuf_shapes and _ts_base_dst != dst:
+                    _operand_emit_ts = _scalar_for_emit(operand0)
+                    state.add_statement(
+                        statement_from_string(
+                            f"nisa.tensor_scalar(dst={_ts_base_dst}, data={_ts_base_dst}, "
+                            f"op0={op0}, operand0={_operand_emit_ts}, op1=None{reverse_part})"
+                        )
+                    )
+                    return _ts_base_dst
         _ts_any_arg_multi_user = False
         if _ts_node is not None:
             for _arg in getattr(_ts_node, "args", ()):
@@ -1751,6 +1811,16 @@ class NKIOpOverrides:
         a_is_scalar = cls._is_scalar_operand(a)
         b_is_scalar = cls._is_scalar_operand(b)
 
+        from torch._inductor.virtualized import V as _V_bin
+
+        _bin_node = _V_bin.current_node
+        if _bin_node is not None and cls._used_only_as_memory_index(_bin_node):
+            # The NKI load/store lowering pattern-matches the original FX
+            # index expression directly. Emitting the arithmetic expression as
+            # a real SBUF op here is both unnecessary and can be invalid for
+            # broadcasted index expressions such as starts[:, None] + i[None, :].
+            return "0"
+
         if a_is_scalar and b_is_scalar:
             raise exc.BackendUnsupported(
                 "nki",
@@ -1773,8 +1843,6 @@ class NKIOpOverrides:
         # Check for broadcast pattern: [M,N] op [M,1] after 3D squeeze
         # This handles cases like acc * alpha[:, :, None] where alpha is [1,M,1]
         if not a_is_scalar and not b_is_scalar:
-            from torch._inductor.virtualized import V as _V_bin
-            _bin_node = _V_bin.current_node
             if _bin_node is not None and len(_bin_node.args) >= 2:
                 _lhs_s = cls._shape_from_node_arg(_bin_node.args[0])
                 _rhs_s = cls._shape_from_node_arg(_bin_node.args[1])
@@ -1800,6 +1868,32 @@ class NKIOpOverrides:
             "nki",
             f"single-op tensor_scalar path does not support tensor/tensor for op {op_tensor_scalar}",
         )
+
+    @staticmethod
+    def _used_only_as_memory_index(node: object) -> bool:
+        users = getattr(node, "users", None)
+        if not users:
+            return False
+
+        def contains(thing: object, needle: object) -> bool:
+            if thing is needle:
+                return True
+            if isinstance(thing, (list, tuple)):
+                return any(contains(item, needle) for item in thing)
+            if isinstance(thing, dict):
+                return any(contains(item, needle) for item in thing.values())
+            return False
+
+        for user in users:
+            if getattr(user, "op", None) != "call_function":
+                return False
+            target_name = str(getattr(getattr(user, "target", None), "__name__", ""))
+            if target_name not in {"load", "store"}:
+                return False
+            args = getattr(user, "args", ())
+            if len(args) < 2 or not contains(args[1], node):
+                return False
+        return True
 
     @staticmethod
     def _shape_from_node_arg(arg: object) -> tuple[object, ...] | None:
@@ -3149,12 +3243,29 @@ class NKIOpOverrides:
             if (
                 a_sh is not None and b_sh is not None
                 and len(a_sh) == 2 and len(b_sh) == 2
-                and list(a_sh) == list(b_sh)
                 and len(shape) == 2
-                and shape[0] != a_sh[0]
-                and shape[1] == a_sh[1]
-                and a_sh[0] == 1
                 and shape[0] > 1
+                and shape[1] > 1
+                and (
+                    (
+                        list(a_sh) == list(b_sh)
+                        and shape[0] != a_sh[0]
+                        and shape[1] == a_sh[1]
+                        and a_sh[0] == 1
+                    )
+                    or (
+                        a_sh[0] == 1
+                        and a_sh[1] == shape[1]
+                        and b_sh[0] == 1
+                        and b_sh[1] == shape[0]
+                    )
+                    or (
+                        b_sh[0] == 1
+                        and b_sh[1] == shape[1]
+                        and a_sh[0] == 1
+                        and a_sh[1] == shape[0]
+                    )
+                )
             ):
                 # Both [1, N] but output is [P, N]: broadcast one to [P, N]
                 # along partition (replicate the row), and transpose the
@@ -3628,24 +3739,27 @@ class NKIBackend(Backend):
         _env = CompileEnvironment.current()
         _state = getattr(_env, "_codegen_state", None)
         _dyn_counter = None
+        _dyn_counter_float = None
         if _state is not None:
             _dyn_loops = getattr(_state.device_function, "_nki_dyn_loops", {})
             for _blk_info in _dyn_loops.values():
                 if _blk_info.get("offset_var") == offset_var:
                     _dyn_counter = _blk_info["counter"]
+                    _dyn_counter_float = _blk_info.get("counter_float")
                     break
         if _dyn_counter is not None:
+            counter_operand = _dyn_counter_float or _dyn_counter
             if block_size_var == "1":
                 return [
                     f"{index_var} = nl.ndarray([1, 1], {dtype}, buffer=nl.sbuf)",
                     f"nisa.memset({index_var}, value=0)",
-                    f"nisa.tensor_scalar(dst={index_var}, data={index_var}, op0=nl.add, operand0={_dyn_counter})",
+                    f"nisa.tensor_scalar(dst={index_var}, data={index_var}, op0=nl.add, operand0={counter_operand})",
                 ]
             return [
                 f"{index_var} = nl.ndarray([1, {block_size_var}], {dtype}, buffer=nl.sbuf)",
                 f"nisa.iota(dst={index_var}, pattern=[[1, {block_size_var}]], "
                 f"offset=0, channel_multiplier=0)",
-                f"nisa.tensor_scalar(dst={index_var}, data={index_var}, op0=nl.add, operand0={_dyn_counter})",
+                f"nisa.tensor_scalar(dst={index_var}, data={index_var}, op0=nl.add, operand0={counter_operand})",
             ]
         if block_size_var == "1":
             return [
@@ -4044,8 +4158,17 @@ class NKIBackend(Backend):
                 else:
                     free_size = 1
                 dst_shape = f"[1, {free_size}]"
-                dtype_str = "nl.float32"
+                if reduction_type == "mean":
+                    dtype_str = "nl.float32"
+                elif fake_output is not None:
+                    dtype_str = env.backend.dtype_str(fake_output.dtype)
+                elif fake_input is not None:
+                    dtype_str = env.backend.dtype_str(fake_input.dtype)
+                else:
+                    dtype_str = "nl.float32"
                 result_var = state.device_function.new_var("nki_part_reduce", dce=True)
+                state.device_function._nki_sbuf_shapes[result_var] = [1, free_size]
+                state.device_function._nki_sbuf_dtypes[result_var] = dtype_str
                 state.add_statement(
                     f"{result_var} = nl.ndarray({dst_shape}, {dtype_str}, buffer=nl.sbuf)"
                 )

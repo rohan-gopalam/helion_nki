@@ -315,8 +315,26 @@ def codegen_full_nki(ctx: LoweringContext, node: Node) -> ast.AST:
         )
         # Register SBUF shape for multi-user detection on copy vars
         # full_expr may have added a trailing 1 for 1D shapes internally
+        def _resolve_nki_shape_dim(dim: object) -> int:
+            if isinstance(dim, int):
+                return dim
+            if isinstance(dim, torch.SymInt):
+                return int(dim._sympy_().subs(_bs_subs))
+            if isinstance(dim, str):
+                for (
+                    block_id,
+                ), var_name in ctx.cg.device_function.block_size_var_cache.items():
+                    if var_name == dim:
+                        return int(
+                            env.block_sizes[block_id].from_config_assert(
+                                state.config
+                            )
+                        )
+                return int(dim)
+            return int(dim)
+
         try:
-            resolved = [int(d) for d in shape_dims]
+            resolved = [_resolve_nki_shape_dim(d) for d in shape_dims]
             if len(resolved) == 1:
                 resolved.append(1)
             if len(resolved) >= 2:

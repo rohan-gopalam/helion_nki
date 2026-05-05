@@ -688,16 +688,13 @@ def _nki_indirect_gather(
     if P <= 0 or F <= 0:
         return None
     # Need to find SBUF var names for lhs (base) and rhs (tile_index).
-    # Helion assigns var names during codegen. We look up via
-    # state.codegen.name_for_fx_node or similar.
-    # For now, try to walk: the lhs/rhs FX nodes should have been codegen'd
-    # already, and their result is an SBUF tile with a known name.
-    try:
-        lhs_ast = state.codegen.get_fx_node_ast(lhs)
-        import ast as _ast_ig
-        lhs_name = _ast_ig.unparse(lhs_ast) if isinstance(lhs_ast, _ast_ig.AST) else str(lhs_ast)
-    except (AttributeError, Exception):
+    # GraphInterpreter records the final lowered AST for used FX nodes on the
+    # active GenerateAST instance.  That gives us the emitted SBUF variable
+    # name, which is the key used by the NKI shape/dtype registries below.
+    lhs_ast = state.codegen.ast_for_fx_node(lhs)
+    if not isinstance(lhs_ast, ast.AST):
         return None
+    lhs_name = ast.unparse(lhs_ast)
     # lhs_name should be the SBUF var containing base [P, 1] ints (or [1, P]).
     # For ``.ap(vector_offset=base_tile, indirect_dim=0)`` the tile must be
     # uint32 [P, 1].
@@ -789,11 +786,13 @@ def _nki_indirect_gather(
     _tensor_shape = list(tensor.shape)
     if len(_tensor_shape) == 1:
         N_total = int(_tensor_shape[0])
+        leading_stride = 1
     elif len(_tensor_shape) == 2:
         N_total = int(_tensor_shape[1])
+        leading_stride = N_total
     else:
         return None
-    pattern = f"[[{N_total}, {P}], [1, {F}]]"
+    pattern = f"[[{leading_stride}, {P}], [1, {F}]]"
     # For dynamic loops, add counter to vector_offset (starts + counter)
     if _tile_bid in _dyn_loops:
         _counter = _dyn_loops[_tile_bid]["counter"]
@@ -806,9 +805,23 @@ def _nki_indirect_gather(
         state.codegen.add_statement(statement_from_string(
             f"nisa.tensor_copy(dst={combined_var}, src={vec_offset_var})"
         ))
-        # Add counter (scalar)
+        counter_u32 = device_fn.new_var("_ig_counter_u32", dce=True)
+        counter_bcast = device_fn.new_var("_ig_counter_bcast", dce=True)
+        device_fn._nki_sbuf_shapes[counter_u32] = [1, 1]
+        device_fn._nki_sbuf_dtypes[counter_u32] = "nl.uint32"
+        device_fn._nki_sbuf_shapes[counter_bcast] = [P, 1]
+        device_fn._nki_sbuf_dtypes[counter_bcast] = "nl.uint32"
         state.codegen.add_statement(statement_from_string(
-            f"nisa.tensor_scalar(dst={combined_var}, data={combined_var}, op0=nl.add, operand0={_counter})"
+            f"{counter_u32} = nl.ndarray([1, 1], nl.uint32, buffer=nl.sbuf)"
+        ))
+        state.codegen.add_statement(statement_from_string(
+            f"nisa.tensor_copy(dst={counter_u32}, src={_counter})"
+        ))
+        state.codegen.add_statement(statement_from_string(
+            f"{counter_bcast} = nl.broadcast_to({counter_u32}, shape=({P}, 1))"
+        ))
+        state.codegen.add_statement(statement_from_string(
+            f"nisa.tensor_tensor(dst={combined_var}, data1={combined_var}, data2={counter_bcast}, op=nl.add)"
         ))
         vec_offset_var = combined_var
     # Emit an .ap() expression inline as the slice_part
@@ -921,6 +934,8 @@ def _(state: CodegenState) -> ast.AST:
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
+    extra_mask = state.ast_args[2]
+    assert isinstance(extra_mask, (type(None), ast.AST))
     name = state.device_function.tensor_arg(tensor).name
     device_fn = state.device_function
     # If this tensor was previously written via nki_return_buf (it's both an
@@ -1430,7 +1445,7 @@ def _(state: CodegenState) -> ast.AST:
         if tensor.dim() == 1:
             # Source tensor reshaped to [1, N] at kernel entry.
             orig_slice = slice_parts[0] if slice_parts else f"0:{partition_dim}"
-            if orig_slice.startswith("__DYN_AP__"):
+            if orig_slice.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__")):
                 # fall through to ap builder with a 2-part slice
                 hbm_src_1d = _build_hbm_src(name, ["0:1", orig_slice])
             else:
@@ -1508,7 +1523,9 @@ def _(state: CodegenState) -> ast.AST:
             )
         )
         # Handle dynamic loop subscripts via .ap()
-        _has_dyn_2d = any(p.startswith("__DYN_AP__") for p in slice_parts)
+        _has_dyn_2d = any(
+            p.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__")) for p in slice_parts
+        )
         if _has_dyn_2d:
             if tensor.dim() == 1 and len(slice_parts) == 1:
                 hbm_src_expr = _build_hbm_src(name, ["0:1", slice_parts[0]])
@@ -1530,6 +1547,48 @@ def _(state: CodegenState) -> ast.AST:
         if not hasattr(device_fn, "_nki_hbm_sources"):
             device_fn._nki_hbm_sources = {}
         device_fn._nki_hbm_sources[sbuf_name] = hbm_src_expr
+    if extra_mask is not None:
+        mask_name = ast.unparse(extra_mask)
+        tile_vars = device_fn.get_tile_list_vars(sbuf_name)
+        if tile_vars is not None:
+            raise exc.BackendUnsupported("nki", "masked tile-list loads")
+        sbuf_shape = device_fn._nki_sbuf_shapes.get(sbuf_name)
+        if sbuf_shape is None:
+            raise exc.BackendUnsupported("nki", "masked load with unknown SBUF shape")
+        masked_name = device_fn.new_var("_nki_masked_load", dce=True)
+        device_fn._nki_sbuf_shapes[masked_name] = list(sbuf_shape)
+        if not hasattr(device_fn, "_nki_sbuf_dtypes"):
+            device_fn._nki_sbuf_dtypes = {}
+        device_fn._nki_sbuf_dtypes[masked_name] = dtype_str
+        shape_str = ", ".join(str(d) for d in sbuf_shape)
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{masked_name} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        state.codegen.add_statement(
+            statement_from_string(f"nisa.memset({masked_name}, value=0)")
+        )
+        mask_shape = device_fn._nki_sbuf_shapes.get(mask_name, sbuf_shape)
+        mask_shape_str = ", ".join(str(d) for d in mask_shape)
+        pred_name = device_fn.new_var("_nki_mask_pred", dce=True)
+        device_fn._nki_sbuf_shapes[pred_name] = list(mask_shape)
+        device_fn._nki_sbuf_dtypes[pred_name] = "nl.uint32"
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{pred_name} = nl.ndarray([{mask_shape_str}], nl.uint32, buffer=nl.sbuf)"
+            )
+        )
+        state.codegen.add_statement(
+            statement_from_string(f"nisa.tensor_copy(dst={pred_name}, src={mask_name})")
+        )
+        state.codegen.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy_predicated(dst={masked_name}, src={sbuf_name}, predicate={pred_name})"
+            )
+        )
+        sbuf_name = masked_name
+
     return expr_from_string(sbuf_name)
 
 

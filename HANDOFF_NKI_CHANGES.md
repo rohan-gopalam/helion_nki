@@ -10,6 +10,77 @@ All edits target the NKI backend only. Triton and other backends are unchanged u
 
 ---
 
+## 2026-05-05 Dynamic Loop Status
+
+Dynamic `hl.tile(..., tensor_bound, ...)` loops now lower to NKI `nl.dynamic_range`
+and have focused runtime coverage on Trainium2.
+
+Verified:
+- Tensor-valued loop stops are loaded into an NKI register with `nisa.register_load`.
+- Dynamic loop offsets are tracked with SBUF counters for `.ap(scalar_offset=...)`.
+- Tile indices inside dynamic loops are materialized with `nisa.iota(offset=0)` plus
+  a float counter tile, avoiding NKI's static-offset restriction.
+- Dynamic loads/stores work for both partition-dimension and free-dimension AP
+  offsets.
+- Loop-carried accumulators update the outer SBUF buffer in place, so reductions
+  after `nl.dynamic_range` no longer reference a buffer allocated inside the
+  dynamic loop body.
+- `hl.load(..., extra_mask=...)` has an NKI masked-load path using
+  `nisa.tensor_copy_predicated` for non tile-list loads.
+
+Focused test:
+
+```bash
+PATH=/opt/aws_neuronx_venv_pytorch_2_9/bin:$PATH \
+PYTHONPATH=/home/ubuntu/helion/helion_nki \
+HELION_BACKEND=nki \
+NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+TORCHINDUCTOR_CACHE_DIR=/tmp/helion_nki_dynloops_cache8 \
+/opt/aws_neuronx_venv_pytorch_2_9/bin/python -m pytest -q \
+  test/test_nki_dynamic_loops.py -x -s
+```
+
+Result: `4 passed, 6 warnings` on 2026-05-05.
+
+Full-suite check after installing the missing dev test dependencies into the
+active Neuron venv (`expecttest`, `hypothesis`, `pytest-timeout`):
+
+```bash
+PATH=/opt/aws_neuronx_venv_pytorch_2_9/bin:$PATH \
+PYTHONPATH=/home/ubuntu/helion/helion_nki \
+HELION_BACKEND=nki \
+NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+TORCHINDUCTOR_CACHE_DIR=/tmp/helion_nki_fullsuite_after_deps_cache \
+/opt/aws_neuronx_venv_pytorch_2_9/bin/python -m pytest -ra --tb=short \
+  --junitxml=/tmp/helion_nki_full_pytest_after_deps.xml test
+```
+
+Result on 2026-05-05: `22 passed, 1164 skipped, 6 warnings`.
+No failures, no collection errors, and no NVIDIA/CUDA-only failures were observed
+in the NKI full-suite run.
+
+Coverage caveat: only `test/test_nki_dynamic_loops.py` is explicitly NKI-enabled
+(`4` tests). The other `18` passing tests are backend-independent utility checks
+from `test/test_aot_autotuning.py` and `test/test_codegen_comments.py`; they do
+not exercise NKI code generation or Trainium execution. Most of the historical
+Helion suite is still intentionally skipped under `HELION_BACKEND=nki`.
+
+Current direct jagged-lowering status:
+- The jagged dense-add path reaches `nl.dynamic_range`, vector-offset gather, and
+  predicated masked loads.
+- `examples/jagged_dense_add.py` was adjusted to prefill `out` from `y` before the
+  dynamic loop instead of using `hl.tile(max_nnz, out.size(1))`; NKI ranges do not
+  accept a tensor-valued start.
+- Remaining blocker: `max_nnz = nnz.amax()` over the per-row int32 length tile is
+  still lowered through `nisa.tensor_partition_reduce`, which neuronx-cc rejects
+  with `NCC_IXCG864 ISA check failed`. This is separate from dynamic-loop lowering;
+  the reduction layout/dtype selection for logical 1D tiles needs another pass.
+
+Tooling note: `ruff` was not available in this environment, so touched files were
+checked with `python -m py_compile` and `git diff --check`.
+
+---
+
 ### 1.1 `helion/_compiler/backend.py`
 
 **NKIBackend / NKIOpOverrides**

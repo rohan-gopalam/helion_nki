@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import copy
 import dataclasses
 import functools
 import inspect
@@ -497,6 +498,53 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             parts.append(f"index_dtype={settings.index_dtype}")
         return f"@helion.kernel({', '.join(parts)})"
 
+    def _complete_nki_partial_config(self, config: Config) -> None:
+        if self.env.backend.name != "nki":
+            return
+        block_sizes = config.config.get("block_sizes")
+        if block_sizes is None:
+            return
+
+        def _flatten(values: object) -> list[object]:
+            if isinstance(values, (list, tuple)):
+                result: list[object] = []
+                for value in values:
+                    result.extend(_flatten(value))
+                return result
+            return [values]
+
+        values = _flatten(block_sizes)
+        expected = len(self.env.config_spec.block_sizes)
+        if not values or len(values) >= expected:
+            return
+        default_block_sizes = self.env.config_spec.default_config().config.get(
+            "block_sizes", []
+        )
+        if not isinstance(default_block_sizes, list) or len(default_block_sizes) < expected:
+            return
+        safe_defaults = list(default_block_sizes)
+        for i, spec in enumerate(self.env.config_spec.block_sizes):
+            if i >= len(safe_defaults):
+                break
+            if i == 0:
+                continue
+            size_hint = int(max(spec.size_hint, 1))
+            safe = min(int(safe_defaults[i]), 128)
+            while safe > 1 and size_hint % safe != 0:
+                safe //= 2
+            safe_defaults[i] = max(safe, 1)
+        config.config["block_sizes"] = [
+            *values,
+            *safe_defaults[len(values) : expected],
+        ]
+
+    @staticmethod
+    def _clone_config(config: Config) -> Config:
+        return Config(
+            platform_target=config.platform_target,
+            **copy.deepcopy(config.config),
+        )
+
     def to_triton_code(
         self,
         config: ConfigLike | None = None,
@@ -520,6 +568,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if not isinstance(config, Config):
                 # pyrefly: ignore [bad-argument-type]
                 config = Config(**config)
+            else:
+                config = self._clone_config(config)
+            self._complete_nki_partial_config(config)
             self.env.config_spec.normalize(config)
             with measure("BoundKernel.generate_ast"):
                 # pyrefly: ignore [bad-argument-type]
@@ -551,6 +602,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # pyrefly: ignore [bad-argument-type]
                 **config
             )
+        else:
+            config = self._clone_config(config)
+        self._complete_nki_partial_config(config)
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
         if (

@@ -868,6 +868,14 @@ def run_example(
     baselines = (
         baseline_fn if isinstance(baseline_fn, dict) else {baseline_name: baseline_fn}
     )
+    if _get_backend() == "nki" and isinstance(baseline_fn, dict):
+        for preferred in ("pytorch", "torch"):
+            if preferred in baselines:
+                baselines = {
+                    preferred: baselines[preferred],
+                    **{k: v for k, v in baselines.items() if k != preferred},
+                }
+                break
 
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))

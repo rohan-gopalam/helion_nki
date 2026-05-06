@@ -23,7 +23,7 @@ import helion.language as hl
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[128, 128, 128]),
+    config=helion.Config(block_sizes=[128, 128, 256]),
     static_shapes=True,
 )
 def _bf16xint16_gemm(x: Tensor, w: Tensor) -> Tensor:
@@ -51,7 +51,7 @@ def _bf16xint16_gemm(x: Tensor, w: Tensor) -> Tensor:
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[128, 128, 128]),
+    config=helion.Config(block_sizes=[128, 128, 256]),
     static_shapes=True,
 )
 def _int16xbf16_gemm(x: Tensor, w: Tensor) -> Tensor:

@@ -1202,13 +1202,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 # dim once. In practice this case is rare and the above
                 # loop handles it.
                 if block_sizes != _orig_block_sizes:
-                    import sys as _sys
-                    print(
-                        f"[helion-nki] auto-clamped block_sizes "
-                        f"{_orig_block_sizes} → {block_sizes} "
-                        f"(NKI partition ≤ {_NKI_PMAX})",
-                        file=_sys.stderr,
-                    )
                     # Propagate the clamp into state.config so any code
                     # that re-derives the block size via
                     # env.block_sizes[bid].from_config_assert(state.config)
@@ -1427,7 +1420,17 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     bnd_reg = state.device_function.new_var("_dyn_bnd_reg")
                     counter_var = state.device_function.new_var("_dyn_counter")
                     counter_float_var = state.device_function.new_var("_dyn_counter_f")
-                    if end_expr_str in state.device_function._nki_sbuf_shapes:
+                    def _nki_has_sbuf_shape(name: str) -> bool:
+                        if name in state.device_function._nki_sbuf_shapes:
+                            return True
+                        lookup = name
+                        while "_copy" in lookup:
+                            lookup = lookup[: lookup.rfind("_copy")]
+                            if lookup in state.device_function._nki_sbuf_shapes:
+                                return True
+                        return False
+
+                    if _nki_has_sbuf_shape(end_expr_str):
                         bnd_sbuf = end_expr_str
                     else:
                         bnd_sbuf = state.device_function.new_var("_dyn_bnd_sbuf")

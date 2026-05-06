@@ -246,6 +246,23 @@ def codegen_full_nki(ctx: LoweringContext, node: Node) -> ast.AST:
                     t_name = str(getattr(u.target, "__name__", u.target)).lower()
                     for key in _binary_op_names:
                         if key in t_name:
+                            # Keep [1, N] row-major when the downstream op
+                            # itself remains [1, N]. Partition-axis NKI
+                            # reductions feed row tiles, and transposing the
+                            # accumulator to [N, 1] turns elementwise updates
+                            # into accidental [N, N] broadcasts.
+                            val = u.meta.get("val")
+                            if isinstance(val, torch.Tensor):
+                                try:
+                                    u_shape = [_resolve_dim(d) for d in val.shape]
+                                except (TypeError, ValueError):
+                                    u_shape = []
+                                if (
+                                    len(u_shape) == 2
+                                    and u_shape[0] == 1
+                                    and u_shape[1] == _n
+                                ):
+                                    break
                             # Look for a same-[N] other operand or a
                             # reduction result in the chain. This also
                             # covers m_i = m_ij pattern where the binary
@@ -1275,7 +1292,7 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
             k_body.append(
                 statement_from_string(
                     f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
-                    f"moving={_rhs_ref(0, n_expr)})"
+                    f"moving={_rhs_ref(sub_k_var, n_expr)})"
                 ),
             )
             state.add_statement(

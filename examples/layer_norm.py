@@ -21,7 +21,11 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128]),
+)
 def layer_norm_fwd(
     x: torch.Tensor,
     normalized_shape: list[int],
@@ -82,7 +86,11 @@ def layer_norm_fwd(
 
 
 # %%
-@helion.kernel
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128]),
+)
 def layer_norm_bwd(
     grad_out: torch.Tensor,
     x: torch.Tensor,

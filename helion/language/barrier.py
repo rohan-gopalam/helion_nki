@@ -51,6 +51,13 @@ def _(state: CodegenState) -> object:
     return expr_from_string("None")
 
 
+@_decorators.codegen(barrier, "nki")
+def _(state: CodegenState) -> object:
+    # NKI lowering currently emits a single kernel with sequential top-level
+    # phases, so the barrier is represented by the host/device loop ordering.
+    return expr_from_string("None")
+
+
 @_decorators.ref(barrier)
 def _() -> None:
     # No-op in ref/interpret mode

@@ -168,8 +168,8 @@ sudo systemctl restart neuron-rtd 2>/dev/null
 │   │       └── matmul_ops.py            # MODIFIED — codegen(dot, "nki")
 │   ├── examples/
 │   │   ├── layer_norm.py                # *** MODIFIED — dim=8192, inner block_size=1
-│   │   ├── EXAMPLES_NKI_STATUS.md       # Status tracking for all NKI examples
 │   │   └── run_nki_examples.py          # Suite runner
+│   ├── examples-progress.md             # Current status tracking for NKI examples
 │   └── HANDOFF_NKI_CHANGES.md           # Previous handoff doc (less detailed)
 ├── debug_layer_norm.py                  # Manual NKI forward kernel test script
 ├── debug_layer_norm_bwd.py              # Manual NKI backward kernel test script
@@ -206,8 +206,9 @@ Likely suspects:
 
 ### Other Examples
 
-See `helion_nki/examples/EXAMPLES_NKI_STATUS.md` for full status. Key validated examples:
-- add, sum, exp, matmul, batch_softmax, softmax_decomposed, swiglu, broadcast_matmul
+See `helion_nki/examples-progress.md` for the current status. It replaced the
+stale `examples/EXAMPLES_NKI_STATUS.md` tracker and is the authoritative ledger
+for examples that have lowered through NKI and passed runtime checks.
 
 ---
 
@@ -697,7 +698,7 @@ Run the debug scripts (`debug_layer_norm.py`, `debug_layer_norm_bwd.py`) to veri
 
 5. **Investigate loop variable aliasing**: The generated kernel has lines like `_nki_cast_copy = _nki_cast` and `_nki_full_copy = _nki_full` inside `sequential_range`. These are Python variable aliases — NKI likely treats them as the same SBUF pointer. If the loop is unrolled differently in the NKI compiler this could cause correctness issues.
 
-6. **Port more examples**: See `EXAMPLES_NKI_STATUS.md` for priorities:
+6. **Port more examples**: See `examples-progress.md` for priorities:
    - rms_norm (needs mean reduction — now supported)
    - layer_norm_f32 (same pattern, fp32 inputs)
    - cross_entropy, kl_div, jsd (need indexing, log-space ops)

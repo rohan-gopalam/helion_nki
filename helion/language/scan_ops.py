@@ -348,6 +348,202 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     return scan_expr
 
 
+@_decorators.codegen(_associative_scan, "nki")
+def _(state: CodegenState) -> ast.AST | list[ast.AST]:
+    """Narrow NKI lowering for segmented prefix-sum tuple scans.
+
+    This covers the pattern used by ``examples/segment_reduction.py``:
+    ``(values, indices)`` scanned over the partition axis with a combine
+    function equivalent to ``where(left_idx == right_idx, left_val + right_val,
+    right_val), right_idx``.
+    """
+
+    from .._compiler.ast_extension import create
+    from .._compiler.ast_extension import expr_from_string
+    from .._compiler.ast_extension import statement_from_string
+    from .._compiler.compile_environment import CompileEnvironment
+
+    dim = state.proxy_arg(2)
+    reverse = state.proxy_arg(3)
+    is_tuple_input = state.proxy_arg(4)
+    if dim != 0 or reverse or not is_tuple_input:
+        raise exc.BackendUnsupported(
+            "nki",
+            "associative_scan only supports forward tuple scans over dim=0",
+        )
+
+    raw_input = state.ast_args[1]
+    if not isinstance(raw_input, (tuple, list)) or len(raw_input) != 2:
+        raise exc.BackendUnsupported(
+            "nki",
+            "associative_scan NKI lowering expects a 2-tensor tuple input",
+        )
+    values_ast, indices_ast = raw_input
+    if not isinstance(values_ast, ast.AST) or not isinstance(indices_ast, ast.AST):
+        raise exc.BackendUnsupported(
+            "nki",
+            "associative_scan NKI lowering expects AST tensor inputs",
+        )
+
+    env = CompileEnvironment.current()
+    dev_fn = state.device_function
+    values_name = ast.unparse(values_ast)
+    indices_name = ast.unparse(indices_ast)
+
+    def _lookup_shape(name: str) -> list[int] | None:
+        shape = dev_fn._nki_sbuf_shapes.get(name)
+        if shape is not None:
+            return shape
+        lookup = name
+        while "_copy" in lookup:
+            lookup = lookup[: lookup.rfind("_copy")]
+            shape = dev_fn._nki_sbuf_shapes.get(lookup)
+            if shape is not None:
+                return shape
+        return None
+
+    def _lookup_dtype(name: str, default: str) -> str:
+        dtype = dev_fn._nki_sbuf_dtypes.get(name)
+        if dtype is not None:
+            return dtype
+        lookup = name
+        while "_copy" in lookup:
+            lookup = lookup[: lookup.rfind("_copy")]
+            dtype = dev_fn._nki_sbuf_dtypes.get(lookup)
+            if dtype is not None:
+                return dtype
+        return default
+
+    value_shape = _lookup_shape(values_name)
+    index_shape = _lookup_shape(indices_name)
+    if (
+        value_shape is None
+        or index_shape is None
+        or len(value_shape) != 2
+        or len(index_shape) != 2
+        or value_shape != index_shape
+    ):
+        raise exc.BackendUnsupported(
+            "nki",
+            "associative_scan segmented lowering requires matching 2D SBUF inputs",
+        )
+    p_count, f_count = value_shape
+    if p_count < 1 or f_count < 1:
+        raise exc.BackendUnsupported(
+            "nki", "associative_scan segmented lowering requires non-empty tiles"
+        )
+
+    value_dtype = _lookup_dtype(values_name, "nl.float32")
+    index_dtype = _lookup_dtype(indices_name, "nl.float32")
+    out = dev_fn.new_var("_nki_assoc_scan", dce=True)
+    carry = dev_fn.new_var("_nki_assoc_carry", dce=True)
+    prev_idx = dev_fn.new_var("_nki_assoc_prev_idx", dce=True)
+    same = dev_fn.new_var("_nki_assoc_same", dce=True)
+    summed = dev_fn.new_var("_nki_assoc_sum", dce=True)
+    pred = dev_fn.new_var("_nki_assoc_pred", dce=True)
+
+    dev_fn._nki_sbuf_shapes[out] = [p_count, f_count]
+    dev_fn._nki_sbuf_dtypes[out] = value_dtype
+    dev_fn._nki_sbuf_shapes[carry] = [1, f_count]
+    dev_fn._nki_sbuf_dtypes[carry] = value_dtype
+    dev_fn._nki_sbuf_shapes[prev_idx] = [1, f_count]
+    dev_fn._nki_sbuf_dtypes[prev_idx] = index_dtype
+    dev_fn._nki_sbuf_shapes[same] = [1, f_count]
+    dev_fn._nki_sbuf_dtypes[same] = "nl.int32"
+    dev_fn._nki_sbuf_shapes[summed] = [1, f_count]
+    dev_fn._nki_sbuf_dtypes[summed] = value_dtype
+    dev_fn._nki_sbuf_shapes[pred] = [1, f_count]
+    dev_fn._nki_sbuf_dtypes[pred] = "nl.uint32"
+
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{out} = nl.ndarray([{p_count}, {f_count}], {value_dtype}, buffer=nl.sbuf)"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{carry} = nl.ndarray([1, {f_count}], {value_dtype}, buffer=nl.sbuf)"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{prev_idx} = nl.ndarray([1, {f_count}], {index_dtype}, buffer=nl.sbuf)"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{same} = nl.ndarray([1, {f_count}], nl.int32, buffer=nl.sbuf)"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{summed} = nl.ndarray([1, {f_count}], {value_dtype}, buffer=nl.sbuf)"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{pred} = nl.ndarray([1, {f_count}], nl.uint32, buffer=nl.sbuf)"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"nisa.tensor_copy(dst={carry}, src={values_name}[0:1, 0:{f_count}])"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"nisa.tensor_copy(dst={prev_idx}, src={indices_name}[0:1, 0:{f_count}])"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"nisa.tensor_copy(dst={out}[0:1, 0:{f_count}], src={carry})"
+        )
+    )
+
+    if p_count > 1:
+        scan_i = dev_fn.new_var("_scan_i")
+        body = [
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={same}, "
+                f"data1={indices_name}[{scan_i}:{scan_i}+1, 0:{f_count}], "
+                f"data2={prev_idx}, op=nl.equal)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={summed}, data1={carry}, "
+                f"data2={values_name}[{scan_i}:{scan_i}+1, 0:{f_count}], op=nl.add)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_copy(dst={carry}, "
+                f"src={values_name}[{scan_i}:{scan_i}+1, 0:{f_count}])"
+            ),
+            statement_from_string(f"nisa.tensor_copy(dst={pred}, src={same})"),
+            statement_from_string(
+                f"nisa.tensor_copy_predicated(dst={carry}, src={summed}, "
+                f"predicate={pred})"
+            ),
+            statement_from_string(
+                f"nisa.tensor_copy(dst={out}[{scan_i}:{scan_i}+1, 0:{f_count}], "
+                f"src={carry})"
+            ),
+            statement_from_string(
+                f"nisa.tensor_copy(dst={prev_idx}, "
+                f"src={indices_name}[{scan_i}:{scan_i}+1, 0:{f_count}])"
+            ),
+        ]
+        state.codegen.add_statement(
+            create(
+                ast.For,
+                target=create(ast.Name, id=scan_i, ctx=ast.Store()),
+                iter=expr_from_string(f"nl.affine_range(1, {p_count}, 1)"),
+                body=body,
+                orelse=[],
+            )
+        )
+
+    return [expr_from_string(out), expr_from_string(indices_name)]
+
+
 def _get_input_tensor_ast(state: CodegenState, is_tuple_input: bool) -> ast.AST:
     """Get the input tensor AST, handling tuple inputs specially."""
     if not is_tuple_input:

@@ -207,6 +207,19 @@ def _full_codegen(state: CodegenState) -> ast.AST:
                                             vs.append(-1)
                                 else:
                                     vs.append(-1)
+                            # If the reduction result is already the same
+                            # logical row tile as this accumulator ([1, N]),
+                            # keep the accumulator row-major.  Partition-axis
+                            # NKI reductions produce exactly this layout; the
+                            # old blanket transpose to [N, 1] caused later
+                            # binary ops to over-broadcast [N, 1] x [1, N].
+                            if (
+                                len(vs) == 2
+                                and resolved[0] == 1
+                                and vs[0] == 1
+                                and vs[1] == resolved[1]
+                            ):
+                                continue
                             if resolved[1] in vs:
                                 transpose = True
                                 break

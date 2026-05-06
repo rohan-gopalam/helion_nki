@@ -507,8 +507,6 @@ class LoopedReductionStrategy(ReductionStrategy):
                             # to avoid using the hint (which may differ from
                             # the actual configured block size)
                             part_size_sym = fake_input.size(0)
-                            import sys
-                            print(f"[REDUCE_DBG] input={input_name} fake_input.shape={list(fake_input.shape)} part_size_sym={part_size_sym} type={type(part_size_sym).__name__} sbuf_shapes_has={input_name in (device_fn._nki_sbuf_shapes if device_fn else {})}", file=sys.stderr)
                             if isinstance(part_size_sym, torch.SymInt):
                                 import sympy as _sympy
                                 _bs_subs: dict[_sympy.Symbol, int] = {}

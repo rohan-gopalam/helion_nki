@@ -59,6 +59,20 @@ Result on 2026-05-05: `22 passed, 1164 skipped, 6 warnings`.
 No failures, no collection errors, and no NVIDIA/CUDA-only failures were observed
 in the NKI full-suite run.
 
+Latest full-suite recheck after the example/lowering updates below:
+
+```bash
+PATH=/opt/aws_neuronx_venv_pytorch_2_9/bin:$PATH \
+PYTHONPATH=/home/ubuntu/helion/helion_nki \
+HELION_BACKEND=nki \
+NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+TORCHINDUCTOR_CACHE_DIR=/tmp/helion_nki_full_pytest_after_examples \
+/opt/aws_neuronx_venv_pytorch_2_9/bin/python -m pytest -ra --tb=short \
+  --junitxml=/tmp/helion_nki_full_pytest_after_examples.xml test
+```
+
+Result on 2026-05-05: `22 passed, 1164 skipped, 6 warnings`.
+
 Coverage caveat: only `test/test_nki_dynamic_loops.py` is explicitly NKI-enabled
 (`4` tests). The other `18` passing tests are backend-independent utility checks
 from `test/test_aot_autotuning.py` and `test/test_codegen_comments.py`; they do
@@ -78,6 +92,40 @@ Current direct jagged-lowering status:
 
 Tooling note: `ruff` was not available in this environment, so touched files were
 checked with `python -m py_compile` and `git diff --check`.
+
+Example-run status after row-gather/scatter and backend-forcing work:
+- `examples/run_nki_examples.py` was run serially with `HELION_BACKEND=nki`,
+  `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`, and
+  `TORCHINDUCTOR_CACHE_DIR=/tmp/helion_nki_examples_after_gather`.
+- Passing canonical examples include: `add.py`, `attention.py`,
+  `batch_softmax.py`, `bmm.py`, `broadcast_matmul.py`, `concatenate.py`,
+  `embedding.py`, `exp.py`, `geglu.py`, `jsd.py`, `kl_div.py`,
+  `layer_norm_f32.py`, `long_sum.py`, `matmul.py`, `matmul_layernorm.py`,
+  `psum_reuse_minimal.py`, `psum_reuse_test.py`, `rms_norm.py`, `softmax.py`,
+  `softmax_decomposed.py`, `squeeze_and_excitation_net.py`, `sum.py`,
+  `swiglu.py`, and `welford.py` (plus quiet zero-output examples
+  `aot_example.py` and `blackwell_attention.py`).
+- Remaining runner failures are tracked in
+  `examples-progress.md`. The major buckets are indexed/free-dim DMA
+  shape gaps, jagged reduction/broadcast layout, quantized `torch.stack` unpack
+  paths, NKI RNG/barrier/Triton benchmark infrastructure, and a few neuronx-cc
+  internal errors.
+
+Additional NKI lowering changes made during this pass:
+- Row gather syntax like `weight[indices, tile_e]` now lowers to
+  `tensor.ap(pattern=[[F, P], [1, tile]], offset=tile_start,
+  vector_offset=indices_p1, indirect_dim=0)`.
+- Row scatter for `out[rows, tile_n] = value` uses the matching AP
+  `vector_offset` destination pattern.
+- NKI loop index SBUF variables are registered with shape/dtype metadata so
+  later memory lowering can recognize `indices_*` and their copy variables.
+- Scalar-like LHS tensor arithmetic (for example `start + tile.index`) uses the
+  tensor-scalar path, and integer SBUF scalar operands are cast to float32 before
+  `nisa.tensor_scalar` to satisfy NKI verifier rules.
+- Non-list RHS matmul K-subtile loops now pass the loop variable into `_rhs_ref`
+  instead of hardcoding K sub-tile 0.
+- Mean reduction scaling over squeezed 3D+ SBUF shapes now uses the logical
+  reduction dimension, not the post-squeeze NKI axis.
 
 ---
 

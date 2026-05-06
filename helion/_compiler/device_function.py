@@ -265,6 +265,11 @@ class DeviceFunction:
         self._variable_renames: dict[str, list[str]] = {}
         self._nki_tile_lists: dict[str, list[str]] = {}  # var → [var_0, var_1, ...]
         self._nki_sbuf_shapes: dict[str, list[int]] = {}  # var → [p, f]
+        # Loop-index SBUF tiles are generated from a scalar offset plus iota.
+        # Keep the scalar origin so index arithmetic such as ``tile.index % S``
+        # can lower to NKI tensor ops even when S is a lifted local variable.
+        self._nki_iota_offsets: dict[str, str] = {}
+        self._nki_iota_block_sizes: dict[str, str] = {}
         # Names of kernel parameters that are Python scalars (float, int,
         # bool) — used by NKIOpOverrides to route binary ops to
         # tensor_scalar instead of tensor_tensor when the operand is a
@@ -279,6 +284,10 @@ class DeviceFunction:
         # was DMA-loaded from, so partition-broadcast codegen can re-DMA with
         # a per-partition layout instead of tiling the existing SBUF tile.
         self._nki_hbm_sources: dict[str, str] = {}
+        # Host tensor argument dtype overrides needed by NKI lowering. This is
+        # used when an HBM dtype has broken/unsupported DMA semantics but the
+        # Helion program immediately casts the value before computation.
+        self._nki_host_arg_casts: dict[str, str] = {}
         # Loop-carry buffers that must not be modified in-place inside nested
         # device loops.
         self._nki_protected_vars: set[str] = set()
@@ -564,8 +573,13 @@ class DeviceFunction:
     def tensor_arg(
         self, fake_value: torch.Tensor, prefer_name: str | None = None
     ) -> TensorArg:
+        host_function = HostFunction.current()
+        if fake_value not in host_function.tensor_to_origin:
+            origin = self._recover_captured_tensor_origin(fake_value, host_function)
+            if origin is not None:
+                host_function.tensor_to_origin[fake_value] = origin
         if fake_value not in self._tensor_args:
-            origin = HostFunction.current().tensor_to_origin[fake_value]
+            origin = host_function.tensor_to_origin[fake_value]
             arg = TensorArg(
                 self.new_var(prefer_name or origin.suggest_var_name()),
                 fake_value,
@@ -574,6 +588,37 @@ class DeviceFunction:
             self.arguments.append(arg)
             self._tensor_args[fake_value] = arg
         return self._tensor_args[fake_value]
+
+    @staticmethod
+    def _recover_captured_tensor_origin(
+        fake_value: torch.Tensor,
+        host_function: HostFunction,
+    ) -> Origin | None:
+        """Recover origins for tensors captured by helper function closures.
+
+        Dynamo can represent a captured tensor inside a nested helper graph as an
+        ``aten.empty_strided`` constant. That produces a tensor with matching
+        metadata but no direct entry in ``tensor_to_origin``. Restrict recovery
+        to renamed origins (globals/closures), so ordinary kernel parameters
+        continue to use the explicit ``host_tensor`` path.
+        """
+
+        candidates: dict[str, Origin] = {}
+        fake_shape = tuple(fake_value.size())
+        fake_stride = tuple(fake_value.stride())
+        for known_tensor, origin in host_function.tensor_to_origin.items():
+            if not origin.needs_rename():
+                continue
+            if known_tensor.dtype != fake_value.dtype:
+                continue
+            if tuple(known_tensor.size()) != fake_shape:
+                continue
+            if tuple(known_tensor.stride()) != fake_stride:
+                continue
+            candidates[origin.host_str()] = origin
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        return None
 
     def tensor_descriptor_arg(
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
@@ -742,6 +787,18 @@ class DeviceFunction:
         self.arguments.sort(key=lambda arg: arg.sort_key())
         return self.arguments
 
+    def _register_nki_dynamic_tensor_size_args(self) -> None:
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki" or env.settings.static_shapes:
+            return
+        for arg in list(self.arguments):
+            if isinstance(arg, TensorArg):
+                for dim, size in enumerate(arg.fake_value.size()):
+                    if isinstance(size, torch.SymInt):
+                        expr = env.shape_env.simplify(size._sympy_())
+                        if expr.free_symbols:
+                            self.tensor_size(arg.fake_value, dim)
+
     def _nki_return_statements(self) -> list[ast.stmt]:
         """Generate return statement(s) for NKI kernel with one or more output buffers."""
         bufs = getattr(self, "_nki_return_buffers", None)
@@ -755,6 +812,106 @@ class DeviceFunction:
             return [statement_from_string(f"return {buf_names[0]}")]
         return [statement_from_string(f"return ({', '.join(buf_names)})")]
 
+    @staticmethod
+    def _is_nki_sbuf_allocation(stmt: ast.stmt) -> str | None:
+        if (
+            not isinstance(stmt, ast.Assign)
+            or len(stmt.targets) != 1
+            or not isinstance(stmt.targets[0], ast.Name)
+            or not isinstance(stmt.value, ast.Call)
+            or not isinstance(stmt.value.func, ast.Attribute)
+            or not isinstance(stmt.value.func.value, ast.Name)
+            or stmt.value.func.value.id != "nl"
+            or stmt.value.func.attr != "ndarray"
+        ):
+            return None
+        for keyword in stmt.value.keywords:
+            if (
+                keyword.arg == "buffer"
+                and isinstance(keyword.value, ast.Attribute)
+                and isinstance(keyword.value.value, ast.Name)
+                and keyword.value.value.id == "nl"
+                and keyword.value.attr == "sbuf"
+            ):
+                return stmt.targets[0].id
+        return None
+
+    def _should_rewrite_nki_sbuf_reassign(
+        self,
+        target: str,
+        source: str,
+        visible_allocs: dict[str, int],
+        depth: int,
+    ) -> bool:
+        if target == source or not target.startswith("_nki") or "_copy" in target:
+            return False
+        target_depth = visible_allocs.get(target)
+        source_depth = visible_allocs.get(source)
+        if target_depth is None or source_depth is None:
+            return False
+        if target_depth > depth or source_depth > depth:
+            return False
+        target_shape = self._nki_sbuf_shapes.get(target)
+        source_shape = self._nki_sbuf_shapes.get(source)
+        if target_shape is None or source_shape is None or target_shape != source_shape:
+            return False
+        target_dtype = self._nki_sbuf_dtypes.get(target)
+        source_dtype = self._nki_sbuf_dtypes.get(source)
+        return not (
+            target_dtype is not None
+            and source_dtype is not None
+            and target_dtype != source_dtype
+        )
+
+    def _rewrite_nki_sbuf_reassignments(
+        self, statements: list[ast.stmt], visible_allocs: dict[str, int], depth: int
+    ) -> None:
+        index = 0
+        while index < len(statements):
+            stmt = statements[index]
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Name)
+                and self._should_rewrite_nki_sbuf_reassign(
+                    stmt.targets[0].id, stmt.value.id, visible_allocs, depth
+                )
+            ):
+                statements[index] = statement_from_string(
+                    f"nisa.tensor_copy(dst={stmt.targets[0].id}, src={stmt.value.id})"
+                )
+                index += 1
+                continue
+
+            if allocated := self._is_nki_sbuf_allocation(stmt):
+                existing_depth = visible_allocs.get(allocated)
+                if (
+                    existing_depth is not None
+                    and existing_depth < depth
+                    and allocated in self._nki_sbuf_shapes
+                    and "_copy" not in allocated
+                ):
+                    del statements[index]
+                    continue
+                visible_allocs[allocated] = depth
+
+            if isinstance(stmt, (ast.For, ast.While)):
+                self._rewrite_nki_sbuf_reassignments(
+                    stmt.body, visible_allocs.copy(), depth + 1
+                )
+                self._rewrite_nki_sbuf_reassignments(
+                    stmt.orelse, visible_allocs.copy(), depth + 1
+                )
+            elif isinstance(stmt, ast.If):
+                self._rewrite_nki_sbuf_reassignments(
+                    stmt.body, visible_allocs.copy(), depth + 1
+                )
+                self._rewrite_nki_sbuf_reassignments(
+                    stmt.orelse, visible_allocs.copy(), depth + 1
+                )
+            index += 1
+
     def codegen_function_def(self) -> list[ast.stmt]:
         prefix = []
         if self._tensor_descriptor_args:
@@ -762,7 +919,10 @@ class DeviceFunction:
                 statement_from_string("helion.runtime.set_triton_allocator()")
             )
 
-        backend = CompileEnvironment.current().backend
+        env = CompileEnvironment.current()
+        backend = env.backend
+        self._register_nki_dynamic_tensor_size_args()
+
         sorted_arguments = self.sorted_args()
 
         # Separate constexpr args: inline those with known literal values at
@@ -803,22 +963,15 @@ class DeviceFunction:
 
         tensor_shape_preamble: list[ast.AST] = []
         if backend.name == "nki":
-            env = CompileEnvironment.current()
-            # Normalize tensor argument views at kernel entry to the compile-time
-            # shape expected by codegen. This keeps raw NKI kernel invocation
-            # compatible with equivalent higher-rank view inputs.
-            def _nki_shape_part(s: object) -> str:
-                # Emit compile-time-known ints where possible. NKI requires
-                # concrete shape literals in ndarray allocations / reshapes;
-                # symbolic shape names (e.g. 'group_offsets_size_0') aren't
-                # defined inside the @nki.jit kernel.
+            # Normalize tensor argument views at kernel entry to the 2D logical
+            # shape expected by codegen. Dynamic kernels use lifted tensor-size
+            # arguments here so one bound kernel can cover multiple input sizes.
+            def _nki_shape_part(arg: TensorArg, dim: int, s: object) -> str:
                 if isinstance(s, int):
                     return str(s)
                 if isinstance(s, torch.SymInt):
-                    try:
-                        return str(env.size_hint(s))
-                    except Exception:
-                        pass
+                    size_arg = self.tensor_size(arg.fake_value, dim)
+                    return size_arg.name
                 return self.literal_expr(s)
 
             # Collect names of non-tensor scalar parameters (e.g.
@@ -837,7 +990,10 @@ class DeviceFunction:
                     # default_nki_launcher) and also in _to_fake_tensor so
                     # the traced kernel is declared with int32. No in-kernel
                     # cast needed here.
-                    shape_parts = [_nki_shape_part(s) for s in arg.fake_value.size()]
+                    shape_parts = [
+                        _nki_shape_part(arg, dim, s)
+                        for dim, s in enumerate(arg.fake_value.size())
+                    ]
                     if arg.fake_value.dim() == 1:
                         # Reshape [N] → [1, N] so the large dimension is the
                         # free axis.  This avoids tile-list fragmentation for
@@ -859,32 +1015,37 @@ class DeviceFunction:
                         )
                     )
 
+        fn_def = ast_rename(
+            create(
+                ast.FunctionDef,
+                name=self.name,
+                args=create_arguments(args),
+                body=[
+                    *scalar_preamble,
+                    *tensor_shape_preamble,
+                    *self.preamble,
+                    *self.body,
+                    *self._nki_return_statements(),
+                ],
+                decorator_list=[expr_from_string(backend.function_decorator)]
+                if backend.function_decorator
+                else [],
+                type_params=[],
+            ),
+            {k: v[0] for k, v in self._variable_renames.items()},
+        )
+        if backend.name == "nki":
+            self._rewrite_nki_sbuf_reassignments(fn_def.body, {}, 0)
+
         return [
             *prefix,
-            ast_rename(
-                create(
-                    ast.FunctionDef,
-                    name=self.name,
-                    args=create_arguments(args),
-                    body=[
-                        *scalar_preamble,
-                        *tensor_shape_preamble,
-                        *self.preamble,
-                        *self.body,
-                        *self._nki_return_statements(),
-                    ],
-                    decorator_list=[expr_from_string(backend.function_decorator)]
-                    if backend.function_decorator
-                    else [],
-                    type_params=[],
-                ),
-                {k: v[0] for k, v in self._variable_renames.items()},
-            ),
+            fn_def,
         ]
 
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
         backend = env.backend
+        self._register_nki_dynamic_tensor_size_args()
 
         args: list[str] = []
         tensor_host_args: list[str] = []

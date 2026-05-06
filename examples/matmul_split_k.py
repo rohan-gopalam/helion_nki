@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[128, 128, 128]),
+    config=helion.Config(block_sizes=[1, 64, 128], split_k=8),
     static_shapes=True,
 )
 def matmul_split_k(

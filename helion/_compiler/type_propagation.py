@@ -543,7 +543,15 @@ class TensorType(TypeInfo):
             if isinstance(value, TensorType):
                 rhs_rank = value.fake_value.ndim
                 # Allow scalar tensors (rank 0) to be assigned to any rank (broadcasts)
-                if rhs_rank != 0 and lhs_rank != rhs_rank:
+                allow_trailing_singletons = (
+                    CompileEnvironment.current().backend.name == "nki"
+                )
+                rhs_trailing_singletons = (
+                    allow_trailing_singletons
+                    and rhs_rank > lhs_rank
+                    and all(dim == 1 for dim in value.fake_value.shape[lhs_rank:])
+                )
+                if rhs_rank != 0 and lhs_rank != rhs_rank and not rhs_trailing_singletons:
                     raise exc.RankMismatch(
                         lhs_rank,
                         rhs_rank,

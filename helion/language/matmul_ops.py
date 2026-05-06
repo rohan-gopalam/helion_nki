@@ -447,37 +447,52 @@ def _(state: CodegenState) -> object:
                 f"{mm_psum} = nl.ndarray([{actual_tile_m}, {N_sub}], nl.float32, buffer=nl.psum)"
             )
         )
-        if n_sub_k > 1:
+
+        def _transpose_body(k_expr: str) -> list[ast.AST]:
+            return [
+                statement_from_string(
+                    f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.psum)"
+                ),
+                statement_from_string(
+                    f"nisa.nc_transpose(dst={lhs_t_psum}, data={_lhs_k_slice(m_i, k_expr)})"
+                ),
+                statement_from_string(
+                    f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.sbuf)"
+                ),
+                statement_from_string(
+                    f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
+                ),
+                *(
+                    [
+                        statement_from_string(
+                            f"{lhs_t_cast} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {matmul_dtype_str}, buffer=nl.sbuf)"
+                        ),
+                        statement_from_string(
+                            f"nisa.tensor_copy(dst={lhs_t_cast}, src={lhs_t_sbuf})"
+                        ),
+                    ]
+                    if need_cast_after_transpose
+                    else []
+                ),
+            ]
+
+        if n_sub_k > 1 and rhs_is_list:
+            for k_i in range(n_sub_k):
+                for stmt in _transpose_body(str(k_i)):
+                    state.add_statement(stmt)
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref(str(k_i), n_expr)})"
+                    )
+                )
+        elif n_sub_k > 1:
             state.add_statement(
                 create(
                     ast.For,
                     target=create(ast.Name, id=sub_k_var, ctx=ast.Store()),
                     iter=expr_from_string(f"nl.affine_range({n_sub_k})"),
                     body=[
-                        statement_from_string(
-                            f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.psum)"
-                        ),
-                        statement_from_string(
-                            f"nisa.nc_transpose(dst={lhs_t_psum}, data={_lhs_k_slice(m_i, sub_k_var)})"
-                        ),
-                        statement_from_string(
-                            f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.sbuf)"
-                        ),
-                        statement_from_string(
-                            f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
-                        ),
-                        *(
-                            [
-                                statement_from_string(
-                                    f"{lhs_t_cast} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {matmul_dtype_str}, buffer=nl.sbuf)"
-                                ),
-                                statement_from_string(
-                                    f"nisa.tensor_copy(dst={lhs_t_cast}, src={lhs_t_sbuf})"
-                                ),
-                            ]
-                            if need_cast_after_transpose
-                            else []
-                        ),
+                        *_transpose_body(sub_k_var),
                         statement_from_string(
                             f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref(sub_k_var, n_expr)})"
                         ),
@@ -486,37 +501,8 @@ def _(state: CodegenState) -> object:
                 )
             )
         else:
-            state.add_statement(
-                statement_from_string(
-                    f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.psum)"
-                )
-            )
-            state.add_statement(
-                statement_from_string(
-                    f"nisa.nc_transpose(dst={lhs_t_psum}, data={_lhs_k_slice(m_i, '0')})"
-                )
-            )
-            state.add_statement(
-                statement_from_string(
-                    f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.sbuf)"
-                )
-            )
-            state.add_statement(
-                statement_from_string(
-                    f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
-                )
-            )
-            if need_cast_after_transpose:
-                state.add_statement(
-                    statement_from_string(
-                        f"{lhs_t_cast} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {matmul_dtype_str}, buffer=nl.sbuf)"
-                    )
-                )
-                state.add_statement(
-                    statement_from_string(
-                        f"nisa.tensor_copy(dst={lhs_t_cast}, src={lhs_t_sbuf})"
-                    )
-                )
+            for stmt in _transpose_body("0"):
+                state.add_statement(stmt)
             state.add_statement(
                 statement_from_string(
                     f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref('0', n_expr)})"

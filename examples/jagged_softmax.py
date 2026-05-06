@@ -58,7 +58,7 @@ def reference_jagged_softmax_pytorch(
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[128, 128, 128, 128]),
+    config=helion.Config(block_sizes=[1, 128, 64, 64]),
 )
 def jagged_softmax_kernel(
     x_data: torch.Tensor,

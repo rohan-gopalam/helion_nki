@@ -61,6 +61,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         # Track var=const for NKI tensor_scalar (avoids tensor_tensor when one op is scalar)
         self._var_to_constant: dict[str, int | float | bool] = {}
+        self._nki_sbuf_alloc_depth: dict[str, int] = {}
         self.fx_node_to_ast: dict[object, ast.AST | tuple[ast.AST, ...]] = {}
 
         # Now create device function and initialize CodegenInterface
@@ -82,9 +83,172 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return loops[-1].strategy.mask_var(block_idx)
         return None
 
+    def _lower_nki_mod_assign(
+        self, target: str, value: ast.BinOp
+    ) -> list[ast.AST] | None:
+        try:
+            env = CompileEnvironment.current()
+        except Exception:
+            return None
+        if env.backend.codegen_name != "nki":
+            return None
+
+        lhs = ast.unparse(value.left)
+        rhs = ast.unparse(value.right)
+        lhs_shape = self.device_function._nki_sbuf_shapes.get(lhs)
+        if lhs_shape is None:
+            lookup = lhs
+            while "_copy" in lookup:
+                lookup = lookup[: lookup.rfind("_copy")]
+                lhs_shape = self.device_function._nki_sbuf_shapes.get(lookup)
+                if lhs_shape is not None:
+                    lhs = lookup
+                    break
+        if lhs_shape is None:
+            block_size = self.device_function._nki_iota_block_sizes.get(lhs)
+            if block_size is not None:
+                try:
+                    lhs_shape = [1, int(block_size)]
+                except ValueError:
+                    lhs_shape = None
+        if lhs_shape is None:
+            for block_id, loops in self.active_device_loops.items():
+                if not loops:
+                    continue
+                strategy = loops[-1].strategy
+                if strategy.index_var(block_id) != lhs:
+                    continue
+                try:
+                    block_size = env.block_sizes[block_id].from_config_assert(
+                        self.device_function.config
+                    )
+                    lhs_shape = [1, int(block_size)]
+                except Exception:
+                    lhs_shape = None
+                break
+        if lhs_shape is None or len(lhs_shape) < 2:
+            return None
+
+        rhs_value: int | float | None = None
+        if isinstance(value.right, ast.Constant) and isinstance(
+            value.right.value, (int, float)
+        ):
+            rhs_value = value.right.value
+        elif isinstance(value.right, ast.Name):
+            const = self.get_var_constant_value(value.right.id)
+            if isinstance(const, (int, float)):
+                rhs_value = const
+        if rhs_value == 0:
+            return None
+
+        tmp = self.device_function.new_var("_nki_mod_div_f32", dce=True)
+        q = self.device_function.new_var("_nki_mod_div_i32", dce=True)
+        prod = self.device_function.new_var("_nki_mod_prod", dce=True)
+        self.device_function._nki_sbuf_shapes[tmp] = list(lhs_shape)
+        self.device_function._nki_sbuf_shapes[q] = list(lhs_shape)
+        self.device_function._nki_sbuf_shapes[prod] = list(lhs_shape)
+        self.device_function._nki_sbuf_shapes[target] = list(lhs_shape)
+        self.device_function._nki_sbuf_dtypes[tmp] = "nl.float32"
+        self.device_function._nki_sbuf_dtypes[q] = "nl.int32"
+        self.device_function._nki_sbuf_dtypes[prod] = "nl.int32"
+        self.device_function._nki_sbuf_dtypes[target] = "nl.int32"
+
+        shape = ", ".join(str(dim) for dim in lhs_shape)
+        if rhs_value is not None:
+            inv: object = 1.0 / float(rhs_value)
+            rhs_operand: object = (
+                int(rhs_value) if float(rhs_value).is_integer() else rhs_value
+            )
+        else:
+            inv = f"1.0 / ({rhs})"
+            rhs_operand = rhs
+
+        return [
+            statement_from_string(
+                f"{tmp} = nl.ndarray([{shape}], nl.float32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_scalar(dst={tmp}, data={lhs}, "
+                f"op0=nl.multiply, operand0={inv})"
+            ),
+            statement_from_string(
+                f"{prod} = nl.ndarray([{shape}], nl.int32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(f"{q} = nl.floor({tmp}, dtype=nl.int32)"),
+            statement_from_string(
+                f"nisa.tensor_scalar(dst={prod}, data={q}, "
+                f"op0=nl.multiply, operand0={rhs_operand})"
+            ),
+            statement_from_string(
+                f"{target} = nl.ndarray([{shape}], nl.int32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={target}, data1={lhs}, data2={prod}, "
+                f"op=nl.subtract)"
+            ),
+        ]
+
     def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
         return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
+
+    def _record_nki_sbuf_allocation(self, stmt: ast.Assign) -> None:
+        if (
+            len(stmt.targets) != 1
+            or not isinstance(stmt.targets[0], ast.Name)
+            or not isinstance(stmt.value, ast.Call)
+            or not isinstance(stmt.value.func, ast.Attribute)
+            or not isinstance(stmt.value.func.value, ast.Name)
+            or stmt.value.func.value.id != "nl"
+            or stmt.value.func.attr != "ndarray"
+        ):
+            return
+        if not any(
+            keyword.arg == "buffer"
+            and isinstance(keyword.value, ast.Attribute)
+            and isinstance(keyword.value.value, ast.Name)
+            and keyword.value.value.id == "nl"
+            and keyword.value.attr == "sbuf"
+            for keyword in stmt.value.keywords
+        ):
+            return
+        self._nki_sbuf_alloc_depth[stmt.targets[0].id] = len(self.statements_stack)
+
+    def _lower_nki_sbuf_reassign(
+        self, target: str, source: str
+    ) -> list[ast.AST] | None:
+        if not self.on_device:
+            return None
+        try:
+            env = CompileEnvironment.current()
+        except Exception:
+            return None
+        if env.backend.codegen_name != "nki":
+            return None
+        if target == source or not target.startswith("_nki") or "_copy" in target:
+            return None
+
+        target_depth = self._nki_sbuf_alloc_depth.get(target)
+        if target_depth is None or target_depth > len(self.statements_stack):
+            return None
+
+        sbuf_shapes = self.device_function._nki_sbuf_shapes
+        target_shape = sbuf_shapes.get(target)
+        source_shape = sbuf_shapes.get(source)
+        if target_shape is None or source_shape is None or target_shape != source_shape:
+            return None
+
+        sbuf_dtypes = self.device_function._nki_sbuf_dtypes
+        target_dtype = sbuf_dtypes.get(target)
+        source_dtype = sbuf_dtypes.get(source)
+        if (
+            target_dtype is not None
+            and source_dtype is not None
+            and target_dtype != source_dtype
+        ):
+            return None
+
+        return [statement_from_string(f"nisa.tensor_copy(dst={target}, src={source})")]
 
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
@@ -96,9 +260,46 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             isinstance(stmt, ast.Assign)
             and len(stmt.targets) == 1
             and isinstance(stmt.targets[0], ast.Name)
-            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value, ast.BinOp)
+            and isinstance(stmt.value.op, ast.Mod)
+            and (lowered := self._lower_nki_mod_assign(stmt.targets[0].id, stmt.value))
+            is not None
         ):
-            self._var_to_constant[stmt.targets[0].id] = stmt.value.value
+            self.statements_stack[-1].extend(lowered)
+            return
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Name)
+            and (
+                lowered := self._lower_nki_sbuf_reassign(
+                    stmt.targets[0].id, stmt.value.id
+                )
+            )
+            is not None
+        ):
+            self.statements_stack[-1].extend(lowered)
+            return
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            if isinstance(stmt.value, ast.Constant):
+                self._var_to_constant[stmt.targets[0].id] = stmt.value.value
+            elif (
+                isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id == "float"
+                and len(stmt.value.args) == 1
+                and isinstance(stmt.value.args[0], ast.Constant)
+                and isinstance(stmt.value.args[0].value, str)
+            ):
+                self._var_to_constant[stmt.targets[0].id] = float(
+                    stmt.value.args[0].value
+                )
+            self._record_nki_sbuf_allocation(stmt)
         self.statements_stack[-1].append(stmt)
 
     def get_var_constant_value(self, var_name: str) -> int | float | bool | None:
@@ -130,6 +331,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if isinstance(expr, ast.Name):
             return expr
         assert isinstance(expr, ExtendedAST), expr
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mod):
+            try:
+                env = CompileEnvironment.current()
+                if env.backend.codegen_name == "nki":
+                    from .backend import NKIOpOverrides
+
+                    lhs = ast.unparse(expr.left)
+                    rhs = ast.unparse(expr.right)
+                    lowered = NKIOpOverrides.mod(lhs, rhs)
+                    if lowered != f"{lhs} % {rhs}" and lowered.isidentifier():
+                        return create(ast.Name, id=lowered, ctx=ast.Load())
+            except Exception:
+                pass
         with expr:
             varname = self.tmpvar(dce=dce, prefix=prefix)
             self.add_statement(

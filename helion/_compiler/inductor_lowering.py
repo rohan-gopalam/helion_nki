@@ -1018,6 +1018,21 @@ class GenerateASTFromInductor(DefaultHandler):
 
         return self._lift(result_expr)
 
+    def mod(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.codegen_name == "nki":
+            return self._default("mod", (str(a), str(b)), {})
+        return self._default("mod", (a, b), {})
+
+    def remainder(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.codegen_name == "nki":
+            return self._default("remainder", (str(a), str(b)), {})
+        return self._default("remainder", (a, b), {})
+
+    def fmod(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.codegen_name == "nki":
+            return self._default("fmod", (str(a), str(b)), {})
+        return self._default("fmod", (a, b), {})
+
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
         return self.cg.lift(self.input_name_lookup[name]).id

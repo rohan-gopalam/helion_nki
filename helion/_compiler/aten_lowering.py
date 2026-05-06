@@ -758,6 +758,127 @@ def codegen_expand(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+@expand_lowering.register_codegen("nki")
+def codegen_expand_nki(ctx: LoweringContext, node: Node) -> object:
+    assert not node.kwargs, "expand kwargs not supported"
+    tensor, _ = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    val = node.meta["val"]
+    assert isinstance(val, torch.Tensor)
+
+    from .backend import NKIOpOverrides
+
+    env = CompileEnvironment.current()
+    state = getattr(env, "_codegen_state", None)
+    if state is None:
+        return tensor
+
+    def _resolve_dim(dim: object) -> int:
+        if isinstance(dim, int):
+            return dim
+        if isinstance(dim, torch.SymInt):
+            if state.config is not None:
+                import sympy as _sympy_expand
+
+                subs: dict[_sympy_expand.Symbol, int] = {}
+                for bs in env.block_sizes:
+                    cfg = bs.from_config(state.config)
+                    if isinstance(cfg, int):
+                        subs[bs.symbol()] = cfg
+                try:
+                    return int(dim._sympy_().subs(subs))
+                except (TypeError, ValueError):
+                    return int(env.size_hint(dim))
+            return int(env.size_hint(dim))
+        return int(dim)
+
+    dst_shape = NKIOpOverrides._squeeze_shape_2d(
+        [_resolve_dim(dim) for dim in val.shape]
+    )
+    if len(dst_shape) != 2:
+        raise exc.BackendUnsupported("nki", f"expand to non-2D SBUF shape {dst_shape}")
+
+    tensor_name = ast.unparse(tensor)
+
+    def _lookup_shape(name: str) -> list[int] | None:
+        shape = state.device_function._nki_sbuf_shapes.get(name)
+        if shape is not None:
+            return list(shape)
+        lookup = name
+        while "_copy" in lookup:
+            lookup = lookup[: lookup.rfind("_copy")]
+            shape = state.device_function._nki_sbuf_shapes.get(lookup)
+            if shape is not None:
+                return list(shape)
+        return None
+
+    src_shape = _lookup_shape(tensor_name)
+    if src_shape is None and isinstance(node.args[0], Node):
+        input_val = node.args[0].meta.get("val")
+        if isinstance(input_val, torch.Tensor):
+            src_shape = NKIOpOverrides._squeeze_shape_2d(
+                [_resolve_dim(dim) for dim in input_val.shape]
+            )
+    if src_shape is None:
+        return tensor
+    if src_shape == dst_shape:
+        return tensor
+    if len(src_shape) != 2:
+        raise exc.BackendUnsupported("nki", f"expand from non-2D SBUF shape {src_shape}")
+
+    src_for_broadcast = tensor_name
+    if (
+        src_shape[0] == 1
+        and src_shape[1] == dst_shape[0]
+        and dst_shape[0] > 1
+        and dst_shape[1] > 1
+    ):
+        dtype_str = env.backend.dtype_str(val.dtype)
+        tr_psum = state.device_function.new_var("_nki_expand_tr_psum", dce=True)
+        tr_sbuf = state.device_function.new_var("_nki_expand_tr_sbuf", dce=True)
+        state.device_function._nki_sbuf_shapes[tr_sbuf] = [dst_shape[0], 1]
+        state.device_function._nki_sbuf_dtypes[tr_sbuf] = dtype_str
+        state.add_statement(
+            statement_from_string(
+                f"{tr_psum} = nl.ndarray([{dst_shape[0]}, 1], "
+                f"{dtype_str}, buffer=nl.psum)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.nc_transpose(dst={tr_psum}, data={tensor_name})"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"{tr_sbuf} = nl.ndarray([{dst_shape[0]}, 1], "
+                f"{dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})")
+        )
+        src_for_broadcast = tr_sbuf
+        src_shape = [dst_shape[0], 1]
+
+    if not all(s == d or s == 1 for s, d in zip(src_shape, dst_shape, strict=True)):
+        raise exc.BackendUnsupported(
+            "nki", f"expand from {src_shape} to {dst_shape} is not broadcastable"
+        )
+
+    dtype_str = env.backend.dtype_str(val.dtype)
+    out = state.device_function.new_var("_nki_expand", dce=True)
+    state.device_function._nki_sbuf_shapes[out] = list(dst_shape)
+    state.device_function._nki_sbuf_dtypes[out] = dtype_str
+    state.add_statement(
+        statement_from_string(
+            f"{out} = nl.broadcast_to({src_for_broadcast}, "
+            f"shape=({dst_shape[0]}, {dst_shape[1]}))"
+        )
+    )
+    return expr_from_string(out)
+
+
 @expand_lowering.register_codegen("pallas")
 def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
     tensor, _ = map_arg(node.args, lambda arg: _env_arg(ctx, arg))

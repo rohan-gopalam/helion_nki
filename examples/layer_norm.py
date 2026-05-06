@@ -24,7 +24,7 @@ import helion.language as hl
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[128]),
+    config=helion.Config(block_sizes=[1]),
 )
 def layer_norm_fwd(
     x: torch.Tensor,

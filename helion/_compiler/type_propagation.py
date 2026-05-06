@@ -858,7 +858,15 @@ class CallableType(LiteralType):
             for x in proxy_args
         ):
             if self.value in self._new_symint_on_host_fns() and origin.is_host():
-                return SymIntType.new_unbacked(origin)
+                hint = 8192
+                with contextlib.suppress(Exception):
+                    hinted_args, hinted_kwargs = tree_map_only(
+                        torch.SymInt, env.size_hint, (proxy_args, proxy_kwargs)
+                    )
+                    hinted_result = self.value(*hinted_args, **hinted_kwargs)
+                    if isinstance(hinted_result, int):
+                        hint = int(hinted_result)
+                return SymIntType(origin, env.create_unbacked_symint(hint=hint))
             if isinstance(self.value, type) and issubclass(
                 self.value, ConfigFragmentType
             ):

@@ -5,6 +5,34 @@
 
 ---
 
+## 2026-05-06 Addendum: Examples Are The Acceptance Target
+
+The current project target is direct Helion-to-NKI lowering for the top-level
+`examples/` suite. `examples-progress.md` is the authoritative pass/fail ledger.
+The previous `examples/EXAMPLES_NKI_STATUS.md` file was removed as redundant.
+
+Recent status:
+- Full pytest sanity: `22 passed, 1164 skipped, 6 warnings`; useful as a guardrail,
+  but most tests are skipped under NKI.
+- Dynamic-loop focused proof remains `test/test_nki_dynamic_loops.py`: `4 passed`.
+- Known proven examples and remaining failures are tracked in `examples-progress.md`.
+
+Recent compiler-only fixes:
+- NKI `run_example` baseline selection now chooses PyTorch before Triton when both
+  are present under `HELION_BACKEND=nki`.
+- NKI `hl.atomic_add` gained a narrow row-scatter RMW path for 2D HBM output rows
+  indexed by SBUF row offsets, plus a guard against unsupported SBUF tensor-valued
+  atomic indices.
+- NKI bit shifts now lower to `nl.left_shift` / `nl.right_shift`.
+- The flat jagged gather+sum recognizer now handles `(starts + k) * M + m` for
+  `jagged_layer_norm.py` reduction passes.
+
+Active run note: K64 `examples/jagged_softmax.py` is still inside Neuron compile as
+of `2026-05-06T06:26:48Z`. The generated BIR is very large; let compiler progress
+continue only up to a hard 30-minute cap from `neuronx-cc` start.
+
+---
+
 ## 2026-05-05 Addendum: Dynamic Loops
 
 Dynamic loops for direct Helion-to-NKI lowering are now implemented and covered by

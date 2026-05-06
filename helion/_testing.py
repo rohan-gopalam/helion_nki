@@ -871,10 +871,7 @@ def run_example(
     if _get_backend() == "nki" and isinstance(baseline_fn, dict):
         for preferred in ("pytorch", "torch"):
             if preferred in baselines:
-                baselines = {
-                    preferred: baselines[preferred],
-                    **{k: v for k, v in baselines.items() if k != preferred},
-                }
+                baselines = {preferred: baselines[preferred]}
                 break
 
     # Check correctness against first baseline

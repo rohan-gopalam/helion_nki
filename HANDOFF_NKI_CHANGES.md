@@ -10,6 +10,40 @@ All edits target the NKI backend only. Triton and other backends are unchanged u
 
 ---
 
+## 2026-05-06 Examples / Dynamic Loop Follow-Up
+
+`examples-progress.md` is now the authoritative examples ledger. The old
+`examples/EXAMPLES_NKI_STATUS.md` tracker was removed as redundant.
+
+Current high-level status:
+- Pytest sanity remains `22 passed, 1164 skipped, 6 warnings`; most of that suite
+  is skipped under NKI and is not the acceptance target.
+- Dynamic-loop tests remain the focused proof for `nl.dynamic_range` lowering.
+- The main acceptance target is the top-level `examples/` set lowering through
+  Helion's NKI backend and passing each example's correctness checks on Trainium.
+
+Recent compiler-only fixes while the K64 `jagged_softmax.py` run is active:
+- `run_example` now prefers PyTorch baselines over Triton baselines when
+  `HELION_BACKEND=nki`, avoiding accidental CUDA/Triton baseline execution.
+- `hl.atomic_add` has a narrow NKI HBM row-scatter RMW path for unused-return
+  2D row-indexed updates, targeting `segment_reduction.py`.
+- SBUF-target `atomic_add` now rejects tensor-valued indices instead of silently
+  treating them as full slices.
+- NKI tensor-valued bit shifts lower through `nl.left_shift` and
+  `nl.right_shift`, removing one packed-lowbit blocker for `int4_gemm.py` and
+  `nvfp4_gemm.py`; stack/reshape interleaving is still unresolved.
+- The fused flat jagged gather plus `sum(dim=1)` path now recognizes
+  `(starts + k) * M + m`, targeting the first/second reduction passes in
+  `jagged_layer_norm.py`.
+
+Active run note: K64 `examples/jagged_softmax.py` with config
+`[1, 128, 64, 64]` is still in Neuron compile as of `2026-05-06T06:26:48Z`.
+Subagent estimate: runtime should be seconds to low minutes once compiled, but
+first compile of the generated BIR can plausibly run long. Use a hard 30-minute
+cap from `neuronx-cc` start if the compiler remains active.
+
+---
+
 ## 2026-05-05 Dynamic Loop Status
 
 Dynamic `hl.tile(..., tensor_bound, ...)` loops now lower to NKI `nl.dynamic_range`

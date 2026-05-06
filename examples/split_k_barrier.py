@@ -25,7 +25,8 @@ import helion.language as hl
     backend="nki",
     autotune_effort="none",
     config=helion.Config(
-        block_sizes=[128, 128, 128, 128, 128],
+        block_sizes=[128, 128, 64, 128, 128],
+        split_k=64,
         pid_type="persistent_blocked",
     ),
     static_shapes=True,

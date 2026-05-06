@@ -1328,8 +1328,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
             lane_loops.append((offset_var, idx_stmts, range_expr))
 
-        nki_pids = NKIProgramIDs()
-        state.device_function.set_pid(nki_pids)
+        if state.device_function.pid is None:
+            state.device_function.set_pid(NKIProgramIDs())
 
         block_id_to_info = self._create_block_id_info_dict(state)
         return DeviceGridState(

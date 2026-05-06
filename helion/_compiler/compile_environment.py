@@ -593,7 +593,13 @@ class CompileEnvironment:
                 # This preserves the original value passed to the kernel.
                 if expr in var_hints:
                     return int(var_hints[expr])
-                # Fall back to default hint if not found
+                hinted_expr = expr.xreplace(var_hints)
+                if not hinted_expr.free_symbols:
+                    return int(hinted_expr)
+                with contextlib.suppress(Exception):
+                    # pyrefly: ignore [no-matching-overload]
+                    return int(self.shape_env.size_hint(expr))
+                # Fall back to default hint if not found.
                 return 8192
 
             # pyrefly: ignore [no-matching-overload]

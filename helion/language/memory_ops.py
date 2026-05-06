@@ -1461,6 +1461,18 @@ def _(state: CodegenState) -> ast.AST:
     free_dims = [_resolve_dim(s) for s in output_shape[1:]]
     dtype_str = backend.dtype_str(tensor.dtype)
 
+    def _tensor_dim_size_str(dim_idx: int) -> str:
+        dim_size = tensor.size(dim_idx)
+        return (
+            state.sympy_expr(dim_size._sympy_())
+            if isinstance(dim_size, torch.SymInt)
+            else str(dim_size)
+        )
+
+    hbm_dim_size_strs = [
+        _tensor_dim_size_str(dim_idx) for dim_idx in range(tensor.dim())
+    ]
+
     # Second pass: emit slice_parts using the resolved block_ids.
     # Track which dims are tile_id (scalar index) vs tile (range slice) so
     # flat_block_size computation can use block_size=1 for tile_id dims.
@@ -1939,9 +1951,6 @@ def _(state: CodegenState) -> ast.AST:
                     if shape is not None:
                         return shape
                 return None
-
-            lhs_shape = _lookup_shape(lhs_name)
-            rhs_shape = _lookup_shape(rhs_name)
 
             def _resolve_index_dim(dim: object) -> int:
                 if isinstance(dim, int):
@@ -2626,6 +2635,13 @@ def _(state: CodegenState) -> ast.AST:
             output_shape = [flat_partition] + [output_shape[-1]]
         partition_dim = _resolve_dim(output_shape[0])
         free_dims = [_resolve_dim(s) for s in output_shape[1:]]
+        flat_hbm_partition = 1
+        for dim_size in original_dim_sizes:
+            flat_hbm_partition *= dim_size
+        hbm_dim_size_strs = [
+            str(flat_hbm_partition),
+            _tensor_dim_size_str(tensor.dim() - 1),
+        ]
 
     def _build_hbm_src(name_str: str, parts: list[str]) -> str:
         """Build an HBM src expression, converting __DYN_AP__counter__size
@@ -2829,7 +2845,7 @@ def _(state: CodegenState) -> ast.AST:
         """Return a Python guard that makes every static HBM slice in-bounds."""
         checks: list[str] = []
         for dim_idx, part in enumerate(parts):
-            if dim_idx >= tensor.dim():
+            if dim_idx >= len(hbm_dim_size_strs):
                 break
             if part.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__")):
                 continue
@@ -2840,12 +2856,7 @@ def _(state: CodegenState) -> ast.AST:
             end = end.strip()
             if not start or not end:
                 continue
-            dim_size = tensor.size(dim_idx)
-            dim_size_str = (
-                state.sympy_expr(dim_size._sympy_())
-                if isinstance(dim_size, torch.SymInt)
-                else str(dim_size)
-            )
+            dim_size_str = hbm_dim_size_strs[dim_idx]
             checks.append(f"({start}) >= 0")
             checks.append(f"({end}) <= {dim_size_str}")
         if not checks:
@@ -2853,7 +2864,7 @@ def _(state: CodegenState) -> ast.AST:
         return " and ".join(checks)
 
     def _slice_info(part: str, dim_idx: int) -> tuple[str, str, int, str] | None:
-        if dim_idx >= tensor.dim() or ":" not in part:
+        if dim_idx >= len(hbm_dim_size_strs) or ":" not in part:
             return None
         if part.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__", "__AP_ROW_GATHER__")):
             return None
@@ -2876,12 +2887,7 @@ def _(state: CodegenState) -> ast.AST:
                 count = None
         if count is None or count <= 0:
             return None
-        dim_size = tensor.size(dim_idx)
-        dim_size_str = (
-            state.sympy_expr(dim_size._sympy_())
-            if isinstance(dim_size, torch.SymInt)
-            else str(dim_size)
-        )
+        dim_size_str = hbm_dim_size_strs[dim_idx]
         return start, end, count, dim_size_str
 
     def _single_tail_load_cases(dst: str, hbm_base: str, parts: list[str]) -> list[ast.If]:
@@ -3005,10 +3011,9 @@ def _(state: CodegenState) -> ast.AST:
                     f"{dtype_str}, buffer=nl.sbuf)"
                 )
             )
-            if extra_mask is not None:
-                state.codegen.add_statement(
-                    statement_from_string(f"nisa.memset({tile_var}, value=0)")
-                )
+            state.codegen.add_statement(
+                statement_from_string(f"nisa.memset({tile_var}, value=0)")
+            )
         for i, tile_var in enumerate(tile_vars):
             part_slice_parts = list(slice_parts)
             if partition_offset_var is not None:
@@ -3058,10 +3063,9 @@ def _(state: CodegenState) -> ast.AST:
                 f"{sbuf_name} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
             )
         )
-        if extra_mask is not None:
-            state.codegen.add_statement(
-                statement_from_string(f"nisa.memset({sbuf_name}, value=0)")
-            )
+        state.codegen.add_statement(
+            statement_from_string(f"nisa.memset({sbuf_name}, value=0)")
+        )
         # Handle dynamic loop subscripts via .ap()
         _has_dyn_2d = any(
             p.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__", "__AP_ROW_GATHER__"))
@@ -3304,11 +3308,25 @@ def _(state: CodegenState) -> None:
             is_scalar_dim_s.append(False)
         tensor_dim_idx += 1
 
+    def _store_tensor_dim_size_str(dim_idx: int) -> str:
+        dim_size = tensor.size(dim_idx)
+        return (
+            state.sympy_expr(dim_size._sympy_())
+            if isinstance(dim_size, torch.SymInt)
+            else str(dim_size)
+        )
+
+    hbm_dim_size_strs_s = [
+        _store_tensor_dim_size_str(dim_idx) for dim_idx in range(tensor.dim())
+    ]
+    flattened_high_rank_store = False
+
     # 3D+ tensors: reshaped to 2D at kernel entry.
     # Combine leading slice_parts into one flat partition slice.
     if tensor.dim() > 2 and len(slice_parts) > 2:
         import sympy as _sympy_store
 
+        flattened_high_rank_store = True
         _bs_subs_store: dict[_sympy_store.Symbol, int] = {}
         for _bid in range(len(env.block_sizes)):
             _bs = env.block_sizes[_bid]
@@ -3367,6 +3385,13 @@ def _(state: CodegenState) -> None:
         flat_slice = f"({flat_offset_s}) : ({flat_offset_s}) + {flat_block_size_s}"
         slice_parts = [flat_slice] + [slice_parts[-1]]
         partition_offset_var = f"({flat_offset_s})"
+        flat_hbm_partition_s = 1
+        for dim_size in original_dim_sizes_s:
+            flat_hbm_partition_s *= dim_size
+        hbm_dim_size_strs_s = [
+            str(flat_hbm_partition_s),
+            _store_tensor_dim_size_str(tensor.dim() - 1),
+        ]
 
     value_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
     tile_vars = device_fn.get_tile_list_vars(value_name)
@@ -3857,7 +3882,7 @@ def _(state: CodegenState) -> None:
         def _store_slice_info(
             part: str, dim_idx: int
         ) -> tuple[str, str, int, str] | None:
-            if dim_idx >= tensor.dim() or ":" not in part:
+            if dim_idx >= len(hbm_dim_size_strs_s) or ":" not in part:
                 return None
             if part.startswith(("__DYN_AP__", "__AP_ROW_GATHER__")):
                 return None
@@ -3867,12 +3892,7 @@ def _(state: CodegenState) -> None:
             width = _slice_width(part)
             if width is None or width <= 0:
                 return None
-            dim_size = tensor.size(dim_idx)
-            dim_size_str = (
-                state.sympy_expr(dim_size._sympy_())
-                if isinstance(dim_size, torch.SymInt)
-                else str(dim_size)
-            )
+            dim_size_str = hbm_dim_size_strs_s[dim_idx]
             return start, end, width, dim_size_str
 
         def _store_bounds_guard(parts: list[str]) -> str | None:
@@ -3951,27 +3971,43 @@ def _(state: CodegenState) -> None:
         transposed_value = None
         if (
             use_nki_return
-            and tensor.dim() == 2
             and val_sbuf_shape is not None
             and len(val_sbuf_shape) == 2
-            and val_sbuf_shape[0] > 1
-            and val_sbuf_shape[1] == 1
         ):
             # Parse adjusted_slice_parts to get HBM slice widths.
             parts = [p.strip() for p in slice_str.split(",")]
             if len(parts) == 2:
                 w0 = _slice_width(parts[0])
                 w1 = _slice_width(parts[1])
-                if w0 == 1 and w1 == val_sbuf_shape[0]:
-                    # HBM slice is [1, N], SBUF is [N, 1] — transpose SBUF.
+                transpose_shape: list[int] | None = None
+                if (
+                    tensor.dim() == 2
+                    and val_sbuf_shape[0] > 1
+                    and val_sbuf_shape[1] == 1
+                    and w0 == 1
+                    and w1 == val_sbuf_shape[0]
+                ):
+                    # HBM slice is [1, N], SBUF is [N, 1].
+                    transpose_shape = [1, val_sbuf_shape[0]]
+                elif (
+                    flattened_high_rank_store
+                    and val_sbuf_shape[0] == 1
+                    and val_sbuf_shape[1] > 1
+                    and w0 == val_sbuf_shape[1]
+                    and w1 == 1
+                ):
+                    # Flattened high-rank HBM slice is [N, 1], SBUF is [1, N].
+                    transpose_shape = [val_sbuf_shape[1], 1]
+                if transpose_shape is not None:
                     from .._compiler.ast_extension import expr_from_string as _efrom
                     dtype_str = env.backend.dtype_str(tensor.dtype)
                     transposed_var = device_fn.new_var("_nki_store_tr", dce=True)
-                    device_fn._nki_sbuf_shapes[transposed_var] = [1, val_sbuf_shape[0]]
+                    device_fn._nki_sbuf_shapes[transposed_var] = transpose_shape
                     tr_psum = device_fn.new_var("_nki_store_tr_psum", dce=True)
+                    transpose_shape_str = ", ".join(str(d) for d in transpose_shape)
                     state.codegen.add_statement(
                         statement_from_string(
-                            f"{tr_psum} = nl.ndarray([1, {val_sbuf_shape[0]}], "
+                            f"{tr_psum} = nl.ndarray([{transpose_shape_str}], "
                             f"{dtype_str}, buffer=nl.psum)"
                         )
                     )
@@ -3982,7 +4018,7 @@ def _(state: CodegenState) -> None:
                     )
                     state.codegen.add_statement(
                         statement_from_string(
-                            f"{transposed_var} = nl.ndarray([1, {val_sbuf_shape[0]}], "
+                            f"{transposed_var} = nl.ndarray([{transpose_shape_str}], "
                             f"{dtype_str}, buffer=nl.sbuf)"
                         )
                     )

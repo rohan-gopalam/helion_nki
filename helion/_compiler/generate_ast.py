@@ -61,6 +61,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         # Track var=const for NKI tensor_scalar (avoids tensor_tensor when one op is scalar)
         self._var_to_constant: dict[str, int | float | bool] = {}
+        self._nki_sbuf_constant_values: dict[str, int | float | bool] = {}
         self._nki_sbuf_alloc_depth: dict[str, int] = {}
         self.fx_node_to_ast: dict[object, ast.AST | tuple[ast.AST, ...]] = {}
 
@@ -130,14 +131,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return None
 
         rhs_value: int | float | None = None
-        if isinstance(value.right, ast.Constant) and isinstance(
-            value.right.value, (int, float)
-        ):
-            rhs_value = value.right.value
-        elif isinstance(value.right, ast.Name):
-            const = self.get_var_constant_value(value.right.id)
-            if isinstance(const, (int, float)):
-                rhs_value = const
+        rhs_value = self._constant_value_from_ast(value.right)
         if rhs_value == 0:
             return None
 
@@ -213,6 +207,95 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         ):
             return
         self._nki_sbuf_alloc_depth[stmt.targets[0].id] = len(self.statements_stack)
+        self._nki_sbuf_constant_values.pop(stmt.targets[0].id, None)
+
+    def _constant_value_from_ast(
+        self, expr: ast.AST
+    ) -> int | float | bool | None:
+        if isinstance(expr, ast.Constant) and isinstance(
+            expr.value, (int, float, bool)
+        ):
+            return expr.value
+        if (
+            isinstance(expr, ast.UnaryOp)
+            and isinstance(expr.operand, ast.Constant)
+            and isinstance(expr.operand.value, (int, float))
+        ):
+            if isinstance(expr.op, ast.USub):
+                return -expr.operand.value
+            if isinstance(expr.op, ast.UAdd):
+                return expr.operand.value
+        if isinstance(expr, ast.Name):
+            const = self.get_var_constant_value(expr.id)
+            if isinstance(const, (int, float, bool)):
+                return const
+            return self._nki_sbuf_constant_values.get(expr.id)
+        if isinstance(expr, ast.BinOp):
+            left = self._constant_value_from_ast(expr.left)
+            right = self._constant_value_from_ast(expr.right)
+            if not isinstance(left, (int, float, bool)) or not isinstance(
+                right, (int, float, bool)
+            ):
+                return None
+            if isinstance(expr.op, ast.Add):
+                return left + right
+            if isinstance(expr.op, ast.Sub):
+                return left - right
+            if isinstance(expr.op, ast.Mult):
+                return left * right
+            if isinstance(expr.op, ast.Div) and right != 0:
+                return left / right
+            if isinstance(expr.op, ast.FloorDiv) and right != 0:
+                return left // right
+            if isinstance(expr.op, ast.Mod) and right != 0:
+                return left % right
+        return None
+
+    def _record_nki_sbuf_write(self, stmt: ast.AST) -> None:
+        call: ast.Call | None = None
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        elif isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        if call is None:
+            return
+
+        written_names: list[str] = []
+        for keyword in call.keywords:
+            if keyword.arg == "dst" and isinstance(keyword.value, ast.Name):
+                written_names.append(keyword.value.id)
+        if (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "nisa"
+            and call.func.attr == "memset"
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+        ):
+            written_names.append(call.args[0].id)
+
+        for name in written_names:
+            self._nki_sbuf_constant_values.pop(name, None)
+
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "nisa"
+            and call.func.attr == "memset"
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+        ):
+            return
+
+        value_expr = next(
+            (keyword.value for keyword in call.keywords if keyword.arg == "value"),
+            None,
+        )
+        if value_expr is None:
+            return
+        value = self._constant_value_from_ast(value_expr)
+        if isinstance(value, (int, float, bool)):
+            self._nki_sbuf_constant_values[call.args[0].id] = value
 
     def _lower_nki_sbuf_reassign(
         self, target: str, source: str
@@ -286,8 +369,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             and len(stmt.targets) == 1
             and isinstance(stmt.targets[0], ast.Name)
         ):
-            if isinstance(stmt.value, ast.Constant):
-                self._var_to_constant[stmt.targets[0].id] = stmt.value.value
+            const_value = self._constant_value_from_ast(stmt.value)
+            if isinstance(const_value, (int, float, bool)):
+                self._var_to_constant[stmt.targets[0].id] = const_value
             elif (
                 isinstance(stmt.value, ast.Call)
                 and isinstance(stmt.value.func, ast.Name)
@@ -300,11 +384,14 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     stmt.value.args[0].value
                 )
             self._record_nki_sbuf_allocation(stmt)
+        self._record_nki_sbuf_write(stmt)
         self.statements_stack[-1].append(stmt)
 
     def get_var_constant_value(self, var_name: str) -> int | float | bool | None:
         """Return constant value if var was assigned a literal, else None."""
-        return self._var_to_constant.get(var_name)
+        return self._var_to_constant.get(
+            var_name, self._nki_sbuf_constant_values.get(var_name)
+        )
 
     def record_fx_node_ast(self, node: object, value: object) -> None:
         if isinstance(value, ast.AST):
@@ -486,8 +573,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             assert node._root_id is not None
             # Loop dependency checks were already run during lowering; phase checker kept for symmetry/debug.
             self._phase_checker(node._root_id)
+            env = CompileEnvironment.current()
+            is_nki = env.backend.name == "nki"
 
-            if len(self.host_function.device_ir.root_ids) == 1:
+            if len(self.host_function.device_ir.root_ids) == 1 or is_nki:
                 body = self.device_function.body
             else:
                 assert len(self.host_function.device_ir.root_ids) > 1
@@ -563,7 +652,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     self.host_function.device_ir.root_ids[node._root_id],
                 )
                 grid_state = self.current_grid_state
-                env = CompileEnvironment.current()
                 if env.backend.name == "nki":
                     env.backend.validate_nki_tensor_shapes(root)
                     # Run FX-graph fusion passes after validation: annotate
@@ -597,7 +685,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
                 # If we are in a multi top level loop, for all loops except for the last one
                 # emit ifthenelse blocks
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                if (
+                    not is_nki
+                    and node._root_id < len(self.host_function.device_ir.root_ids) - 1
+                ):
                     block = (
                         self.device_function.body
                         if self.next_else_block is None

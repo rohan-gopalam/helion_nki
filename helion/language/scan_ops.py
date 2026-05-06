@@ -438,6 +438,8 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     out = dev_fn.new_var("_nki_assoc_scan", dce=True)
     carry = dev_fn.new_var("_nki_assoc_carry", dce=True)
     prev_idx = dev_fn.new_var("_nki_assoc_prev_idx", dce=True)
+    cur_val = dev_fn.new_var("_nki_assoc_cur_val", dce=True)
+    cur_idx = dev_fn.new_var("_nki_assoc_cur_idx", dce=True)
     same = dev_fn.new_var("_nki_assoc_same", dce=True)
     summed = dev_fn.new_var("_nki_assoc_sum", dce=True)
     pred = dev_fn.new_var("_nki_assoc_pred", dce=True)
@@ -448,6 +450,10 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     dev_fn._nki_sbuf_dtypes[carry] = value_dtype
     dev_fn._nki_sbuf_shapes[prev_idx] = [1, f_count]
     dev_fn._nki_sbuf_dtypes[prev_idx] = index_dtype
+    dev_fn._nki_sbuf_shapes[cur_val] = [1, f_count]
+    dev_fn._nki_sbuf_dtypes[cur_val] = value_dtype
+    dev_fn._nki_sbuf_shapes[cur_idx] = [1, f_count]
+    dev_fn._nki_sbuf_dtypes[cur_idx] = index_dtype
     dev_fn._nki_sbuf_shapes[same] = [1, f_count]
     dev_fn._nki_sbuf_dtypes[same] = "nl.int32"
     dev_fn._nki_sbuf_shapes[summed] = [1, f_count]
@@ -468,6 +474,16 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     state.codegen.add_statement(
         statement_from_string(
             f"{prev_idx} = nl.ndarray([1, {f_count}], {index_dtype}, buffer=nl.sbuf)"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{cur_val} = nl.ndarray([1, {f_count}], {value_dtype}, buffer=nl.sbuf)"
+        )
+    )
+    state.codegen.add_statement(
+        statement_from_string(
+            f"{cur_idx} = nl.ndarray([1, {f_count}], {index_dtype}, buffer=nl.sbuf)"
         )
     )
     state.codegen.add_statement(
@@ -505,18 +521,22 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         scan_i = dev_fn.new_var("_scan_i")
         body = [
             statement_from_string(
-                f"nisa.tensor_tensor(dst={same}, "
-                f"data1={indices_name}[{scan_i}:{scan_i}+1, 0:{f_count}], "
+                f"nisa.tensor_copy(dst={cur_idx}, "
+                f"src={indices_name}[{scan_i}:{scan_i}+1, 0:{f_count}])"
+            ),
+            statement_from_string(
+                f"nisa.tensor_copy(dst={cur_val}, "
+                f"src={values_name}[{scan_i}:{scan_i}+1, 0:{f_count}])"
+            ),
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={same}, data1={cur_idx}, "
                 f"data2={prev_idx}, op=nl.equal)"
             ),
             statement_from_string(
                 f"nisa.tensor_tensor(dst={summed}, data1={carry}, "
-                f"data2={values_name}[{scan_i}:{scan_i}+1, 0:{f_count}], op=nl.add)"
+                f"data2={cur_val}, op=nl.add)"
             ),
-            statement_from_string(
-                f"nisa.tensor_copy(dst={carry}, "
-                f"src={values_name}[{scan_i}:{scan_i}+1, 0:{f_count}])"
-            ),
+            statement_from_string(f"nisa.tensor_copy(dst={carry}, src={cur_val})"),
             statement_from_string(f"nisa.tensor_copy(dst={pred}, src={same})"),
             statement_from_string(
                 f"nisa.tensor_copy_predicated(dst={carry}, src={summed}, "
@@ -526,10 +546,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
                 f"nisa.tensor_copy(dst={out}[{scan_i}:{scan_i}+1, 0:{f_count}], "
                 f"src={carry})"
             ),
-            statement_from_string(
-                f"nisa.tensor_copy(dst={prev_idx}, "
-                f"src={indices_name}[{scan_i}:{scan_i}+1, 0:{f_count}])"
-            ),
+            statement_from_string(f"nisa.tensor_copy(dst={prev_idx}, src={cur_idx})"),
         ]
         state.codegen.add_statement(
             create(

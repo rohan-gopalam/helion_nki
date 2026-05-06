@@ -2032,6 +2032,35 @@ class NKIOpOverrides:
         # we still need to allocate a new dst to avoid overwriting it.
         from torch._inductor.virtualized import V as _V_ts
         _ts_node = _V_ts.current_node or state.fx_node
+
+        def _recover_tensor_scalar_operand(operand: object) -> object:
+            is_mask_literal = isinstance(operand, (int, float, bool))
+            if isinstance(operand, str):
+                try:
+                    float(operand)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    is_mask_literal = True
+            if not is_mask_literal or _ts_node is None:
+                return operand
+            scalar_arg_index = 0 if reverse0 else 1
+            args = getattr(_ts_node, "args", ())
+            if len(args) <= scalar_arg_index:
+                return operand
+            fx_arg = args[scalar_arg_index]
+            if not hasattr(fx_arg, "meta"):
+                return operand
+            if not isinstance(fx_arg.meta.get("val"), torch.Tensor):
+                return operand
+            fx_ast = state.codegen.ast_for_fx_node(fx_arg)
+            if isinstance(fx_ast, ast.AST):
+                recovered = ast.unparse(fx_ast)
+                if recovered:
+                    return recovered
+            return operand
+
+        operand0 = _recover_tensor_scalar_operand(operand0)
         _ts_is_copy = "_copy_" in dst and dst[-1:].isdigit()
         if _ts_is_copy and _ts_node is not None and dst_tile_vars is None:
             _ts_users = getattr(_ts_node, "users", {})
@@ -2300,9 +2329,6 @@ class NKIOpOverrides:
         op_tensor_scalar: str,
         allow_tensor_tensor: bool = True,
     ) -> str:
-        a_is_scalar = cls._is_scalar_operand(a)
-        b_is_scalar = cls._is_scalar_operand(b)
-
         from torch._inductor.virtualized import V as _V_bin
 
         _bin_node = _V_bin.current_node
@@ -2317,6 +2343,103 @@ class NKIOpOverrides:
             # a real SBUF op here is both unnecessary and can be invalid for
             # broadcasted index expressions such as starts[:, None] + i[None, :].
             return "0"
+
+        if _bin_node is not None:
+            from .compile_environment import CompileEnvironment as _CE_bin
+
+            _bin_state = getattr(_CE_bin.current(), "_codegen_state", None)
+
+            def _recover_tensor_ast_operand(operand: object, arg_index: int) -> object:
+                is_mask_literal = isinstance(operand, (int, float, bool))
+                if isinstance(operand, str):
+                    try:
+                        float(operand)
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        is_mask_literal = True
+                if not is_mask_literal:
+                    return operand
+                if _bin_state is None or len(_bin_node.args) <= arg_index:
+                    return operand
+                fx_arg = _bin_node.args[arg_index]
+                if not hasattr(fx_arg, "meta"):
+                    return operand
+                if not isinstance(fx_arg.meta.get("val"), torch.Tensor):
+                    return operand
+                fx_ast = _bin_state.codegen.ast_for_fx_node(fx_arg)
+                if isinstance(fx_ast, ast.AST):
+                    recovered = ast.unparse(fx_ast)
+                    if recovered:
+                        return recovered
+                return operand
+
+            # Some tile loads have masked-value metadata of 0. When a scalar-like
+            # tensor view such as mean_mb[:, None] reaches Inductor binary
+            # lowering, the operand can arrive as that neutral literal even
+            # though the real SBUF load already exists. Recover the AST so NKI
+            # tensor_scalar uses the loaded tile as operand0.
+            a = _recover_tensor_ast_operand(a, 0)
+            b = _recover_tensor_ast_operand(b, 1)
+
+        if _bin_node is not None and op_tensor_tensor == "nl.add":
+            from .ast_extension import statement_from_string
+            from .compile_environment import CompileEnvironment as _CE_acc
+
+            _acc_state = getattr(_CE_acc.current(), "_codegen_state", None)
+            if _acc_state is not None:
+                _users = getattr(_bin_node, "users", {})
+                _is_loop_output = (
+                    len(_users) == 1
+                    and any(getattr(user, "op", None) == "output" for user in _users)
+                )
+                _a_name = ast.unparse(a) if isinstance(a, ast.AST) else str(a)
+                _b_name = ast.unparse(b) if isinstance(b, ast.AST) else str(b)
+
+                def _lookup_loop_acc_shape(name: str) -> list[int] | None:
+                    shape = _acc_state.device_function._nki_sbuf_shapes.get(name)
+                    if shape is not None:
+                        return shape
+                    lookup = name
+                    while "_copy" in lookup:
+                        lookup = lookup[: lookup.rfind("_copy")]
+                        shape = _acc_state.device_function._nki_sbuf_shapes.get(
+                            lookup
+                        )
+                        if shape is not None:
+                            return shape
+                    return None
+
+                if (
+                    _is_loop_output
+                    and "_copy_" in _a_name
+                    and _a_name[-1:].isdigit()
+                    and _acc_state.device_function.get_tile_list_vars(_a_name) is None
+                    and _acc_state.device_function.get_tile_list_vars(_b_name) is None
+                ):
+                    _base_name = _a_name
+                    _sbuf_shapes = _acc_state.device_function._nki_sbuf_shapes
+                    while _base_name not in _sbuf_shapes and "_copy" in _base_name:
+                        _base_name = _base_name[: _base_name.rfind("_copy")]
+                    _base_shape = _lookup_loop_acc_shape(_base_name)
+                    _b_shape = _lookup_loop_acc_shape(_b_name)
+                    if (
+                        _base_name != _a_name
+                        and _base_shape is not None
+                        and _b_shape is not None
+                        and list(_base_shape) == list(_b_shape)
+                    ):
+                        _acc_state.add_statement(
+                            statement_from_string(
+                                f"nisa.tensor_tensor(dst={_base_name}, "
+                                f"data1={_base_name}, data2={_b_name}, "
+                                f"op={op_tensor_tensor})"
+                            )
+                        )
+                        return _base_name
+
+        a_is_scalar = cls._is_scalar_operand(a)
+        b_is_scalar = cls._is_scalar_operand(b)
 
         if a_is_scalar and b_is_scalar:
             raise exc.BackendUnsupported(
@@ -2375,6 +2498,67 @@ class NKIOpOverrides:
                     return cls._nki_tensor_scalar(
                         b, a, op_tensor_scalar, reverse0=reverse0
                     )
+
+        if (
+            not a_is_scalar
+            and not b_is_scalar
+            and _bin_node is not None
+            and op_tensor_tensor == "nl.add"
+        ):
+            from .ast_extension import statement_from_string
+            from .compile_environment import CompileEnvironment as _CE_acc
+
+            _acc_state = getattr(_CE_acc.current(), "_codegen_state", None)
+            if _acc_state is not None:
+                _users = getattr(_bin_node, "users", {})
+                _is_loop_output = (
+                    len(_users) == 1
+                    and any(getattr(user, "op", None) == "output" for user in _users)
+                )
+                _a_name = ast.unparse(a) if isinstance(a, ast.AST) else str(a)
+                _b_name = ast.unparse(b) if isinstance(b, ast.AST) else str(b)
+
+                def _lookup_loop_acc_shape(name: str) -> list[int] | None:
+                    shape = _acc_state.device_function._nki_sbuf_shapes.get(name)
+                    if shape is not None:
+                        return shape
+                    lookup = name
+                    while "_copy" in lookup:
+                        lookup = lookup[: lookup.rfind("_copy")]
+                        shape = _acc_state.device_function._nki_sbuf_shapes.get(
+                            lookup
+                        )
+                        if shape is not None:
+                            return shape
+                    return None
+
+                if (
+                    _is_loop_output
+                    and "_copy_" in _a_name
+                    and _a_name[-1:].isdigit()
+                    and _acc_state.device_function.get_tile_list_vars(_a_name) is None
+                    and _acc_state.device_function.get_tile_list_vars(_b_name) is None
+                ):
+                    _base_name = _a_name
+                    _sbuf_shapes = _acc_state.device_function._nki_sbuf_shapes
+                    while _base_name not in _sbuf_shapes and "_copy" in _base_name:
+                        _base_name = _base_name[: _base_name.rfind("_copy")]
+                    _base_shape = _lookup_loop_acc_shape(_base_name)
+                    _b_shape = _lookup_loop_acc_shape(_b_name)
+                    if (
+                        _base_name != _a_name
+                        and _base_shape is not None
+                        and _b_shape is not None
+                        and list(_base_shape) == list(_b_shape)
+                    ):
+                        _acc_state.add_statement(
+                            statement_from_string(
+                                f"nisa.tensor_tensor(dst={_base_name}, "
+                                f"data1={_base_name}, data2={_b_name}, "
+                                f"op={op_tensor_tensor})"
+                            )
+                        )
+                        return _base_name
 
         # Check for broadcast pattern: [M,N] op [M,1] after 3D squeeze
         # This handles cases like acc * alpha[:, :, None] where alpha is [1,M,1]
@@ -4392,18 +4576,20 @@ class NKIOpOverrides:
         if a_scalar and not b_scalar:
             # (scalar op tensor)  — use tensor_scalar with reverse
             data_name = _cmp_match_data_layout(b_str)
+            scalar_operand = NKIOpOverrides._resolve_scalar_operand(a_str)
             state.add_statement(
                 statement_from_string(
                     f"nisa.tensor_scalar(dst={dst_var}, data={data_name}, "
-                    f"op0={nl_op}, operand0={a_str}, reverse0=True)"
+                    f"op0={nl_op}, operand0={scalar_operand}, reverse0=True)"
                 )
             )
         elif b_scalar and not a_scalar:
             data_name = _cmp_match_data_layout(a_str)
+            scalar_operand = NKIOpOverrides._resolve_scalar_operand(b_str)
             state.add_statement(
                 statement_from_string(
                     f"nisa.tensor_scalar(dst={dst_var}, data={data_name}, "
-                    f"op0={nl_op}, operand0={b_str})"
+                    f"op0={nl_op}, operand0={scalar_operand})"
                 )
             )
         else:

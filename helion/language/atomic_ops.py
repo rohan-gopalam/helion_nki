@@ -383,6 +383,11 @@ def _(state: CodegenState) -> ast.AST:
             elif isinstance(sub_val, slice):
                 dim_size = target_shape[tensor_dim_idx]
                 parts.append(f"0:{dim_size}")
+            elif isinstance(sub_val, torch.Tensor):
+                raise exc.BackendUnsupported(
+                    "nki",
+                    "atomic_add on SBUF tensors does not support tensor-valued indices",
+                )
             else:
                 dim_size = target_shape[tensor_dim_idx]
                 parts.append(f"0:{dim_size}")

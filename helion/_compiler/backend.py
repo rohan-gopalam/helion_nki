@@ -6150,8 +6150,9 @@ class NKIBackend(Backend):
 
         from ..autotuner.nki_search import NKIFiniteSearch
 
+        effort = bound_kernel.settings.autotune_effort
         try:
-            return NKIFiniteSearch(bound_kernel, args, configs=configs).autotune()
+            return NKIFiniteSearch(bound_kernel, args, configs=configs, effort=effort).autotune()
         except Exception as e:
             import logging as _logging
             _logging.getLogger(__name__).warning(

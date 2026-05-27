@@ -36,10 +36,12 @@ NKI_MAX_PARTITION_DIM = 128
 # Maximum free-dim block size (SBUF row size constraint).
 NKI_MAX_FREE_DIM = 512
 
-# Candidate block sizes to try (powers of 2 up to hardware limits).
-# NKI compilation is very slow (~5-10 min per matmul config), so keep these small.
-_PARTITION_CANDIDATES = [32, 128]  # small and large partition sizes
-_FREE_CANDIDATES = [128, 512]      # small and large free sizes
+# Candidate block sizes to try, indexed by effort level.
+# NKI compilation is very slow (~5-10 min per config for complex kernels).
+_PARTITION_CANDIDATES_QUICK = [32, 128]         # 2 values: quick search
+_FREE_CANDIDATES_QUICK = [128, 512]             # 2 values: quick search
+_PARTITION_CANDIDATES_FULL = [16, 32, 64, 128]  # 4 values: full search
+_FREE_CANDIDATES_FULL = [64, 128, 256, 512]     # 4 values: full search
 
 
 def _nki_synchronize() -> None:
@@ -103,11 +105,15 @@ def _is_nki_error(exc: Exception) -> bool:
     return any(p in msg for p in recoverable_patterns)
 
 
-def _generate_nki_configs(config_spec: object) -> list[Config]:
-    """Generate a small set of valid NKI configs to try during autotuning.
+def _generate_nki_configs(
+    config_spec: object,
+    effort: str = "quick",
+) -> list[Config]:
+    """Generate a set of valid NKI configs to try during autotuning.
 
-    NKI compilation is very slow (~5-10 min per config for complex kernels),
-    so we generate only 4-6 representative configs covering the design space.
+    NKI compilation is very slow (~5-10 min per config for complex kernels).
+    "quick" generates 5 representative configs covering the design space.
+    "full" generates up to 17 configs for a more thorough search.
 
     Respects NKI hardware constraints:
     - Partition dim (block_sizes[0]) <= NKI_MAX_PARTITION_DIM
@@ -139,6 +145,10 @@ def _generate_nki_configs(config_spec: object) -> list[Config]:
     if default_block_sizes:
         _add_config(list(default_block_sizes))
 
+    # Choose search breadth based on effort level
+    part_cands = _PARTITION_CANDIDATES_FULL if effort == "full" else _PARTITION_CANDIDATES_QUICK
+    free_cands = _FREE_CANDIDATES_FULL if effort == "full" else _FREE_CANDIDATES_QUICK
+
     if num_block_dims >= 2:
         spec0 = config_spec.block_sizes[0]
         spec1 = config_spec.block_sizes[1]
@@ -150,30 +160,29 @@ def _generate_nki_configs(config_spec: object) -> list[Config]:
         max0 = min(hint0, NKI_MAX_PARTITION_DIM)
         max1 = min(hint1, NKI_MAX_FREE_DIM)
 
-        # Pick a small and large value for each dimension
         def _candidate_sizes(max_val: int, candidates: list[int]) -> list[int]:
             valid = [s for s in candidates if s <= max_val]
             if not valid:
                 return [max(1, max_val)]
-            # Keep only smallest and largest to limit config count
-            return sorted({valid[0], valid[-1]})
+            if effort != "full":
+                # For quick search, keep only smallest and largest
+                return sorted({valid[0], valid[-1]})
+            return valid
 
-        part_sizes = _candidate_sizes(max0, _PARTITION_CANDIDATES)
-        free_sizes = _candidate_sizes(max1, _FREE_CANDIDATES)
+        part_sizes = _candidate_sizes(max0, part_cands)
+        free_sizes = _candidate_sizes(max1, free_cands)
 
         def _fill_remaining(p: int, f: int) -> list[int]:
             bs = [p, f]
             for i in range(2, num_block_dims):
                 if i < len(default_block_sizes):
                     raw = int(default_block_sizes[i])
-                    # Cap non-first dims to reasonable limits
                     capped = min(raw, NKI_MAX_FREE_DIM if i % 2 == 1 else NKI_MAX_PARTITION_DIM)
                     bs.append(capped)
                 else:
                     bs.append(1)
             return bs
 
-        # Generate configs from the corner combinations of (small, large) × (small, large)
         for p in part_sizes:
             for f in free_sizes:
                 _add_config(_fill_remaining(p, f))
@@ -181,8 +190,12 @@ def _generate_nki_configs(config_spec: object) -> list[Config]:
     elif num_block_dims == 1:
         spec0 = config_spec.block_sizes[0]
         hint0 = int(max(spec0.size_hint, 1))
-        valid = [s for s in _FREE_CANDIDATES if s <= hint0]
-        for s in (valid[:1] + valid[-1:] if valid else [min(64, hint0)]):
+        valid = [s for s in free_cands if s <= hint0]
+        if not valid:
+            valid = [min(64, hint0)]
+        if effort != "full":
+            valid = sorted({valid[0], valid[-1]})
+        for s in valid:
             _add_config([s])
 
     return configs
@@ -203,6 +216,7 @@ class NKIFiniteSearch(BaseSearch):
         kernel: _AutotunableKernel,
         args: Sequence[object],
         configs: list[Config] | None = None,
+        effort: str = "quick",
     ) -> None:
         # Bypass base __init__ since it calls torch.accelerator.synchronize().
         # We replicate the minimal initialization needed.
@@ -234,11 +248,11 @@ class NKIFiniteSearch(BaseSearch):
         self._jobs: int = 1
         self._current_generation: int = 0
 
-        # Use provided configs or generate NKI-safe ones.
+        # Use provided configs or generate NKI-safe ones based on effort level.
         if configs is not None:
             self.configs = list(configs)
         else:
-            self.configs = _generate_nki_configs(self.config_spec)
+            self.configs = _generate_nki_configs(self.config_spec, effort=effort)
 
         self.log(f"[NKI autotune] will try {len(self.configs)} configs: {self.configs}")
 

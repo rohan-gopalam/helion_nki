@@ -14,7 +14,7 @@ import helion.language as hl
 DEVICE = xm.xla_device()
 
 
-@helion.kernel(backend="nki")
+@helion.kernel(backend="nki", autotune_effort="quick")
 def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     x, y = torch.broadcast_tensors(x, y)
     out = torch.empty(

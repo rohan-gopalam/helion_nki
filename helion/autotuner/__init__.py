@@ -20,6 +20,8 @@ from .effort_profile import RandomSearchConfig as RandomSearchConfig
 from .external import UserConfigSpec as UserConfigSpec
 from .external import autotune as autotune
 from .finite_search import FiniteSearch as FiniteSearch
+from .nki_search import NKIFiniteSearch as NKIFiniteSearch
+from .nki_search import _generate_nki_configs as _generate_nki_configs
 from .local_cache import LocalAutotuneCache as LocalAutotuneCache
 from .local_cache import StrictLocalAutotuneCache as StrictLocalAutotuneCache
 from .pattern_search import InitialPopulationStrategy as InitialPopulationStrategy

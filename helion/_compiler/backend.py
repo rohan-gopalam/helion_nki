@@ -6145,6 +6145,7 @@ class NKIBackend(Backend):
                 return bound_kernel.kernel.configs[0]
             configs = bound_kernel.kernel.configs
         else:
+            bound_kernel.settings.check_autotuning_disabled()
             configs = None  # let NKIFiniteSearch generate safe candidates
 
         from ..autotuner.nki_search import NKIFiniteSearch

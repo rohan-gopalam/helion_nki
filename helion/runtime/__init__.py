@@ -165,7 +165,9 @@ def default_nki_launcher(
 
     # pyrefly: ignore [operator]
     import sys
-    print("        [Profile] Starting nki_kernel (XLA trace/compile)...", file=sys.stderr)
+    _nki_profile = os.environ.get("HELION_NKI_PROFILE", "0") not in ("0", "false", "")
+    if _nki_profile:
+        print("        [Profile] Starting nki_kernel (XLA trace/compile)...", file=sys.stderr)
     t_nki_start = time.time()
     # New NKI API: kernel[N] sets LNC (Logical NeuronCore count, 1 or 2), not a
     # launch grid. Helion always compiles a single NKI program that handles all
@@ -183,13 +185,16 @@ def default_nki_launcher(
         pass
     result = nki_kernel[lnc](*moved_args, **kwargs)
     t_nki_end = time.time()
-    print(f"        [Profile] nki_kernel took {t_nki_end - t_nki_start:.2f} seconds.", file=sys.stderr)
-    
-    print("        [Profile] Starting xm.mark_step() (XLA execution)...", file=sys.stderr)
+    if _nki_profile:
+        print(f"        [Profile] nki_kernel took {t_nki_end - t_nki_start:.2f} seconds.", file=sys.stderr)
+
+    if _nki_profile:
+        print("        [Profile] Starting xm.mark_step() (XLA execution)...", file=sys.stderr)
     t_mark_start = time.time()
     xm.mark_step()
     t_mark_end = time.time()
-    print(f"        [Profile] xm.mark_step took {t_mark_end - t_mark_start:.2f} seconds.", file=sys.stderr)
+    if _nki_profile:
+        print(f"        [Profile] xm.mark_step took {t_mark_end - t_mark_start:.2f} seconds.", file=sys.stderr)
 
     if first_tensor_device is None:
         return result

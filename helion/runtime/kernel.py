@@ -619,20 +619,25 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             triton_dir = helion_triton_cache_dir(device_index)
             os.environ["TRITON_CACHE_DIR"] = triton_dir
             log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
+        _nki_profile = os.environ.get("HELION_NKI_PROFILE", "0") not in ("0", "false", "")
         try:
-            print("      [Profile] Starting to_triton_code...", file=sys.stderr)
+            if _nki_profile:
+                print("      [Profile] Starting to_triton_code...", file=sys.stderr)
             t_start = time.time()
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
             )
             t_codegen = time.time()
-            print(f"      [Profile] to_triton_code took {t_codegen - t_start:.2f} seconds.", file=sys.stderr)
-            
+            if _nki_profile:
+                print(f"      [Profile] to_triton_code took {t_codegen - t_start:.2f} seconds.", file=sys.stderr)
+
             with measure("BoundKernel.PyCodeCache.load"):
-                print("      [Profile] Starting PyCodeCache.load() [this invokes Inductor/AOT/neuronx-cc]...", file=sys.stderr)
+                if _nki_profile:
+                    print("      [Profile] Starting PyCodeCache.load() [this invokes Inductor/AOT/neuronx-cc]...", file=sys.stderr)
                 module = PyCodeCache.load(triton_code)
                 t_compile = time.time()
-                print(f"      [Profile] PyCodeCache.load took {t_compile - t_codegen:.2f} seconds.", file=sys.stderr)
+                if _nki_profile:
+                    print(f"      [Profile] PyCodeCache.load took {t_compile - t_codegen:.2f} seconds.", file=sys.stderr)
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
@@ -881,11 +886,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self.maybe_log_repro(log.warning, args)
 
         with measure("BoundKernel.kernel_call"):
-            print("      [Profile] Starting self._run(*args) [this triggers NKI AOT compilation]...", file=sys.stderr)
+            _nki_profile = os.environ.get("HELION_NKI_PROFILE", "0") not in ("0", "false", "")
+            if _nki_profile:
+                print("      [Profile] Starting self._run(*args) [this triggers NKI AOT compilation]...", file=sys.stderr)
             t_run_start = time.time()
             res = self._run(*args)
             t_run_end = time.time()
-            print(f"      [Profile] self._run took {t_run_end - t_run_start:.2f} seconds.", file=sys.stderr)
+            if _nki_profile:
+                print(f"      [Profile] self._run took {t_run_end - t_run_start:.2f} seconds.", file=sys.stderr)
             return res
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:

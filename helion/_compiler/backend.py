@@ -1942,13 +1942,19 @@ class NKIOpOverrides:
             except (ValueError, TypeError):
                 pass
             # Var holding constant (e.g. v_0 = 1.0 from lift)?
+            # Do NOT resolve _nki_sbuf_* names — they are SBUF buffers whose
+            # memset value is tracked in _nki_sbuf_constant_values, but they
+            # are tensors, not scalar operands.
             from .compile_environment import CompileEnvironment
 
             env = CompileEnvironment.current()
             state = getattr(env, "_codegen_state", None)
             if state is not None and hasattr(state, "codegen"):
                 cg = state.codegen
-                if hasattr(cg, "get_var_constant_value"):
+                # Skip all generated NKI variables (_nki_*) — they are SBUF
+                # buffers whose memset value is tracked in the constant map but
+                # they are tensors, not scalar operands.
+                if hasattr(cg, "get_var_constant_value") and not x.startswith("_nki_"):
                     val = cg.get_var_constant_value(x)
                     if val is not None:
                         return val
@@ -2350,14 +2356,17 @@ class NKIOpOverrides:
             _bin_state = getattr(_CE_bin.current(), "_codegen_state", None)
 
             def _recover_tensor_ast_operand(operand: object, arg_index: int) -> object:
+                # Only attempt recovery when the operand is a bare numeric
+                # literal (int/float/bool or a string that parses as one).
+                # Named variables like "_nki_sbuf_0" are already correct and
+                # must not be replaced.
                 is_mask_literal = isinstance(operand, (int, float, bool))
-                if isinstance(operand, str):
+                if not is_mask_literal and isinstance(operand, str):
                     try:
                         float(operand)
+                        is_mask_literal = True
                     except (TypeError, ValueError):
                         pass
-                    else:
-                        is_mask_literal = True
                 if not is_mask_literal:
                     return operand
                 if _bin_state is None or len(_bin_node.args) <= arg_index:
@@ -2370,7 +2379,10 @@ class NKIOpOverrides:
                 fx_ast = _bin_state.codegen.ast_for_fx_node(fx_arg)
                 if isinstance(fx_ast, ast.AST):
                     recovered = ast.unparse(fx_ast)
-                    if recovered:
+                    # Only use the recovered name if it looks like a real
+                    # identifier (starts with a letter or underscore), not
+                    # another numeric literal or empty string.
+                    if recovered and (recovered[0].isalpha() or recovered[0] == "_"):
                         return recovered
                 return operand
 
@@ -6121,6 +6133,34 @@ class NKIBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
+        """Autotune NKI kernel by trying a small set of NKI-safe block-size configs.
+
+        Uses NKIFiniteSearch which handles XLA synchronization and catches
+        per-config errors (e.g. SBUF overflow) without aborting the search.
+        Falls back to the safe default config if all configs fail.
+        """
+        if not force and bound_kernel.kernel.configs:
+            # User supplied explicit configs; use finite search over them.
+            if len(bound_kernel.kernel.configs) == 1:
+                return bound_kernel.kernel.configs[0]
+            configs = bound_kernel.kernel.configs
+        else:
+            configs = None  # let NKIFiniteSearch generate safe candidates
+
+        from ..autotuner.nki_search import NKIFiniteSearch
+
+        try:
+            return NKIFiniteSearch(bound_kernel, args, configs=configs).autotune()
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"[NKI autotune] search failed ({type(e).__name__}: {e}), "
+                "falling back to safe default config"
+            )
+            return self._safe_default_config(bound_kernel)
+
+    def _safe_default_config(self, bound_kernel: BoundKernel[Any]) -> Config:
+        """Return a hardware-safe default NKI config (same as old autotune logic)."""
         config = bound_kernel.config_spec.default_config()
         block_sizes = config.config.get("block_sizes")
         if isinstance(block_sizes, list):

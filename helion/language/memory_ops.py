@@ -2286,7 +2286,10 @@ def _(state: CodegenState) -> ast.AST:
                     return int(dim._sympy_().subs(_bs_subs))
                 return int(dim)
 
-            logical_shape = [_resolve_index_dim(dim) for dim in index_val.shape]
+            try:
+                logical_shape = [_resolve_index_dim(dim) for dim in index_val.shape]
+            except Exception:
+                return None
             if len(logical_shape) != 3:
                 return None
             p_count, k_count, m_count = logical_shape
@@ -2312,7 +2315,10 @@ def _(state: CodegenState) -> ast.AST:
                 node_val = node.meta.get("val")
                 if not isinstance(node_val, torch.Tensor):
                     return None
-                node_shape = [_resolve_index_dim(dim) for dim in node_val.shape]
+                try:
+                    node_shape = [_resolve_index_dim(dim) for dim in node_val.shape]
+                except Exception:
+                    return None
                 if node_shape == [p_count, k_count]:
                     return [p_count, k_count]
                 if node_shape == [p_count, k_count, 1]:
@@ -2646,6 +2652,8 @@ def _(state: CodegenState) -> ast.AST:
                 ]
             )
             # Emit chain ops (elementwise transforms between load and reduction).
+            # pre_loop_stmts: ops that must be emitted BEFORE the k-loop (e.g. transpose)
+            pre_loop_stmts: list[ast.AST] = []
             _cur_tile = masked
             assert _chain_ops is not None
             for _chain_node in _chain_ops:
@@ -2657,11 +2665,30 @@ def _(state: CodegenState) -> ast.AST:
                 # be non-zero for invalid elements (e.g. 0 - mean ≠ 0 after subtract).
                 # Re-apply the predicate mask to zero out invalid positions.
                 if _target is torch.ops.aten.where.self:
-                    # The where(mask, x, 0.0) ensures invalid positions are zeroed.
-                    # Since we use OOB scatter (vector_offset=1073741824 for invalid),
-                    # invalid positions are already skipped in the output write.
-                    # No need to re-mask here — just skip the where op.
-                    if False and pred_name is not None:  # disabled: OOB scatter handles it
+                    # For reduce path: must re-mask so invalid positions don't corrupt
+                    # the accumulated sum. For store path: OOB scatter handles it.
+                    _where_false2 = _chain_node.args[2] if len(_chain_node.args) > 2 else None
+                    _is_zero_fill2 = isinstance(_where_false2, (int, float)) and _where_false2 == 0
+                    if not _is_zero_fill2 and isinstance(_where_false2, torch.fx.Node):
+                        _wf_val2 = _where_false2.meta.get("val")
+                        if isinstance(_wf_val2, (int, float)):
+                            _is_zero_fill2 = (_wf_val2 == 0)
+                        elif isinstance(_wf_val2, torch.Tensor) and _wf_val2.numel() == 1:
+                            # Check FX node args for scalar(0) pattern
+                            _wa2 = getattr(_where_false2, 'args', ())
+                            if _wa2 and isinstance(_wa2[0], (int, float)) and _wa2[0] == 0:
+                                _is_zero_fill2 = True
+                            else:
+                                # Try to check constant tensor value using try/except to
+                                # prevent TorchInductor guard errors on SymInt shapes
+                                try:
+                                    with torch.no_grad():
+                                        _val_cpu = _wf_val2.to('cpu')
+                                        _is_zero_fill2 = bool((_val_cpu == 0).all().item())
+                                except Exception:
+                                    pass
+                    _should_remask = _is_zero_fill2 and pred_name is not None and _chain_terminal == "reduce"
+                    if _should_remask:
                         _remasked = device_fn.new_var("_nki_chain_masked", dce=True)
                         device_fn._nki_sbuf_shapes[_remasked] = [p_count, m_count]
                         device_fn._nki_sbuf_dtypes[_remasked] = dtype_str
@@ -2706,7 +2733,7 @@ def _(state: CodegenState) -> ast.AST:
                         _cur_tile = _cast_tile
                     continue
                 # sub/add/mul: tensor-tensor ops
-                if _target in (
+                if _target in (  # sub/add/mul chain ops
                     torch.ops.aten.sub.Tensor,
                     torch.ops.aten.add.Tensor,
                     torch.ops.aten.mul.Tensor,
@@ -2720,8 +2747,9 @@ def _(state: CodegenState) -> ast.AST:
                     # Determine which arg is the current tile and which is "other"
                     _arg0 = _chain_node.args[0] if len(_chain_node.args) > 0 else None
                     _arg1 = _chain_node.args[1] if len(_chain_node.args) > 1 else None
-                    # Check if this is self-op (e.g. mul tile * tile for squaring)
-                    if _arg0 is _arg1:
+                    # Check if this is self-op (e.g. mul tile * tile for squaring).
+                    # Also handles Helion trace of x*x as mul(x, None) (single-arg form).
+                    if _arg0 is _arg1 or (_arg1 is None and _nki_op == "nl.multiply"):
                         body.append(
                             statement_from_string(
                                 f"nisa.tensor_tensor(dst={_cur_tile}, data1={_cur_tile}, "
@@ -2809,8 +2837,19 @@ def _(state: CodegenState) -> ast.AST:
                         _oe_dtype = device_fn._nki_sbuf_dtypes.get(_other_expr, dtype_str)
                         # Use tensor_scalar if we can transpose _other to [p_count, 1]
                         # (broadcasts over free dim m_count). Otherwise fallback to broadcast_to.
+                        # Broadcast the [1, P] mean/rstd to [P, M] or [P, 1] for tensor_tensor.
+                        # Try to broadcast to [p_count, m_count] directly — NKI broadcast_to
+                        # supports [1, N] → [M, N] (repeating partition row).
+                        _bc_tile = device_fn.new_var("_nki_chain_bcast", dce=True)
+                        device_fn._nki_sbuf_shapes[_bc_tile] = [p_count, m_count]
+                        device_fn._nki_sbuf_dtypes[_bc_tile] = dtype_str
                         if _other_shape == [1, p_count]:
-                            # Transpose [1, p_count] → [p_count, 1] for tensor_scalar use
+                            # [1, P] mean/rstd needs to broadcast differently.
+                            # Use a [P, M] broadcast via: first broadcast [1, P] → [1, M*P]
+                            # then reshape — but that's complex. Instead, create [P, M] by
+                            # iterating: for each free pos, copy the mean value via tensor_scalar
+                            # approach. Actually, use [1, P] → [P, 1] via transpose in pre_loop,
+                            # then broadcast [P, 1] → [P, M] via broadcast_to.
                             _tr_p = device_fn.new_var("_nki_chain_tr_psum", dce=True)
                             _tr_s = device_fn.new_var("_nki_chain_tr_sbuf", dce=True)
                             _tr_dtype = "nl.float32" if _oe_dtype in ("nl.int32", "nl.uint32") else _oe_dtype
@@ -2820,32 +2859,31 @@ def _(state: CodegenState) -> ast.AST:
                                 _cast_oe = device_fn.new_var("_nki_chain_cast", dce=True)
                                 device_fn._nki_sbuf_shapes[_cast_oe] = [1, p_count]
                                 device_fn._nki_sbuf_dtypes[_cast_oe] = _tr_dtype
-                                body.append(statement_from_string(
+                                pre_loop_stmts.append(statement_from_string(
                                     f"{_cast_oe} = nl.ndarray([1, {p_count}], {_tr_dtype}, buffer=nl.sbuf)"
                                 ))
-                                body.append(statement_from_string(
+                                pre_loop_stmts.append(statement_from_string(
                                     f"nisa.memset({_cast_oe}, value=0)"
                                 ))
-                                body.append(statement_from_string(
+                                pre_loop_stmts.append(statement_from_string(
                                     f"nisa.tensor_tensor(dst={_cast_oe}, data1={_cast_oe}, data2={_other_expr}, op=nl.add)"
                                 ))
                                 _oe_for_tr = _cast_oe
                             else:
                                 _oe_for_tr = _other_expr
-                            body.append(statement_from_string(
+                            pre_loop_stmts.append(statement_from_string(
                                 f"{_tr_p} = nl.ndarray([{p_count}, 1], {_tr_dtype}, buffer=nl.psum)"
                             ))
-                            body.append(statement_from_string(
+                            pre_loop_stmts.append(statement_from_string(
                                 f"nisa.nc_transpose(dst={_tr_p}, data={_oe_for_tr})"
                             ))
-                            body.append(statement_from_string(
+                            pre_loop_stmts.append(statement_from_string(
                                 f"{_tr_s} = nl.ndarray([{p_count}, 1], {_oe_dtype}, buffer=nl.sbuf)"
                             ))
-                            body.append(statement_from_string(
+                            pre_loop_stmts.append(statement_from_string(
                                 f"nisa.tensor_copy(dst={_tr_s}, src={_tr_p})"
                             ))
-                            _other_bcast = _tr_s
-                            # Override to tensor_scalar path
+                            # Use tensor_scalar with [P,1] operand — broadcasts over free dim
                             if _tile_is_arg0:
                                 body.append(statement_from_string(
                                     f"nisa.tensor_scalar(dst={_cur_tile}, data={_cur_tile}, "
@@ -2867,14 +2905,10 @@ def _(state: CodegenState) -> ast.AST:
                                 ))
                                 _cur_tile = _rev_tile2
                             continue
-                        else:
-                            _bc_tile = device_fn.new_var("_nki_chain_bcast", dce=True)
-                            device_fn._nki_sbuf_shapes[_bc_tile] = [p_count, m_count]
-                            device_fn._nki_sbuf_dtypes[_bc_tile] = dtype_str
-                            body.append(statement_from_string(
-                                f"{_bc_tile} = nl.broadcast_to({_other_expr}, shape=({p_count}, {m_count}))"
-                            ))
-                            _other_bcast = _bc_tile
+                        body.append(statement_from_string(
+                            f"{_bc_tile} = nl.broadcast_to({_other_expr}, shape=({p_count}, {m_count}))"
+                        ))
+                        _other_bcast = _bc_tile
                     if _tile_is_arg0:
                         body.append(
                             statement_from_string(
@@ -3003,6 +3037,9 @@ def _(state: CodegenState) -> ast.AST:
                         f"oob_mode=nisa.oob_mode.skip)"
                     )
                 )
+
+            # Emit pre-loop statements (transposes etc.) at the top of the k-loop body.
+            body = pre_loop_stmts + body
 
             state.codegen.add_statement(
                 create(

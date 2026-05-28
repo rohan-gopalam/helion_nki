@@ -776,7 +776,25 @@ def codegen_stack_nki(ctx: LoweringContext, node: Node) -> object:
         raise NotImplementedError("NKI stack requires output shape metadata")
 
     from .backend import NKIOpOverrides
-    out_shape_full = [int(env.size_hint(d)) if isinstance(d, torch.SymInt) else int(d) for d in out_val.shape]
+    import sympy as _sp_stack
+    _bs_subs_stack: dict[_sp_stack.Symbol, int] = {}
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        _cfg = _bs.from_config(state.config)
+        if isinstance(_cfg, int):
+            _bs_subs_stack[_bs.symbol()] = _cfg
+
+    def _resolve_stack_dim(d: object) -> int:
+        if isinstance(d, int):
+            return d
+        if isinstance(d, torch.SymInt):
+            try:
+                return int(d._sympy_().subs(_bs_subs_stack))
+            except (TypeError, ValueError):
+                return int(env.size_hint(d))
+        return int(d)
+
+    out_shape_full = [_resolve_stack_dim(d) for d in out_val.shape]
     out_shape = NKIOpOverrides._squeeze_shape_2d(out_shape_full)
     if len(out_shape) != 2:
         raise NotImplementedError(f"NKI stack: output shape {out_shape_full} doesn't squeeze to 2D")
@@ -788,7 +806,7 @@ def codegen_stack_nki(ctx: LoweringContext, node: Node) -> object:
     first_val = first_input.meta.get("val") if isinstance(first_input, Node) else None
     if first_val is None or not isinstance(first_val, torch.Tensor):
         raise NotImplementedError("NKI stack: input metadata missing")
-    in_shape_full = [int(env.size_hint(d)) if isinstance(d, torch.SymInt) else int(d) for d in first_val.shape]
+    in_shape_full = [_resolve_stack_dim(d) for d in first_val.shape]
     in_shape = NKIOpOverrides._squeeze_shape_2d(in_shape_full)
     if len(in_shape) != 2:
         raise NotImplementedError(f"NKI stack: input shape {in_shape_full} doesn't squeeze to 2D")

@@ -1385,7 +1385,12 @@ def _(state: CodegenState) -> ast.AST:
     def _resolve_dim(s: int | torch.SymInt) -> int:
         if isinstance(s, int):
             return s
-        return int(s._sympy_().subs(_bs_subs))
+        try:
+            return int(s._sympy_().subs(_bs_subs))
+        except (TypeError, ValueError):
+            # Fallback: use size_hint when symbol substitution fails
+            # (e.g. for computed expressions like 2*block_size_k_packed)
+            return int(env.size_hint(s))
 
     # First pass: resolve block_id per (tensor_dim_idx, subscript_position).
     # We use the FX subscript nodes (which carry live SymInts even when the
@@ -1409,7 +1414,9 @@ def _(state: CodegenState) -> ast.AST:
         fx_node_i = fx_subscript[i] if fx_subscript is not None and i < len(fx_subscript) else None
         bid = _nki_subscript_block_id(sub_val, fx_node_i, env)
         # slice(None) subscripts over reduction blocks: look up by size-match.
-        if bid is None and isinstance(sub_val, slice):
+        # Only match full-dimension slices (slice(None) or equivalent), not
+        # computed partial slices like a_tile_begin:a_tile_begin+a_tile_len.
+        if bid is None and isinstance(sub_val, slice) and sub_val == slice(None):
             dim_size = tensor.size(_tdi)
             for _bid in range(len(env.block_sizes)):
                 bs_info = env.block_sizes[_bid]
@@ -1768,6 +1775,100 @@ def _(state: CodegenState) -> ast.AST:
                 slice_parts.append(_gather)
                 is_scalar_dim.append(False)
                 continue
+
+            # Iota/tensor subscript at non-partition dim: represents a contiguous
+            # range in the free dimension. Detect iota-based subscripts (common for
+            # computed slices like a_tile_begin:a_tile_begin+a_tile_len which trace
+            # as prims.iota) and emit the correct offset+length slice.
+            if (
+                tdi > 0
+                and isinstance(_sub_val_load, torch.Tensor)
+                and isinstance(fx_node_tdi_check, torch.fx.Node)
+            ):
+                # Check if this is an iota-based subscript (prims.iota.default).
+                # The iota represents a contiguous range in the free dimension.
+                # Its kwargs['start'] gives the offset and args[0] gives the length.
+                _fx_target_name = str(getattr(fx_node_tdi_check, "target", ""))
+                _is_iota = "iota" in _fx_target_name
+                if _is_iota:
+                    _fx_val = fx_node_tdi_check.meta.get("val")
+                    if isinstance(_fx_val, torch.Tensor) and _fx_val.ndim == 1:
+                        _iota_len_sym = _fx_val.size(0)
+                        _iota_len = _resolve_dim(_iota_len_sym) if isinstance(_iota_len_sym, torch.SymInt) else int(_iota_len_sym)
+                        # Get the start offset from kwargs['start']
+                        _iota_start_node = fx_node_tdi_check.kwargs.get("start")
+                        _start_expr = "0"
+                        if isinstance(_iota_start_node, torch.fx.Node):
+                            _start_ast = state.codegen.ast_for_fx_node(_iota_start_node)
+                            if isinstance(_start_ast, ast.AST):
+                                _start_expr = ast.unparse(_start_ast)
+                        elif isinstance(_iota_start_node, (int, float)):
+                            _start_expr = str(int(_iota_start_node))
+                        # Emit slice: start:start+len
+                        slice_parts.append(f"{_start_expr}:{_start_expr}+{_iota_len}")
+                        is_scalar_dim.append(False)
+                        continue
+
+            # Computed partial slice: slice(start, stop) where start is not None.
+            # Emit the slice as "start_expr:stop_expr" using FX AST evaluation.
+            if isinstance(_sub_val_load, slice) and _sub_val_load.start is not None:
+                # Get AST for the slice start and stop from FX
+                _slice_start_ast = None
+                _slice_stop_ast = None
+                if isinstance(fx_node_tdi_check, torch.fx.Node):
+                    # FX slice nodes have args[0]=start, args[1]=stop or similar
+                    # Actually the FX subscript for a slice is represented differently.
+                    # The slice values are in sub_val directly.
+                    _start_val = _sub_val_load.start
+                    _stop_val = _sub_val_load.stop
+                    if isinstance(_start_val, torch.SymInt):
+                        _start_expr = state.sympy_expr(_start_val._sympy_())
+                    elif isinstance(_start_val, int):
+                        _start_expr = str(_start_val)
+                    else:
+                        _start_expr = str(_start_val)
+                    if isinstance(_stop_val, torch.SymInt):
+                        _stop_expr = state.sympy_expr(_stop_val._sympy_())
+                    elif isinstance(_stop_val, int):
+                        _stop_expr = str(_stop_val)
+                    else:
+                        _stop_expr = str(_stop_val)
+                    # Check if the dynamic range loop has a counter that can be used
+                    _dyn_loops = getattr(state.device_function, "_nki_dyn_loops", {})
+                    _is_in_dyn_loop = any(
+                        bid_candidate in _dyn_loops
+                        for bid_candidate in state.codegen.active_device_loops
+                    )
+                    if _is_in_dyn_loop:
+                        # Use __DYN_AP__ sentinel with the slice extent
+                        try:
+                            _slice_len = int(_stop_val) - int(_start_val) if isinstance(_start_val, int) and isinstance(_stop_val, int) else None
+                        except (TypeError, ValueError):
+                            _slice_len = None
+                        if _slice_len is None:
+                            # Try computing length from SymInt
+                            if isinstance(_start_val, torch.SymInt) and isinstance(_stop_val, torch.SymInt):
+                                _len_sympy = _stop_val._sympy_() - _start_val._sympy_()
+                                _len_sympy_subbed = _len_sympy.subs(_bs_subs)
+                                try:
+                                    _slice_len = int(_len_sympy_subbed)
+                                except (TypeError, ValueError):
+                                    _slice_len = int(env.size_hint(_stop_val)) - int(env.size_hint(_start_val))
+                        if _slice_len is not None:
+                            # Find the dyn loop counter to express start in terms of
+                            for _bid_c, _dyn_info_c in _dyn_loops.items():
+                                _counter_c = _dyn_info_c.get("counter_float") or _dyn_info_c.get("counter")
+                                if _counter_c:
+                                    slice_parts.append(f"__DYN_AP__{_counter_c}__{_slice_len}")
+                                    is_scalar_dim.append(False)
+                                    break
+                            else:
+                                slice_parts.append(f"{_start_expr}:{_stop_expr}")
+                                is_scalar_dim.append(False)
+                            continue
+                    slice_parts.append(f"{_start_expr}:{_stop_expr}")
+                    is_scalar_dim.append(False)
+                    continue
 
             # Fixed slice for this dimension.
             size_i = tensor.size(tdi)

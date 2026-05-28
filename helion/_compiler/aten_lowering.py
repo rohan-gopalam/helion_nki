@@ -976,6 +976,26 @@ def codegen_expand_nki(ctx: LoweringContext, node: Node) -> object:
         and dst_shape[1] > 1
     ):
         dtype_str = env.backend.dtype_str(val.dtype)
+        # nc_transpose requires float input. Cast int/bool to float32 first.
+        _int_dtypes_expand = {"nl.int32", "nl.int16", "nl.int8", "nl.uint32",
+                              "nl.uint16", "nl.uint8", "nl.bool_"}
+        _tr_src = tensor_name
+        _tr_dtype = dtype_str
+        if dtype_str in _int_dtypes_expand:
+            _cast_expand = state.device_function.new_var("_nki_expand_cast", dce=True)
+            state.device_function._nki_sbuf_shapes[_cast_expand] = [1, src_shape[1]]
+            state.device_function._nki_sbuf_dtypes[_cast_expand] = "nl.float32"
+            state.add_statement(statement_from_string(
+                f"{_cast_expand} = nl.ndarray([1, {src_shape[1]}], nl.float32, buffer=nl.sbuf)"
+            ))
+            state.add_statement(statement_from_string(
+                f"nisa.memset({_cast_expand}, value=0)"
+            ))
+            state.add_statement(statement_from_string(
+                f"nisa.tensor_tensor(dst={_cast_expand}, data1={_cast_expand}, data2={tensor_name}, op=nl.add)"
+            ))
+            _tr_src = _cast_expand
+            _tr_dtype = "nl.float32"
         tr_psum = state.device_function.new_var("_nki_expand_tr_psum", dce=True)
         tr_sbuf = state.device_function.new_var("_nki_expand_tr_sbuf", dce=True)
         state.device_function._nki_sbuf_shapes[tr_sbuf] = [dst_shape[0], 1]
@@ -983,12 +1003,12 @@ def codegen_expand_nki(ctx: LoweringContext, node: Node) -> object:
         state.add_statement(
             statement_from_string(
                 f"{tr_psum} = nl.ndarray([{dst_shape[0]}, 1], "
-                f"{dtype_str}, buffer=nl.psum)"
+                f"{_tr_dtype}, buffer=nl.psum)"
             )
         )
         state.add_statement(
             statement_from_string(
-                f"nisa.nc_transpose(dst={tr_psum}, data={tensor_name})"
+                f"nisa.nc_transpose(dst={tr_psum}, data={_tr_src})"
             )
         )
         state.add_statement(

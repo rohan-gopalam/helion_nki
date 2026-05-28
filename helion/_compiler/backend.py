@@ -5320,8 +5320,9 @@ class NKIBackend(Backend):
         """NKI: use nl.sequential_range with literal step (no tl.range / constexpr).
 
         When this loop has a dynamic (tensor-valued) bound, the tile_strategy
-        has pre-emitted a register setup and stashed the register var name on
-        ``device_function._nki_dyn_range_end_var``. Use dynamic_range instead.
+        has pre-emitted a register setup and stashed info in ``_nki_dyn_loops``.
+        Check if the end expression matches a dynamic bound and use
+        dynamic_range with the pre-allocated register.
         """
         begin_part = begin if begin is not None else "0"
         step_part = step if step is not None else "1"
@@ -5330,10 +5331,33 @@ class NKIBackend(Backend):
         _state = getattr(_env, "_codegen_state", None)
         _dyn_reg = None
         if _state is not None:
+            # First try the legacy single-var path (consumed once)
             _dyn_reg = getattr(_state.device_function, "_nki_dyn_range_end_var", None)
+            if _dyn_reg is not None:
+                _state.device_function._nki_dyn_range_end_var = None
+            else:
+                # Check if 'end' matches a dynamic loop bound by looking at
+                # _nki_dyn_loops entries where the bound_sbuf matches end.
+                _dyn_loops = getattr(_state.device_function, "_nki_dyn_loops", {})
+                _end_str = str(end)
+                for _blk_id, _dyn_info in _dyn_loops.items():
+                    _bound_sbuf = _dyn_info.get("bound_sbuf", "")
+                    # Match either exact name or _copy-stripped version
+                    _match = _end_str == _bound_sbuf
+                    if not _match:
+                        _stripped = _end_str
+                        while "_copy" in _stripped:
+                            _stripped = _stripped[:_stripped.rfind("_copy")]
+                        _match = _stripped == _bound_sbuf
+                    if not _match:
+                        _stripped2 = _bound_sbuf
+                        while "_copy" in _stripped2:
+                            _stripped2 = _stripped2[:_stripped2.rfind("_copy")]
+                        _match = _end_str == _stripped2 or (_stripped == _stripped2 and _stripped != _end_str)
+                    if _match:
+                        _dyn_reg = _dyn_info.get("reg")
+                        break
         if _dyn_reg is not None:
-            # Consume once so nested loops don't reuse.
-            _state.device_function._nki_dyn_range_end_var = None
             return f"nl.dynamic_range({begin_part}, {_dyn_reg}, {step_part})"
         return f"nl.sequential_range({begin_part}, {end}, {step_part})"
 

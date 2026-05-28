@@ -3157,10 +3157,36 @@ def _(state: CodegenState) -> ast.AST:
                 else:
                     f_start = "0"
                     f_count = free_dims[0] if free_dims else f_total
-                pattern = f"[[{f_total}, {p_count}], [1, {f_count}]]"
+                # Reshape tensor to [total_elements, 1] and use flat indices.
+                # vector_offset contains row indices; compute flat offsets:
+                # flat_offset[p] = vector_offset[p] * f_total + f_start
+                # Then use pattern [[1, P], [1, F_count]].
+                _total_elems = "*".join(hbm_dim_size_strs) if hbm_dim_size_strs else str(f_total)
+                _f_start_int = 0
+                try:
+                    _f_start_int = int(f_start)
+                except (ValueError, TypeError):
+                    pass
+                # Reshape tensor to [total_elements, 1] and compute flat indices.
+                # vector_offset contains row indices; flat_offset = row * f_total + f_start
+                _flat_vec = device_fn.new_var("_ig_flat_vec", dce=True)
+                device_fn._nki_sbuf_shapes[_flat_vec] = [p_count, 1]
+                device_fn._nki_sbuf_dtypes[_flat_vec] = "nl.uint32"
+                from .._compiler.ast_extension import statement_from_string as _sfs_ig
+                state.codegen.add_statement(_sfs_ig(
+                    f"{_flat_vec} = nl.ndarray([{p_count}, 1], nl.uint32, buffer=nl.sbuf)"
+                ))
+                state.codegen.add_statement(_sfs_ig(
+                    f"nisa.tensor_scalar(dst={_flat_vec}, data={vec_offset}, op0=nl.multiply, operand0={f_total}, op1=None)"
+                ))
+                if _f_start_int != 0:
+                    state.codegen.add_statement(_sfs_ig(
+                        f"nisa.tensor_scalar(dst={_flat_vec}, data={_flat_vec}, op0=nl.add, operand0={f_start}, op1=None)"
+                    ))
+                pattern = f"[[1, {p_count}], [1, {f_count}]]"
                 return (
-                    f"{name_str}.ap(pattern={pattern}, offset={f_start}, "
-                    f"vector_offset={vec_offset}, indirect_dim=0)"
+                    f"{name_str}.reshape([{_total_elems}, 1]).ap(pattern={pattern}, "
+                    f"vector_offset={_flat_vec}, indirect_dim=0)"
                 )
 
         # Handle vector_offset gather first
@@ -3757,7 +3783,11 @@ def _(state: CodegenState) -> None:
                 and tensor.dim() == 2
                 and isinstance(sub_val, torch.Tensor)
             ):
-                row_scatter = _nki_row_index_gather(fx_node_i, state, None)
+                # Get partition size from the value being stored
+                _store_val_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
+                _store_val_shape = device_fn._nki_sbuf_shapes.get(_store_val_name)
+                _store_p_count = _store_val_shape[0] if _store_val_shape and len(_store_val_shape) >= 1 else None
+                row_scatter = _nki_row_index_gather(fx_node_i, state, _store_p_count)
                 if row_scatter is not None:
                     slice_parts.append(row_scatter)
                     is_scalar_dim_s.append(False)

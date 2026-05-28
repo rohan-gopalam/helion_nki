@@ -1405,7 +1405,7 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 if isinstance(bs_info.size, (int, torch.SymInt)):
                     ends[i] = bs_info.size
                     proxy_ends[i] = bs_info.size
-                elif bs_info.size is None and len(block_ids) == 1:
+                elif bs_info.size is None:
                     # Dynamic bound: emit register setup + SBUF counter.
                     # The loop body will rewrite offset_var uses to reference
                     # the counter tile.
@@ -1525,6 +1525,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         block_id_to_info = {}
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
+        # If we set up _nki_dyn_loops above, clear the legacy single-var
+        # so the range_str fallback doesn't consume it for the wrong dimension.
+        if getattr(state.device_function, "_nki_dyn_loops", {}):
+            state.device_function._nki_dyn_range_end_var = None
         for block_idx, block_size, begin, end, proxy_end in self._reorder(
             [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
         ):
@@ -1551,24 +1555,47 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
 
-            for_node = create(
-                ast.For,
-                target=create(ast.Name, id=offset_var, ctx=ast.Store()),
-                iter=expr_from_string(
-                    self.get_range_call_str(
-                        state.config,
-                        [block_idx],
-                        begin="{begin}",
-                        end="{end}",
-                        step=block_size_var,
+            # For dynamic-bound loops (block_idx in _nki_dyn_loops), emit
+            # nl.dynamic_range with the pre-allocated register directly instead
+            # of going through range_str (which can't know the block_id).
+            _dyn_info_here = getattr(state.device_function, "_nki_dyn_loops", {}).get(block_idx)
+            if _dyn_info_here is not None and env.backend.name == "nki":
+                _dyn_reg_here = _dyn_info_here["reg"]
+                _begin_str = "0"
+                if isinstance(begin, int):
+                    _begin_str = str(begin)
+                for_node = create(
+                    ast.For,
+                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                    iter=expr_from_string(
+                        f"nl.dynamic_range({_begin_str}, {_dyn_reg_here}, {block_size_var})"
                     ),
-                    begin=self._to_ast(begin, to_dtype=dtype),
-                    end=self._to_ast(end, to_dtype=dtype),
-                ),
-                body=body,
-                orelse=[],
-                type_comment=None,
-            )
+                    body=body,
+                    orelse=[],
+                    type_comment=None,
+                )
+                # Consume the legacy single-var if it was set for this block
+                if getattr(state.device_function, "_nki_dyn_range_end_var", None) == _dyn_reg_here:
+                    state.device_function._nki_dyn_range_end_var = None
+            else:
+                for_node = create(
+                    ast.For,
+                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                    iter=expr_from_string(
+                        self.get_range_call_str(
+                            state.config,
+                            [block_idx],
+                            begin="{begin}",
+                            end="{end}",
+                            step=block_size_var,
+                        ),
+                        begin=self._to_ast(begin, to_dtype=dtype),
+                        end=self._to_ast(end, to_dtype=dtype),
+                    ),
+                    body=body,
+                    orelse=[],
+                    type_comment=None,
+                )
             assert for_node.body is body
             uses_thread_axis = self._uses_thread_axis(block_size)
             axis = thread_axis_offset + thread_axis_map[block_idx]

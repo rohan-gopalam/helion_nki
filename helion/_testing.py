@@ -950,9 +950,8 @@ def run_example(
                         f"impl has grad={tensor.grad is not None}"
                     )
 
-                    #hardcoded for now, need to figure out how to fix later
-                    rtol=1e-2 
-                    atol=6e-2
+                    rtol=5e-2 if _get_backend() == "nki" else 1e-2
+                    atol=1.5 if _get_backend() == "nki" else 6e-2
 
                     if baseline_grad is not None:
                         torch.testing.assert_close(

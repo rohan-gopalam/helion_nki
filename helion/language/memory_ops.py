@@ -557,10 +557,25 @@ def _nki_shifted_tile_subscript(
         """If ``node`` is ``tile.index`` (FX value is a 1D SymInt-tensor),
         return its block_id.  tile.index gets lowered as a tensor-valued
         node whose shape is ``[block_size]`` symbolically.
+        Also recognizes scalar grid loop variables (block_size == 1).
         """
         if not isinstance(node, torch.fx.Node):
             return None
         val = node.meta.get("val")
+        # Scalar grid loop variable (hl.grid): val is int or SymInt, block_size=1
+        if isinstance(val, (int, torch.SymInt)):
+            node_ast = state.codegen.ast_for_fx_node(node)
+            if isinstance(node_ast, ast.AST):
+                node_expr = ast.unparse(node_ast)
+                for bid in state.codegen.active_device_loops:
+                    try:
+                        block_size = int(
+                            env.block_sizes[bid].from_config_assert(state.config)
+                        )
+                    except Exception:
+                        continue
+                    if block_size == 1 and node_expr == state.codegen.offset_var(bid):
+                        return bid
         if isinstance(val, torch.Tensor) and val.ndim == 1:
             size = val.size(0)
             if isinstance(size, torch.SymInt):
@@ -1252,12 +1267,13 @@ def _nki_subscript_block_id(
         if bid is not None:
             return bid
         sym_expr = sub_val._sympy_()
-        free = getattr(sym_expr, "free_symbols", None)
-        if free:
-            for sym in free:
-                bid = env.get_block_id(sym)
-                if bid is not None:
-                    return bid
+        # Only match a bare symbol (e.g. u2), not a compound expression
+        # like u2 + 1. Compound expressions containing a block symbol should
+        # be handled by _nki_shifted_tile_subscript instead.
+        if isinstance(sym_expr, _sp.Symbol):
+            bid = env.get_block_id(sym_expr)
+            if bid is not None:
+                return bid
 
     # 2. FX node's meta["val"] (survives even if sub_val was concretized).
     if isinstance(fx_node_i, torch.fx.Node):
@@ -1267,12 +1283,11 @@ def _nki_subscript_block_id(
             if bid is not None:
                 return bid
             sym_expr = fx_val._sympy_()
-            free = getattr(sym_expr, "free_symbols", None)
-            if free:
-                for sym in free:
-                    bid = env.get_block_id(sym)
-                    if bid is not None:
-                        return bid
+            # Same as above: only match bare symbols.
+            if isinstance(sym_expr, _sp.Symbol):
+                bid = env.get_block_id(sym_expr)
+                if bid is not None:
+                    return bid
         elif isinstance(fx_val, _sp.Expr):
             free = getattr(fx_val, "free_symbols", None)
             if free:
@@ -2638,8 +2653,27 @@ def _(state: CodegenState) -> ast.AST:
                 # _mask_to: no-op on NKI (masking already done by predicated copy)
                 if _target is _mask_to_fn:
                     continue
-                # where(mask, value, 0.0): zero-fill invalid positions — already done
+                # where(mask, value, 0.0): after chain transforms, some positions may
+                # be non-zero for invalid elements (e.g. 0 - mean ≠ 0 after subtract).
+                # Re-apply the predicate mask to zero out invalid positions.
                 if _target is torch.ops.aten.where.self:
+                    # Check if false branch is 0 (scalar) — then re-mask the tile
+                    _where_false = _chain_node.args[2] if len(_chain_node.args) > 2 else None
+                    _is_zero_fill = isinstance(_where_false, (int, float)) and _where_false == 0
+                    if _is_zero_fill and pred_name is not None:
+                        _remasked = device_fn.new_var("_nki_chain_masked", dce=True)
+                        device_fn._nki_sbuf_shapes[_remasked] = [p_count, m_count]
+                        device_fn._nki_sbuf_dtypes[_remasked] = dtype_str
+                        body.append(statement_from_string(
+                            f"{_remasked} = nl.ndarray([{p_count}, {m_count}], {dtype_str}, buffer=nl.sbuf)"
+                        ))
+                        body.append(statement_from_string(
+                            f"nisa.memset({_remasked}, value=0)"
+                        ))
+                        body.append(statement_from_string(
+                            f"nisa.tensor_copy_predicated(dst={_remasked}, src={_cur_tile}, predicate={pred_name})"
+                        ))
+                        _cur_tile = _remasked
                     continue
                 # convert_element_type: dtype cast
                 if _target is torch.ops.prims.convert_element_type.default:
@@ -2834,13 +2868,32 @@ def _(state: CodegenState) -> ast.AST:
                 if _store_out_buf is None:
                     # Can't get/create output buffer; fall back
                     return None
+                # For invalid positions, set scatter destination to OOB so writes
+                # are skipped (preventing invalid k-positions from overwriting valid ones).
+                _safe_base_u32 = base_u32
+                if row_pred_col is not None:
+                    _safe_offsets = device_fn.new_var("_nki_scatter_safe_offsets", dce=True)
+                    device_fn._nki_sbuf_shapes[_safe_offsets] = [p_count, 1]
+                    device_fn._nki_sbuf_dtypes[_safe_offsets] = "nl.uint32"
+                    body.append(statement_from_string(
+                        f"{_safe_offsets} = nl.ndarray([{p_count}, 1], nl.uint32, buffer=nl.sbuf)"
+                    ))
+                    # Use a large static OOB value; actual tensor size < 2^30 in practice
+                    body.append(statement_from_string(
+                        f"nisa.memset({_safe_offsets}, value=1073741824)"
+                    ))
+                    body.append(statement_from_string(
+                        f"nisa.tensor_copy_predicated(dst={_safe_offsets}, "
+                        f"src={base_u32}, predicate={row_pred_col})"
+                    ))
+                    _safe_base_u32 = _safe_offsets
                 # Emit scatter DMA: write _cur_tile back to the output tensor at this k-step.
                 body.append(
                     statement_from_string(
                         f"nisa.dma_copy("
                         f"dst={_store_out_buf}.reshape([{_out_flat_extent}, 1]).ap("
                         f"pattern=[[1, {p_count}], [1, {m_count}]], "
-                        f"vector_offset={base_u32}, indirect_dim=0), "
+                        f"vector_offset={_safe_base_u32}, indirect_dim=0), "
                         f"src={_cur_tile}, "
                         f"oob_mode=nisa.oob_mode.skip)"
                     )
@@ -3264,10 +3317,11 @@ def _(state: CodegenState) -> ast.AST:
                 # Then use pattern [[1, P], [1, F_count]].
                 _total_elems = "*".join(hbm_dim_size_strs) if hbm_dim_size_strs else str(f_total)
                 _f_start_int = 0
+                _f_start_is_dynamic = False
                 try:
                     _f_start_int = int(f_start)
                 except (ValueError, TypeError):
-                    pass
+                    _f_start_is_dynamic = (f_start != "0")
                 # Reshape tensor to [total_elements, 1] and compute flat indices.
                 # vector_offset contains row indices; flat_offset = row * f_total + f_start
                 _flat_vec = device_fn.new_var("_ig_flat_vec", dce=True)
@@ -3280,7 +3334,7 @@ def _(state: CodegenState) -> ast.AST:
                 state.codegen.add_statement(_sfs_ig(
                     f"nisa.tensor_scalar(dst={_flat_vec}, data={vec_offset}, op0=nl.multiply, operand0={f_total}, op1=None)"
                 ))
-                if _f_start_int != 0:
+                if _f_start_int != 0 or _f_start_is_dynamic:
                     state.codegen.add_statement(_sfs_ig(
                         f"nisa.tensor_scalar(dst={_flat_vec}, data={_flat_vec}, op0=nl.add, operand0={f_start}, op1=None)"
                     ))
@@ -3435,6 +3489,7 @@ def _(state: CodegenState) -> ast.AST:
 
     def _slice_bounds_guard(parts: list[str]) -> str | None:
         """Return a Python guard that makes every static HBM slice in-bounds."""
+        import re as _re_bounds
         checks: list[str] = []
         for dim_idx, part in enumerate(parts):
             if dim_idx >= len(hbm_dim_size_strs):
@@ -3451,6 +3506,32 @@ def _(state: CodegenState) -> ast.AST:
             dim_size_str = hbm_dim_size_strs[dim_idx]
             checks.append(f"({start}) >= 0")
             checks.append(f"({end}) <= {dim_size_str}")
+            # Additional inner-dimension bound: when start is "A * stride + tile_offset"
+            # (scalar * constant + loop_var), add "tile_offset + block <= stride" so
+            # the tile doesn't overflow into the next scalar block. This prevents
+            # 3D-flattened 2D accesses (e.g. W[e*K + k_tile]) from reading across
+            # expert boundaries when K is not a multiple of the block size.
+            # Pattern: start = "X * stride + offset_N" or "X + offset_N"
+            _inner_m = _re_bounds.match(
+                r'^(.+\*\s*(\d+))\s*\+\s*(offset_\d+)$', start
+            )
+            if not _inner_m:
+                # Try stripping outer parentheses
+                _start_stripped = start.strip('()')
+                _inner_m = _re_bounds.match(
+                    r'^(.+\*\s*(\d+))\s*\+\s*(offset_\d+)$', _start_stripped
+                )
+            if _inner_m:
+                _stride_str = _inner_m.group(2)
+                _tile_offset = _inner_m.group(3)
+                # end contains "start + block_size"; extract block_size
+                _end_m = _re_bounds.match(
+                    r'^(.+)\s*\+\s*(\d+)$', end
+                )
+                if _end_m:
+                    _block_size = _end_m.group(2)
+                    # Check tile_offset + block_size <= stride (inner bound)
+                    checks.append(f"({_tile_offset}) + {_block_size} <= {_stride_str}")
         if not checks:
             return None
         return " and ".join(checks)
@@ -3538,16 +3619,110 @@ def _(state: CodegenState) -> ast.AST:
         stmt = statement_from_string(f"nisa.dma_copy(dst={dst}, src={src}{oob_arg})")
         guard = _slice_bounds_guard(parts) if parts else None
         if guard is not None:
+            import re as _re_guard
+            tail_cases = (
+                _single_tail_load_cases(dst, hbm_base, parts)
+                if hbm_base is not None and parts is not None
+                else []
+            )
+            # Also add inner-bound partial DMA cases for 3D-flattened accesses.
+            # When the partition start is "scalar * stride + tile_offset" and the
+            # tile_offset overflows the inner stride (K per expert), generate a
+            # partial load that only reads the valid elements.
+            if hbm_base is not None and parts is not None and len(parts) >= 1:
+                _part0 = parts[0]
+                if ":" in _part0 and not _part0.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__")):
+                    _p0_start, _p0_end = _part0.split(":", 1)
+                    _p0_start = _p0_start.strip().strip("()")
+                    _inner_m2 = _re_guard.match(r'^(.+\*\s*(\d+))\s*\+\s*(offset_\d+)$', _p0_start)
+                    if _inner_m2:
+                        _stride2 = _inner_m2.group(2)
+                        _tile_var2 = _inner_m2.group(3)
+                        _p0_end2 = _p0_end.strip()
+                        _block_m2 = _re_guard.match(r'^.+\+\s*(\d+)$', _p0_end2)
+                        if _block_m2:
+                            _blk2 = _block_m2.group(1)
+                            # Partial case: tile_var overflows inner stride
+                            # Condition: tile_var >= 0 and tile_var < stride and tile_var + block > stride
+                            _inner_overflow_cond = (
+                                f"({_tile_var2}) >= 0 and ({_tile_var2}) < {_stride2} "
+                                f"and ({_tile_var2}) + {_blk2} > {_stride2}"
+                            )
+                            # Also check outer bounds still valid and all other
+                            # dims are fully in-bounds (no multi-tail scenario)
+                            if len(hbm_dim_size_strs) > 0:
+                                _inner_overflow_cond += f" and ({_p0_start}) >= 0 and ({_p0_start}) + {_stride2} - ({_tile_var2}) <= {hbm_dim_size_strs[0]}"
+                            for _other_i, _other_p in enumerate(parts[1:], 1):
+                                if ":" in _other_p and _other_i < len(hbm_dim_size_strs):
+                                    _os, _oe = _other_p.split(":", 1)
+                                    _inner_overflow_cond += f" and ({_oe.strip()}) <= {hbm_dim_size_strs[_other_i]}"
+                            # Build partial src/dst slices
+                            _p0_base = _inner_m2.group(1)  # "scalar * stride"
+                            _inner_partial_len = f"{_stride2} - ({_tile_var2})"
+                            _partial_src_parts = [f"{_p0_start}:{_p0_base} + {_stride2}"] + parts[1:]
+                            _partial_src = f"{hbm_base}[{', '.join(_partial_src_parts)}]"
+                            # For the dst SBUF, use 0-based indexing in the free dim
+                            # (the SBUF tile is always indexed from 0, unlike the HBM src)
+                            _free_count = _blk2  # default free count from block size
+                            if len(parts) > 1:
+                                _free_part = parts[1]
+                                if ":" in _free_part:
+                                    _fp_start, _fp_end = _free_part.split(":", 1)
+                                    _fp_end = _fp_end.strip()
+                                    _fp_start = _fp_start.strip()
+                                    _fpm = _re_guard.match(r'^.+\+\s*(\d+)$', _fp_end)
+                                    if _fpm:
+                                        _free_count = _fpm.group(1)
+                            _partial_dst = f"{dst}[0:{_inner_partial_len}, 0:{_free_count}]"
+                            _partial_stmt = statement_from_string(
+                                f"nisa.dma_copy(dst={_partial_dst}, src={_partial_src})"
+                            )
+                            _inner_tail_cases = [
+                                create(
+                                    ast.If,
+                                    test=expr_from_string(_inner_overflow_cond),
+                                    body=[_partial_stmt],
+                                    orelse=[],
+                                )
+                            ]
+                            # Also add combined K-tail + other-dim-tail cases
+                            if len(parts) == 2 and len(hbm_dim_size_strs) >= 2:
+                                _free_part2 = parts[1]
+                                if ":" in _free_part2:
+                                    _fp2_start, _fp2_end = _free_part2.split(":", 1)
+                                    _fp2_start = _fp2_start.strip()
+                                    _fp2_end = _fp2_end.strip()
+                                    _fp2_size = hbm_dim_size_strs[1]
+                                    # Combined case: K overflow AND free-dim overflow
+                                    _combined_cond = (
+                                        f"({_tile_var2}) >= 0 and ({_tile_var2}) < {_stride2} "
+                                        f"and ({_tile_var2}) + {_blk2} > {_stride2} "
+                                        f"and ({_p0_start}) >= 0 "
+                                        f"and ({_fp2_start}) >= 0 "
+                                        f"and ({_fp2_start}) < {_fp2_size} "
+                                        f"and ({_fp2_end}) > {_fp2_size}"
+                                    )
+                                    _combined_dst = f"{dst}[0:{_inner_partial_len}, 0:{_fp2_size} - ({_fp2_start})]"
+                                    _combined_src_parts = [f"{_p0_start}:{_p0_base} + {_stride2}", f"{_fp2_start}:{_fp2_size}"]
+                                    _combined_src = f"{hbm_base}[{', '.join(_combined_src_parts)}]"
+                                    _combined_stmt = statement_from_string(
+                                        f"nisa.dma_copy(dst={_combined_dst}, src={_combined_src})"
+                                    )
+                                    _inner_tail_cases.append(
+                                        create(
+                                            ast.If,
+                                            test=expr_from_string(_combined_cond),
+                                            body=[_combined_stmt],
+                                            orelse=[],
+                                        )
+                                    )
+                            tail_cases = tail_cases + _inner_tail_cases
             state.codegen.add_statement(
                 create(
                     ast.If,
                     test=expr_from_string(guard),
                     body=[stmt],
-                    orelse=(
-                        _single_tail_load_cases(dst, hbm_base, parts)
-                        if hbm_base is not None and parts is not None
-                        else []
-                    ),
+                    orelse=tail_cases,
                 )
             )
         else:

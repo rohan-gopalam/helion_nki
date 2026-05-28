@@ -999,7 +999,11 @@ def codegen_expand_nki(ctx: LoweringContext, node: Node) -> object:
         tr_psum = state.device_function.new_var("_nki_expand_tr_psum", dce=True)
         tr_sbuf = state.device_function.new_var("_nki_expand_tr_sbuf", dce=True)
         state.device_function._nki_sbuf_shapes[tr_sbuf] = [dst_shape[0], 1]
-        state.device_function._nki_sbuf_dtypes[tr_sbuf] = dtype_str
+        # When the transpose cast via float32, keep tr_sbuf as float32 to avoid
+        # a float32 psum -> bool_ bitcast (which destroys the data). The where
+        # lowering handles the bool->uint32 cast separately.
+        _tr_sbuf_dtype = _tr_dtype if _tr_dtype != dtype_str else dtype_str
+        state.device_function._nki_sbuf_dtypes[tr_sbuf] = _tr_sbuf_dtype
         state.add_statement(
             statement_from_string(
                 f"{tr_psum} = nl.ndarray([{dst_shape[0]}, 1], "
@@ -1014,7 +1018,7 @@ def codegen_expand_nki(ctx: LoweringContext, node: Node) -> object:
         state.add_statement(
             statement_from_string(
                 f"{tr_sbuf} = nl.ndarray([{dst_shape[0]}, 1], "
-                f"{dtype_str}, buffer=nl.sbuf)"
+                f"{_tr_sbuf_dtype}, buffer=nl.sbuf)"
             )
         )
         state.add_statement(
@@ -1029,9 +1033,15 @@ def codegen_expand_nki(ctx: LoweringContext, node: Node) -> object:
         )
 
     dtype_str = env.backend.dtype_str(val.dtype)
+    # When we transposed via float32, src_for_broadcast is float32.
+    # Use the actual src dtype for the broadcast output to avoid
+    # float32 → bool_ invalid bitcasts.
+    _out_dtype = state.device_function._nki_sbuf_dtypes.get(
+        src_for_broadcast if isinstance(src_for_broadcast, str) else "", dtype_str
+    )
     out = state.device_function.new_var("_nki_expand", dce=True)
     state.device_function._nki_sbuf_shapes[out] = list(dst_shape)
-    state.device_function._nki_sbuf_dtypes[out] = dtype_str
+    state.device_function._nki_sbuf_dtypes[out] = _out_dtype
     state.add_statement(
         statement_from_string(
             f"{out} = nl.broadcast_to({src_for_broadcast}, "

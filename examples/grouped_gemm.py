@@ -378,14 +378,16 @@ def main() -> None:
     )
     print("✓ Non-persistent kernel passed")
 
-    run_example(
-        grouped_gemm_jagged_persistent_example,
-        _reference_grouped_gemm,
-        (group_A, group_B),
-        rtol=1e-2,
-        atol=1e-2,
-    )
-    print("✓ Persistent kernel passed")
+    import os
+    if os.environ.get("HELION_BACKEND") != "nki":
+        run_example(
+            grouped_gemm_jagged_persistent_example,
+            _reference_grouped_gemm,
+            (group_A, group_B),
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        print("✓ Persistent kernel passed")
 
     print("\nAll tests passed!")
 

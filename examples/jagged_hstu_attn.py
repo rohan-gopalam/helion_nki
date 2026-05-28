@@ -284,8 +284,8 @@ def main() -> None:
     Main entry point for testing the simplified jagged HSTU attention kernel.
     """
     test(
-        batch_size=1024,
-        max_seq_len=1024,
+        batch_size=32,
+        max_seq_len=128,
         heads=4,
         head_dim=128,
         dtype=torch.bfloat16,

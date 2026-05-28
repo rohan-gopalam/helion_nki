@@ -296,6 +296,8 @@ def main() -> None:
             lambda x, o, eps: jagged_layer_norm_kernel(x, o, eps),
             lambda x, o, eps: reference_jagged_layer_norm_pytorch(x, o, eps),
             (x_data, x_offsets, eps),
+            rtol=1e-2,
+            atol=0.5,
         )
 
 

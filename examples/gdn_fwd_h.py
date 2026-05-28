@@ -207,7 +207,7 @@ def main() -> None:
     """
     Main entry point that runs the attention kernel test with specific parameters.
     """
-    test(8, 80, 4096, 256, 64, 128)
+    test(8, 80, 4096, 128, 64, 128)
 
 
 if __name__ == "__main__":

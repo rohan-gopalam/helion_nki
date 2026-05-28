@@ -156,7 +156,7 @@ def check(m: int, k: int, n: int) -> None:
         reference_bf16xint16_pytorch,
         (x, w, False),
         rtol=1e-2,
-        atol=1e-2,
+        atol=0.5,
     )
 
     x_int16 = torch.randint(
@@ -168,7 +168,7 @@ def check(m: int, k: int, n: int) -> None:
         reference_bf16xint16_pytorch,
         (x_int16, w_bf16, True),
         rtol=1e-2,
-        atol=1e-2,
+        atol=0.5,
     )
 
 

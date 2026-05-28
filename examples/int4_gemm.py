@@ -33,7 +33,7 @@ import helion.language as hl
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[128, 128, 128]),
+    config=helion.Config(block_sizes=[64, 128, 128]),
     static_shapes=False,
 )
 def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:

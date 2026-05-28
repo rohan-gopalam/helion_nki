@@ -738,6 +738,120 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
     return expr_from_string(result)
 
 
+@stack_lowering.register_codegen("nki")
+def codegen_stack_nki(ctx: LoweringContext, node: Node) -> object:
+    """NKI lowering for aten.stack.
+
+    Stacks N input tensors along a new dimension. Since NKI only supports
+    2D tiles, we interleave the input tiles into a larger 2D tile.
+
+    For dim=0: stack([A, B], dim=0) on [P, F] tiles → [N*P, F]
+      Row i*P+j of output = input_i[j, :]
+    For dim=1: stack([A, B], dim=1) on [P, F] tiles → [P, N*F]
+      or after squeeze: [P*N, F] depending on dimensionality
+    """
+    import ast as _ast
+
+    from .ast_extension import statement_from_string, create, expr_from_string
+    from .compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    state = getattr(env, "_codegen_state", None)
+    if state is None:
+        raise NotImplementedError("NKI stack requires codegen state")
+
+    tensors = node.args[0]
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+    assert isinstance(tensors, (list, tuple))
+    assert isinstance(dim, int)
+
+    tensor_asts = [ctx.env[t] for t in tensors]
+    n = len(tensor_asts)
+    if n == 0:
+        raise ValueError("Cannot stack empty tensor list")
+
+    # Get output shape from FX metadata
+    out_val = node.meta.get("val")
+    if out_val is None or not isinstance(out_val, torch.Tensor):
+        raise NotImplementedError("NKI stack requires output shape metadata")
+
+    from .backend import NKIOpOverrides
+    out_shape_full = [int(env.size_hint(d)) if isinstance(d, torch.SymInt) else int(d) for d in out_val.shape]
+    out_shape = NKIOpOverrides._squeeze_shape_2d(out_shape_full)
+    if len(out_shape) != 2:
+        raise NotImplementedError(f"NKI stack: output shape {out_shape_full} doesn't squeeze to 2D")
+
+    p_out, f_out = out_shape[0], out_shape[1]
+
+    # Get input shapes
+    first_input = tensors[0]
+    first_val = first_input.meta.get("val") if isinstance(first_input, Node) else None
+    if first_val is None or not isinstance(first_val, torch.Tensor):
+        raise NotImplementedError("NKI stack: input metadata missing")
+    in_shape_full = [int(env.size_hint(d)) if isinstance(d, torch.SymInt) else int(d) for d in first_val.shape]
+    in_shape = NKIOpOverrides._squeeze_shape_2d(in_shape_full)
+    if len(in_shape) != 2:
+        raise NotImplementedError(f"NKI stack: input shape {in_shape_full} doesn't squeeze to 2D")
+    p_in, f_in = in_shape[0], in_shape[1]
+
+    dtype_str = env.backend.dtype_str(out_val.dtype)
+    device_fn = state.device_function
+
+    # Allocate output buffer
+    result_var = device_fn.new_var("_nki_stack", dce=True)
+    device_fn._nki_sbuf_shapes[result_var] = [p_out, f_out]
+    device_fn._nki_sbuf_dtypes[result_var] = dtype_str
+    state.add_statement(statement_from_string(
+        f"{result_var} = nl.ndarray([{p_out}, {f_out}], {dtype_str}, buffer=nl.sbuf)"
+    ))
+    state.add_statement(statement_from_string(f"nisa.memset({result_var}, value=0)"))
+
+    # Copy each input tile into the correct position
+    # After squeeze_shape_2d, the output [P_out, F_out] = [n*P_in, F_in] for dim=0
+    # or [P_in, n*F_in] for dim=-1 on the original shape.
+    # Determine the interleave strategy from the shapes:
+    if p_out == n * p_in and f_out == f_in:
+        # Stack along partition dimension: output[i*p_in:(i+1)*p_in, :] = input_i
+        for i, tensor_ast in enumerate(tensor_asts):
+            src_name = _ast.unparse(tensor_ast) if isinstance(tensor_ast, _ast.AST) else str(tensor_ast)
+            start = i * p_in
+            state.add_statement(statement_from_string(
+                f"nisa.tensor_copy(dst={result_var}[{start}:{start + p_in}, 0:{f_out}], src={src_name})"
+            ))
+    elif p_out == p_in and f_out == n * f_in:
+        # Stack along free dimension: output[:, i*f_in:(i+1)*f_in] = input_i
+        for i, tensor_ast in enumerate(tensor_asts):
+            src_name = _ast.unparse(tensor_ast) if isinstance(tensor_ast, _ast.AST) else str(tensor_ast)
+            start = i * f_in
+            state.add_statement(statement_from_string(
+                f"nisa.tensor_copy(dst={result_var}[0:{p_out}, {start}:{start + f_in}], src={src_name})"
+            ))
+    elif p_out == p_in * n and f_out == f_in:
+        # Interleave: output[i + j*n, :] = input_j[i, :] — partition interleave
+        # This happens with dim=1 on [P, F] → [P, n, F] → squeeze [P*n, F]
+        loop_var = device_fn.new_var("_stack_i")
+        body_stmts = []
+        for j, tensor_ast in enumerate(tensor_asts):
+            src_name = _ast.unparse(tensor_ast) if isinstance(tensor_ast, _ast.AST) else str(tensor_ast)
+            body_stmts.append(statement_from_string(
+                f"nisa.tensor_copy(dst={result_var}[{loop_var}*{n}+{j}:{loop_var}*{n}+{j}+1, 0:{f_out}], "
+                f"src={src_name}[{loop_var}:{loop_var}+1, 0:{f_in}])"
+            ))
+        state.add_statement(create(
+            _ast.For,
+            target=create(_ast.Name, id=loop_var, ctx=_ast.Store()),
+            iter=expr_from_string(f"nl.affine_range({p_in})"),
+            body=body_stmts,
+            orelse=[],
+        ))
+    else:
+        raise NotImplementedError(
+            f"NKI stack: unsupported shape combination in={in_shape} out={out_shape} n={n}"
+        )
+
+    return expr_from_string(result_var)
+
+
 expand_lowering = register_lowering(
     torch.ops.aten.expand.default,
     masked_value_fn=passthrough_masked_value,

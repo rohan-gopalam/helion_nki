@@ -2657,10 +2657,11 @@ def _(state: CodegenState) -> ast.AST:
                 # be non-zero for invalid elements (e.g. 0 - mean ≠ 0 after subtract).
                 # Re-apply the predicate mask to zero out invalid positions.
                 if _target is torch.ops.aten.where.self:
-                    # Check if false branch is 0 (scalar) — then re-mask the tile
-                    _where_false = _chain_node.args[2] if len(_chain_node.args) > 2 else None
-                    _is_zero_fill = isinstance(_where_false, (int, float)) and _where_false == 0
-                    if _is_zero_fill and pred_name is not None:
+                    # The where(mask, x, 0.0) ensures invalid positions are zeroed.
+                    # Since we use OOB scatter (vector_offset=1073741824 for invalid),
+                    # invalid positions are already skipped in the output write.
+                    # No need to re-mask here — just skip the where op.
+                    if False and pred_name is not None:  # disabled: OOB scatter handles it
                         _remasked = device_fn.new_var("_nki_chain_masked", dce=True)
                         device_fn._nki_sbuf_shapes[_remasked] = [p_count, m_count]
                         device_fn._nki_sbuf_dtypes[_remasked] = dtype_str
@@ -2766,15 +2767,119 @@ def _(state: CodegenState) -> ast.AST:
                         _other_ast = state.codegen.ast_for_fx_node(_other_arg)
                         if isinstance(_other_ast, ast.AST):
                             _other_expr = ast.unparse(_other_ast)
+                        # If not found directly, walk up through view/slice/transpose ops
+                        if _other_expr is None:
+                            _walk_node = _other_arg
+                            _transparent_ops = {
+                                'view', 'expand', 'reshape', 'unsqueeze', 'squeeze',
+                                'permute', 'transpose', 'select', 'narrow',
+                                'aten.view.default', 'aten.expand.default',
+                                'aten.unsqueeze.default', 'aten.squeeze.default',
+                                'aten.permute.default',
+                                'subscript',  # helion.language.view_ops.subscript
+                            }
+                            _visited = set()
+                            while _walk_node is not None and id(_walk_node) not in _visited:
+                                _visited.add(id(_walk_node))
+                                _tname = str(getattr(_walk_node, 'target', ''))
+                                _is_transparent = any(t in _tname for t in _transparent_ops)
+                                if not _is_transparent:
+                                    break
+                                _args = getattr(_walk_node, 'args', ())
+                                _walk_node = _args[0] if _args and isinstance(_args[0], torch.fx.Node) else None
+                                if _walk_node is not None:
+                                    _walk_ast = state.codegen.ast_for_fx_node(_walk_node)
+                                    if isinstance(_walk_ast, ast.AST):
+                                        _other_expr = ast.unparse(_walk_ast)
+                                        break
                     elif isinstance(_other_arg, (int, float)):
                         _other_expr = repr(_other_arg)
                     if _other_expr is None:
                         continue
+                    # Handle shape mismatch for _other_expr vs [p_count, m_count]
+                    _other_bcast = _other_expr
+                    _other_shape = device_fn._nki_sbuf_shapes.get(_other_expr)
+                    # Walk copy aliases to find shape
+                    if _other_shape is None:
+                        _oe_lookup = _other_expr
+                        while _other_shape is None and "_copy" in _oe_lookup:
+                            _oe_lookup = _oe_lookup[:_oe_lookup.rfind("_copy")]
+                            _other_shape = device_fn._nki_sbuf_shapes.get(_oe_lookup)
+                    if _other_shape is not None and list(_other_shape) != [p_count, m_count]:
+                        _oe_dtype = device_fn._nki_sbuf_dtypes.get(_other_expr, dtype_str)
+                        # Use tensor_scalar if we can transpose _other to [p_count, 1]
+                        # (broadcasts over free dim m_count). Otherwise fallback to broadcast_to.
+                        if _other_shape == [1, p_count]:
+                            # Transpose [1, p_count] → [p_count, 1] for tensor_scalar use
+                            _tr_p = device_fn.new_var("_nki_chain_tr_psum", dce=True)
+                            _tr_s = device_fn.new_var("_nki_chain_tr_sbuf", dce=True)
+                            _tr_dtype = "nl.float32" if _oe_dtype in ("nl.int32", "nl.uint32") else _oe_dtype
+                            device_fn._nki_sbuf_shapes[_tr_s] = [p_count, 1]
+                            device_fn._nki_sbuf_dtypes[_tr_s] = _oe_dtype
+                            if _tr_dtype != _oe_dtype:
+                                _cast_oe = device_fn.new_var("_nki_chain_cast", dce=True)
+                                device_fn._nki_sbuf_shapes[_cast_oe] = [1, p_count]
+                                device_fn._nki_sbuf_dtypes[_cast_oe] = _tr_dtype
+                                body.append(statement_from_string(
+                                    f"{_cast_oe} = nl.ndarray([1, {p_count}], {_tr_dtype}, buffer=nl.sbuf)"
+                                ))
+                                body.append(statement_from_string(
+                                    f"nisa.memset({_cast_oe}, value=0)"
+                                ))
+                                body.append(statement_from_string(
+                                    f"nisa.tensor_tensor(dst={_cast_oe}, data1={_cast_oe}, data2={_other_expr}, op=nl.add)"
+                                ))
+                                _oe_for_tr = _cast_oe
+                            else:
+                                _oe_for_tr = _other_expr
+                            body.append(statement_from_string(
+                                f"{_tr_p} = nl.ndarray([{p_count}, 1], {_tr_dtype}, buffer=nl.psum)"
+                            ))
+                            body.append(statement_from_string(
+                                f"nisa.nc_transpose(dst={_tr_p}, data={_oe_for_tr})"
+                            ))
+                            body.append(statement_from_string(
+                                f"{_tr_s} = nl.ndarray([{p_count}, 1], {_oe_dtype}, buffer=nl.sbuf)"
+                            ))
+                            body.append(statement_from_string(
+                                f"nisa.tensor_copy(dst={_tr_s}, src={_tr_p})"
+                            ))
+                            _other_bcast = _tr_s
+                            # Override to tensor_scalar path
+                            if _tile_is_arg0:
+                                body.append(statement_from_string(
+                                    f"nisa.tensor_scalar(dst={_cur_tile}, data={_cur_tile}, "
+                                    f"op0={_nki_op}, operand0={_tr_s}, op1=None)"
+                                ))
+                            else:
+                                _rev_tile2 = device_fn.new_var("_nki_chain_tile", dce=True)
+                                device_fn._nki_sbuf_shapes[_rev_tile2] = [p_count, m_count]
+                                device_fn._nki_sbuf_dtypes[_rev_tile2] = dtype_str
+                                body.append(statement_from_string(
+                                    f"{_rev_tile2} = nl.ndarray([{p_count}, {m_count}], {dtype_str}, buffer=nl.sbuf)"
+                                ))
+                                body.append(statement_from_string(
+                                    f"nisa.tensor_copy(dst={_rev_tile2}, src={_cur_tile})"
+                                ))
+                                body.append(statement_from_string(
+                                    f"nisa.tensor_scalar(dst={_rev_tile2}, data={_rev_tile2}, "
+                                    f"op0={_nki_op}, operand0={_tr_s}, op1=None, reverse0=True)"
+                                ))
+                                _cur_tile = _rev_tile2
+                            continue
+                        else:
+                            _bc_tile = device_fn.new_var("_nki_chain_bcast", dce=True)
+                            device_fn._nki_sbuf_shapes[_bc_tile] = [p_count, m_count]
+                            device_fn._nki_sbuf_dtypes[_bc_tile] = dtype_str
+                            body.append(statement_from_string(
+                                f"{_bc_tile} = nl.broadcast_to({_other_expr}, shape=({p_count}, {m_count}))"
+                            ))
+                            _other_bcast = _bc_tile
                     if _tile_is_arg0:
                         body.append(
                             statement_from_string(
                                 f"nisa.tensor_tensor(dst={_cur_tile}, data1={_cur_tile}, "
-                                f"data2={_other_expr}, op={_nki_op})"
+                                f"data2={_other_bcast}, op={_nki_op})"
                             )
                         )
                     else:
@@ -2791,7 +2896,7 @@ def _(state: CodegenState) -> ast.AST:
                         )
                         body.append(
                             statement_from_string(
-                                f"nisa.tensor_tensor(dst={_rev_tile}, data1={_other_expr}, "
+                                f"nisa.tensor_tensor(dst={_rev_tile}, data1={_other_bcast}, "
                                 f"data2={_cur_tile}, op={_nki_op})"
                             )
                         )

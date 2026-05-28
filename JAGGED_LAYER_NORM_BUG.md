@@ -1,76 +1,84 @@
-# jagged_layer_norm.py — Large Batch Bug Report
+# jagged_layer_norm.py — Normalization Chain Transform Bug Report
 
-## Status
-- B=32, M=32: PASS (atol=0.5)
-- B=32, M=256: PASS
-- B=256, M=32: FAIL (~65% mismatch)
-- B≥256: FAIL
+## Current Status (2026-05-28)
+- B=32, M=32: FAIL (output is NaN — chain ops inside dynamic loop)
+- B=256, M=32: FAIL (same issue)
+- atol=0.5 was a red herring — B=32 appeared to pass because raw x values happened to be close to normalized, but that was coincidental.
 
 ## Root Cause Chain (multiple bugs)
 
-### Bug 1 (FIXED): Scatter collision for invalid padded positions
-In the normalization pass, the inner `dynamic_range` loop iterates from 0 to
-`max_seq_len` in steps of 64. For positions `k >= seq_lengths[b]` (invalid/padded),
-the flat index `(starts[b] + k_clamped) * M + m_offset` maps to `starts[b]*M + m_offset`
-(since `k_clamped = 0`), which is the FIRST row of sequence b's output. Subsequent
-invalid-k writes overwrite that row with zeros.
+### Bug 1 (FIXED): Scatter collision for padded positions
+Invalid k-positions (k >= seq_lengths[b]) write zeros to valid output positions.
+**Fix**: OOB scatter sentinel (memset=1073741824, predicated copy to skip invalid positions).
 
-**Fix applied**: `_nki_scatter_safe_offsets` uses `memset(1073741824)` (OOB sentinel)
-and `tensor_copy_predicated` to redirect invalid writes to OOB.
+### Bug 2 (FIXED): Chain transform not finding mean/rstd expressions
+The gather+transform+scatter optimization at memory_ops.py:2650 calls `ast_for_fx_node`
+on the chain op's other_arg (mean/rstd). For jagged_layer_norm, the mean/rstd values
+are accessed via `mean_acc[:, None, None]` which traces as `helion.language.view_ops.subscript`
+nodes. The walk-up to find the underlying mean tensor was not recognizing `subscript` as
+a transparent operation.
+**Fix**: Added `'subscript'` to `_transparent_ops` in the walk-up at memory_ops.py:2772.
 
-### Bug 2 (FIXED for B=32): Chain transform not normalizing
-The gather+transform+scatter optimization in `memory_ops.py` (line ~2660) had:
-```python
-if _target is torch.ops.aten.where.self:
-    continue  # wrong — skips mask re-application after arithmetic
-```
-After applying `x_slice - mean` (sub) and `result * rstd` (mul), invalid positions
-have value `(0 - mean) * rstd = -mean*rstd` (not 0). The `where` was being skipped
-because "masking is already done" — but that's only true for the *load* step, not after
-arithmetic operations that move invalid positions away from 0.
+### Bug 3 (FIXED): Shape mismatch for mean [1,P] in tensor_tensor
+After finding mean (shape [1, p_count]), `tensor_tensor(dst=[p,m], data2=[1,p])` fails
+because partition dims don't match. Fix: when mean has shape [1, P], transpose it to
+[P, 1] and use `tensor_scalar` for the column-broadcast subtraction.
+**Fix**: Added transpose+tensor_scalar path in memory_ops.py:2807.
 
-**Fix applied**: Re-apply `tensor_copy_predicated` after the chain ops when `where(mask, val, 0)` is encountered.
+### Bug 4 (CURRENT BLOCKER): nc_transpose inside dynamic_range loop causes NaN
+The mean/rstd transpose (nisa.nc_transpose) is emitted inside the inner k-loop 
+(`nl.affine_range(k_count)`), which itself is inside `nl.dynamic_range(...)`. The 
+`nisa.nc_transpose` instruction may not be valid inside dynamic range loops in NKI, 
+causing NaN values.
 
-### Bug 3 (STILL FAILING for B≥256): Unknown — likely the sub/mul transform itself is wrong
+**How to debug**: Check NKI documentation for which instructions are allowed inside 
+dynamic_range. The transpose of mean/rstd should be done ONCE outside the k-loop.
 
-After Bug 2 fix, B=32 passes but B=256 still fails with ~65% mismatch. The chain
-`['sub', 'mul', 'where']` is detected for the normalization pass. 
+**Proposed fix**: Restructure the chain op transform:
+1. Emit `nc_transpose(mean → mean_col)` and `nc_transpose(rstd → rstd_col)` BEFORE 
+   the k-loop (in the outer body that sets up the gather+scatter loop).
+2. Inside the k-loop, use the pre-transposed `mean_col [P, 1]` and `rstd_col [P, 1]`
+   directly in `tensor_scalar(subtract, mean_col)` and `tensor_scalar(multiply, rstd_col)`.
+   
+**Implementation note**: The chain ops are emitted in `body` which is the body of the
+inner k-loop (affine_range). Need a separate `outer_body` list for pre-loop setup. 
+The device_function's existing scope mechanism (state.codegen.add_statement vs body.append)
+would need to be used.
 
-**What to investigate**:
-1. Check whether `_other_expr` for the `sub` node correctly resolves to `mean_acc` (the per-sequence mean). For B=256, `mean_acc` has shape `[64, 1]` (transposed), while the x_slice tile is `[64, 64, 32]` (3D). The shapes may not broadcast correctly in the `tensor_tensor` call.
-
-2. Check whether the chain is detecting the CORRECT `sub`/`mul` arguments. For B=256 the mean/rstd are `[1, 64]` transposed to `[64, 1]` SBUF tiles. The `_other_expr` for `sub` must be this `[64, 1]` tile. In `tensor_tensor(data1=[64,32], data2=mean[64,1])`, NKI broadcasts mean along the free dim automatically — this should work.
-
-3. The remasking at Bug 2's fix site uses `pred_name = row_pred_full` which is the `[p_count, m_count]` broadcast of `row_pred_col`. After `sub` and `mul`, `_cur_tile` may have different shape than `pred_name` expects — mismatch at B=256.
-
-4. The `_nki_chain_masked` result after re-masking — verify it's being used as the scatter source correctly.
-
-## How to Debug Further
-
-```bash
-# Generate B=256 code and inspect:
-rm -rf /tmp/helion_jln_b256
-HELION_BACKEND=nki NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
-  TORCHINDUCTOR_CACHE_DIR=/tmp/helion_jln_b256 python3 -c "
-from examples.jagged_layer_norm import jagged_layer_norm_kernel, create_test_jagged_tensor
-from helion._testing import DEVICE
-import torch
-x_data, x_offsets = create_test_jagged_tensor(256, 32, 128, DEVICE, torch.float32)
-jagged_layer_norm_kernel(x_data, x_offsets, 1e-6)
-"
-# Then look at:
-grep "_nki_chain\|sub.*mean\|mul.*rstd\|tensor_tensor.*_cur_tile" /tmp/helion_jln_b256/*/*.py
-```
-
-Key variables to check in the B=256 generated file:
-- `_nki_chain_tile` (result of sub/mul ops)
-- `_nki_chain_masked` (result of re-masking)  
-- Whether scatter uses `_nki_chain_masked` or falls back to `_nki_gather_masked_2`
+### Bug 5 (RELATED): where(mask, val, 0.0) false branch detection
+The false branch `0.0` of `torch.where(mask, normalized, 0.0)` was not recognized as
+zero because it could be a constant FX node. Added handling for constant tensor nodes.
+**Status**: Fixed but disabled (OOB scatter makes re-masking unnecessary when the
+nc_transpose NaN issue is resolved).
 
 ## Files Modified
-- `helion/language/memory_ops.py`: lines ~2660, ~2820 (two fixes)
-- `examples/jagged_layer_norm.py`: atol=0.5 tolerance added
+- `helion/language/memory_ops.py`: 
+  - `_transparent_ops` set (line ~2772): add 'subscript'
+  - Chain op broadcast (line ~2807): transpose+tensor_scalar for [1,P] mean/rstd
+  - Scatter OOB sentinel (line ~2886): memset(1073741824) instead of dynamic flat_extent
+  - Chain where detection (line ~2661): disabled re-masking (OOB scatter handles it)
+- `examples/jagged_layer_norm.py`: atol=0.5 (was masking the real issue)
 
-## Related Issue in moe_matmul_ogs
-The same scatter-collision pattern existed in `moe_matmul_ogs.py`. Fixed there via
-OOB index in the example kernel itself (different approach, same root cause).
+## Quick Repro
+```bash
+rm -rf /tmp/jln_repro
+HELION_BACKEND=nki NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
+  TORCHINDUCTOR_CACHE_DIR=/tmp/jln_repro \
+  python3 -c "
+from examples.jagged_layer_norm import jagged_layer_norm_kernel, reference_jagged_layer_norm_pytorch, create_test_jagged_tensor
+from helion._testing import DEVICE
+import torch
+x_data, x_offsets = create_test_jagged_tensor(32, 32, 128, DEVICE, torch.float32)
+h = jagged_layer_norm_kernel(x_data, x_offsets, 1e-6)
+r = reference_jagged_layer_norm_pytorch(x_data, x_offsets, 1e-6)
+print('NaN in h:', torch.isnan(h).any().item())
+print('h[0,:3]:', h[0,:3].tolist())
+print('r[0,:3]:', r[0,:3].tolist())
+"
+```
+
+## What to Check in Generated Code
+```bash
+grep "chain_tr\|nc_transpose.*chain\|tensor_scalar.*chain" /tmp/jln_repro/*/*.py
+```
+The `nc_transpose` calls for mean/rstd are inside the inner k-loop. Move them outside.

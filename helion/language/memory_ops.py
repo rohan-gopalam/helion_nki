@@ -1020,6 +1020,19 @@ def _nki_row_index_gather(
             shape, _ = _nki_lookup_sbuf_shape_dtype(state, name)
             if shape in ([1, p_count], [p_count, 1]):
                 return shape
+            # Fall back: check if name is an active loop index variable (iota)
+            # whose shape hasn't been registered yet (outer loop pre-emission).
+            if shape is None:
+                from .._compiler.compile_environment import CompileEnvironment as _CE
+                _env = _CE.current()
+                for bid in state.codegen.active_device_loops:
+                    try:
+                        if state.codegen.index_var(bid) == name:
+                            bs = int(_env.block_sizes[bid].from_config_assert(state.config))
+                            if bs == p_count:
+                                return [1, p_count]
+                    except Exception:
+                        pass
             return None
 
         lhs_name_simple = _arg_name(lhs_node)
@@ -1052,12 +1065,30 @@ def _nki_row_index_gather(
                         f"{index_shape[1]}], nl.int32, buffer=nl.sbuf)"
                     )
                 )
-                state.codegen.add_statement(
-                    statement_from_string(
-                        f"nisa.tensor_scalar(dst={row_index}, data={index_name}, "
-                        f"op0=nl.add, operand0={scalar_name})"
+                # If scalar_name is an SBUF variable (not a Python literal),
+                # use tensor_tensor with broadcast rather than tensor_scalar.
+                scalar_sbuf_shape = _nki_lookup_sbuf_shape_dtype(state, scalar_name)[0]
+                if scalar_sbuf_shape is not None:
+                    # scalar_name is an SBUF buffer — broadcast it to match index shape
+                    bcast_scalar = device_fn.new_var("_row_idx_scalar_bcast", dce=True)
+                    device_fn._nki_sbuf_shapes[bcast_scalar] = list(index_shape)
+                    device_fn._nki_sbuf_dtypes[bcast_scalar] = "nl.int32"
+                    state.codegen.add_statement(statement_from_string(
+                        f"{bcast_scalar} = nl.ndarray([{index_shape[0]}, {index_shape[1]}], nl.int32, buffer=nl.sbuf)"
+                    ))
+                    state.codegen.add_statement(statement_from_string(
+                        f"{bcast_scalar} = nl.broadcast_to({scalar_name}, shape=({index_shape[0]}, {index_shape[1]}))"
+                    ))
+                    state.codegen.add_statement(statement_from_string(
+                        f"nisa.tensor_tensor(dst={row_index}, data1={index_name}, data2={bcast_scalar}, op=nl.add)"
+                    ))
+                else:
+                    state.codegen.add_statement(
+                        statement_from_string(
+                            f"nisa.tensor_scalar(dst={row_index}, data={index_name}, "
+                            f"op0=nl.add, operand0={scalar_name})"
+                        )
                     )
-                )
                 vec_offset_var = _nki_as_uint32_p1_vector(
                     state, row_index, p_count
                 )
@@ -1473,12 +1504,108 @@ def _(state: CodegenState) -> ast.AST:
         _tensor_dim_size_str(dim_idx) for dim_idx in range(tensor.dim())
     ]
 
-    # Second pass: emit slice_parts using the resolved block_ids.
-    # Track which dims are tile_id (scalar index) vs tile (range slice) so
-    # flat_block_size computation can use block_size=1 for tile_id dims.
+    # Initialize slice_parts and related vars here; the 3D early-exit below may
+    # populate them and skip the normal per-dim loop.
     slice_parts: list[str] = []
     is_scalar_dim: list[bool] = []
     partition_offset_var: str | None = None
+
+    # Early-exit: 3D tensor with pattern [vec_1d + starts, scalar_head, :].
+    # This occurs for q[tile.index + starts, tile_h.begin, :] where q is [L, H, D].
+    # The kernel reshapes q to [L*H, D], so the correct flat row index is:
+    #   flat_row = (tile.index + starts) * H + head
+    # Detect this and emit a 2D row-gather directly, bypassing the per-dim loop.
+    import os as _os
+    if _os.environ.get("HELION_DEBUG_3D_LOAD"):
+        print(f"DEBUG 3D load: tensor.dim={tensor.dim()}, subscript_block_ids={subscript_block_ids}, subscript_positions={subscript_positions}, fx_subscript_len={len(fx_subscript) if fx_subscript else None}")
+        if tensor.dim() == 3 and fx_subscript:
+            for i, s in enumerate(subscript):
+                print(f"  subscript[{i}] = {type(s).__name__} {getattr(s, 'shape', '')}")
+    if (
+        tensor.dim() == 3
+        and len(subscript_block_ids) == 3
+        and len(subscript_positions) == 3
+        and fx_subscript is not None
+        and len(fx_subscript) >= 3
+    ):
+        sub0 = subscript[subscript_positions[0]]
+        sub1 = subscript[subscript_positions[1]]
+        sub2 = subscript[subscript_positions[2]]
+        fx0 = fx_subscript[subscript_positions[0]] if subscript_positions[0] < len(fx_subscript) else None
+        fx1 = fx_subscript[subscript_positions[1]] if subscript_positions[1] < len(fx_subscript) else None
+        # sub0 must be a tensor (1D vector of row indices)
+        # sub1 must be a scalar (tile_begin or const)
+        # sub2 must be slice(None)
+        sub1_is_scalar = (
+            not isinstance(sub1, (slice, torch.Tensor))
+        )
+        if (
+            isinstance(sub0, torch.Tensor)
+            and sub1_is_scalar
+            and isinstance(sub2, slice)
+            and isinstance(fx0, torch.fx.Node)
+        ):
+            # Compute H and D
+            h_size = tensor.size(1)
+            d_size = tensor.size(2)
+            h_int = int(h_size._sympy_().subs(_bs_subs)) if isinstance(h_size, torch.SymInt) else int(h_size)
+            d_int = int(d_size._sympy_().subs(_bs_subs)) if isinstance(d_size, torch.SymInt) else int(d_size)
+            # Get scalar head expression
+            head_expr: str | None = None
+            if isinstance(fx1, torch.fx.Node):
+                fx1_ast = state.codegen.ast_for_fx_node(fx1)
+                if isinstance(fx1_ast, ast.AST):
+                    head_expr = ast.unparse(fx1_ast)
+            if head_expr is None:
+                bid1 = subscript_block_ids[1]
+                if bid1 is not None:
+                    head_expr = state.codegen.offset_var(bid1)
+                elif isinstance(sub1, (int, bool)):
+                    head_expr = str(int(sub1))
+                elif isinstance(sub1, torch.SymInt):
+                    head_expr = str(int(sub1._sympy_().subs(_bs_subs)))
+            # Get the 2D row-gather sentinel for the vector index (tile.index + starts)
+            _row_gather_3d = _nki_row_index_gather(fx0, state, partition_dim)
+            if _row_gather_3d is not None and head_expr is not None:
+                sentinel_prefix = "__AP_ROW_GATHER__"
+                if _row_gather_3d.startswith(sentinel_prefix):
+                    vec_var = _row_gather_3d[len(sentinel_prefix):].rstrip("_")
+                    # flat_var = vec_var * H + head
+                    flat_var = device_fn.new_var("_3d_flat_idx", dce=True)
+                    device_fn._nki_sbuf_shapes[flat_var] = [partition_dim, 1]
+                    device_fn._nki_sbuf_dtypes[flat_var] = "nl.uint32"
+                    from .._compiler.ast_extension import statement_from_string as _sfs3d
+                    state.codegen.add_statement(_sfs3d(
+                        f"{flat_var} = nl.ndarray([{partition_dim}, 1], nl.uint32, buffer=nl.sbuf)"
+                    ))
+                    state.codegen.add_statement(_sfs3d(
+                        f"nisa.tensor_copy(dst={flat_var}, src={vec_var})"
+                    ))
+                    if h_int != 1:
+                        state.codegen.add_statement(_sfs3d(
+                            f"nisa.tensor_scalar(dst={flat_var}, data={flat_var}, op0=nl.multiply, operand0={h_int}, op1=None)"
+                        ))
+                    state.codegen.add_statement(_sfs3d(
+                        f"nisa.tensor_scalar(dst={flat_var}, data={flat_var}, op0=nl.add, operand0={head_expr}, op1=None)"
+                    ))
+                    # Now emit the 2D gather: [__AP_ROW_GATHER__flat_var__, 0:D]
+                    slice_parts = [f"__AP_ROW_GATHER__{flat_var}__", f"0:{d_int}"]
+                    is_scalar_dim = [False, False]
+                    # Override partition_dim, free_dims, and hbm_dim_size_strs to
+                    # match the 2D reshaped tensor [L*H, D] — this controls the
+                    # SBUF allocation and DMA shape.
+                    partition_dim = partition_dim  # keep [tile_q_size] = 128
+                    free_dims = [d_int]
+                    total_rows = int(tensor.numel()) // d_int
+                    hbm_dim_size_strs = [str(total_rows), str(d_int)]
+                    partition_offset_var = None
+                    # Skip the normal per-dim loop — go directly to DMA emit
+                    # by setting subscript_block_ids to indicate no further processing
+                    subscript_block_ids = []
+                    subscript_positions = []
+
+    # Second pass: emit slice_parts using the resolved block_ids (unless already
+    # populated by the 3D early-exit above).
     used_shifted_subscript = False
     for tdi in range(len(subscript_block_ids)):
         block_id = subscript_block_ids[tdi]
@@ -1933,6 +2060,90 @@ def _(state: CodegenState) -> ast.AST:
             ):
                 return None
 
+            # Walk the FX graph forward from the load node to find a linear chain
+            # of elementwise ops that terminates at either:
+            #   (a) a dim=1 reduction (sum/amax/etc.) → fuse into gather+accumulate loop
+            #   (b) a hl.store call → fuse into gather+transform+scatter loop
+            # _chain_ops is the list of intermediate elementwise nodes.
+            # _chain_terminal is 'reduce' or 'store' to indicate the terminal type.
+            # If no linear chain is found, return None.
+            from ..language._tracing_ops import _mask_to as _mask_to_fn
+            # _store_fn is the hl.store API function (defined in this same module)
+            _store_fn = store
+
+            _dim1_reduce_targets = {
+                torch.ops.aten.sum.dim_IntList,
+                torch.ops.aten.mean.dim,
+                torch.ops.aten.amax.default,
+                torch.ops.aten.amin.default,
+            }
+            _elementwise_targets = {
+                torch.ops.aten.sub.Tensor,
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.mul.Tensor,
+                torch.ops.aten.where.self,
+                torch.ops.prims.convert_element_type.default,
+            }
+
+            def _is_dim1_reduce(node: torch.fx.Node) -> bool:
+                if node.op != "call_function" or node.target not in _dim1_reduce_targets:
+                    return False
+                _dim_arg = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+                if isinstance(_dim_arg, (list, tuple)):
+                    return list(_dim_arg) == [1]
+                return _dim_arg == 1
+
+            def _is_store_node(node: torch.fx.Node) -> bool:
+                return (
+                    node.op == "call_function"
+                    and node.target is _store_fn
+                )
+
+            def _walk_chain(
+                load_node: torch.fx.Node,
+            ) -> tuple[list[torch.fx.Node], str] | None:
+                """Walk forward from load_node following single-user chains.
+                Returns (chain, terminal_type) where terminal_type is 'reduce' or 'store',
+                or None if no linear fusable chain is found."""
+                chain: list[torch.fx.Node] = []
+                cur = load_node
+                while True:
+                    users = list(cur.users)
+                    if len(users) != 1:
+                        return None
+                    user = users[0]
+                    if _is_dim1_reduce(user):
+                        return chain, "reduce"
+                    if _is_store_node(user):
+                        return chain, "store"
+                    if user.op == "call_function" and (
+                        user.target in _elementwise_targets
+                        or user.target is _mask_to_fn
+                    ):
+                        chain.append(user)
+                        cur = user
+                        continue
+                    return None
+
+            _chain_ops: list[torch.fx.Node] | None = None
+            _chain_terminal: str = "reduce"
+            _chain_store_node: torch.fx.Node | None = None
+            if state.fx_node is not None:
+                _walk_result = _walk_chain(state.fx_node)
+                if _walk_result is not None:
+                    _chain_ops, _chain_terminal = _walk_result
+                    if _chain_terminal == "store":
+                        # The store node is the user of the last chain node
+                        _last_chain = _chain_ops[-1] if _chain_ops else state.fx_node
+                        _chain_store_node = next(iter(_last_chain.users))
+            else:
+                _chain_ops = []
+                _chain_terminal = "reduce"
+
+            # If we cannot fuse (no linear chain to a reduction or store), bail out.
+            if _chain_ops is None:
+                return None
+
             lhs_ast = state.codegen.ast_for_fx_node(index_node.args[0])
             rhs_ast = state.codegen.ast_for_fx_node(index_node.args[1])
             if not isinstance(lhs_ast, ast.AST) or not isinstance(rhs_ast, ast.AST):
@@ -2165,18 +2376,28 @@ def _(state: CodegenState) -> ast.AST:
                 feature_mask_name = None
 
             total_elems = int(tensor.numel())
-            acc_name = device_fn.new_var("_nki_flat_sum", dce=True)
-            device_fn._nki_sbuf_shapes[acc_name] = [p_count, m_count]
-            device_fn._nki_sbuf_dtypes[acc_name] = dtype_str
-            state.codegen.add_statement(
-                statement_from_string(
-                    f"{acc_name} = nl.ndarray([{p_count}, {m_count}], "
-                    f"{dtype_str}, buffer=nl.sbuf)"
+            out_p = p_count
+            out_m = m_count
+            if _chain_terminal == "reduce":
+                # Reduce path: allocate [p_count, m_count] accumulator, zero-init
+                acc_name = device_fn.new_var("_nki_flat_sum", dce=True)
+                device_fn._nki_sbuf_shapes[acc_name] = [out_p, out_m]
+                device_fn._nki_sbuf_dtypes[acc_name] = dtype_str
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{acc_name} = nl.ndarray([{out_p}, {out_m}], "
+                        f"{dtype_str}, buffer=nl.sbuf)"
+                    )
                 )
-            )
-            state.codegen.add_statement(
-                statement_from_string(f"nisa.memset({acc_name}, value=0)")
-            )
+                state.codegen.add_statement(
+                    statement_from_string(f"nisa.memset({acc_name}, value=0)")
+                )
+            else:
+                # Store path: no accumulator needed; use a placeholder name for the
+                # return expression (the per-k tile will be scattered directly).
+                acc_name = device_fn.new_var("_nki_flat_scatter", dce=True)
+                device_fn._nki_sbuf_shapes[acc_name] = [out_p, out_m]
+                device_fn._nki_sbuf_dtypes[acc_name] = dtype_str
 
             k_var = device_fn.new_var("_nki_gather_k")
             base_col = device_fn.new_var("_nki_gather_base", dce=True)
@@ -2294,6 +2515,7 @@ def _(state: CodegenState) -> ast.AST:
                     ]
                 )
                 pred_name = combined_pred
+            # Allocate and zero-fill the masked tile, then predicated-copy the gathered data.
             body.extend(
                 [
                     statement_from_string(
@@ -2305,12 +2527,224 @@ def _(state: CodegenState) -> ast.AST:
                         f"nisa.tensor_copy_predicated(dst={masked}, "
                         f"src={gathered}, predicate={pred_name})"
                     ),
-                    statement_from_string(
-                        f"nisa.tensor_tensor(dst={acc_name}, data1={acc_name}, "
-                        f"data2={masked}, op=nl.add)"
-                    ),
                 ]
             )
+            # Emit chain ops (elementwise transforms between load and reduction).
+            _cur_tile = masked
+            assert _chain_ops is not None
+            for _chain_node in _chain_ops:
+                _target = _chain_node.target
+                # _mask_to: no-op on NKI (masking already done by predicated copy)
+                if _target is _mask_to_fn:
+                    continue
+                # where(mask, value, 0.0): zero-fill invalid positions — already done
+                if _target is torch.ops.aten.where.self:
+                    continue
+                # convert_element_type: dtype cast
+                if _target is torch.ops.prims.convert_element_type.default:
+                    _cast_dtype_val = _chain_node.args[1] if len(_chain_node.args) > 1 else None
+                    if _cast_dtype_val is not None:
+                        _cast_tile = device_fn.new_var("_nki_chain_tile", dce=True)
+                        device_fn._nki_sbuf_shapes[_cast_tile] = [p_count, m_count]
+                        try:
+                            _nki_dtype = {
+                                torch.float32: "nl.float32",
+                                torch.float16: "nl.float16",
+                                torch.bfloat16: "nl.bfloat16",
+                                torch.int32: "nl.int32",
+                            }.get(_cast_dtype_val, dtype_str)
+                        except TypeError:
+                            _nki_dtype = dtype_str
+                        device_fn._nki_sbuf_dtypes[_cast_tile] = _nki_dtype
+                        body.append(
+                            statement_from_string(
+                                f"{_cast_tile} = nl.ndarray([{p_count}, {m_count}], "
+                                f"{_nki_dtype}, buffer=nl.sbuf)"
+                            )
+                        )
+                        body.append(
+                            statement_from_string(
+                                f"nisa.tensor_copy(dst={_cast_tile}, src={_cur_tile})"
+                            )
+                        )
+                        _cur_tile = _cast_tile
+                    continue
+                # sub/add/mul: tensor-tensor ops
+                if _target in (
+                    torch.ops.aten.sub.Tensor,
+                    torch.ops.aten.add.Tensor,
+                    torch.ops.aten.mul.Tensor,
+                ):
+                    _op_map = {
+                        torch.ops.aten.sub.Tensor: "nl.subtract",
+                        torch.ops.aten.add.Tensor: "nl.add",
+                        torch.ops.aten.mul.Tensor: "nl.multiply",
+                    }
+                    _nki_op = _op_map[_target]
+                    # Determine which arg is the current tile and which is "other"
+                    _arg0 = _chain_node.args[0] if len(_chain_node.args) > 0 else None
+                    _arg1 = _chain_node.args[1] if len(_chain_node.args) > 1 else None
+                    # Check if this is self-op (e.g. mul tile * tile for squaring)
+                    if _arg0 is _arg1:
+                        body.append(
+                            statement_from_string(
+                                f"nisa.tensor_tensor(dst={_cur_tile}, data1={_cur_tile}, "
+                                f"data2={_cur_tile}, op={_nki_op})"
+                            )
+                        )
+                        continue
+                    # Find the "other" arg (not the chain predecessor)
+                    # The chain predecessor could be _cur_tile's source node; we check by
+                    # walking back to find which arg is the load-chain node.
+                    _other_arg = None
+                    _tile_is_arg0 = True
+                    # We need to figure out which arg is the "current tile" (chain input)
+                    # and which is the external operand.
+                    # The chain input is the node we just processed (or the load node for
+                    # first chain node).  Walk the chain to find previous node.
+                    _prev_chain_idx = _chain_ops.index(_chain_node)
+                    if _prev_chain_idx == 0:
+                        _chain_input_node = state.fx_node
+                    else:
+                        _chain_input_node = _chain_ops[_prev_chain_idx - 1]
+                    if _arg0 is _chain_input_node or (
+                        isinstance(_arg0, torch.fx.Node)
+                        and _arg0 in (_chain_input_node,)
+                    ):
+                        _other_arg = _arg1
+                        _tile_is_arg0 = True
+                    elif _arg1 is _chain_input_node or (
+                        isinstance(_arg1, torch.fx.Node)
+                        and _arg1 in (_chain_input_node,)
+                    ):
+                        _other_arg = _arg0
+                        _tile_is_arg0 = False
+                    else:
+                        # Fallback: first arg is tile, second is other
+                        _other_arg = _arg1
+                        _tile_is_arg0 = True
+                    # Get the NKI expression for _other_arg
+                    if _other_arg is None:
+                        continue
+                    _other_expr: str | None = None
+                    if isinstance(_other_arg, torch.fx.Node):
+                        _other_ast = state.codegen.ast_for_fx_node(_other_arg)
+                        if isinstance(_other_ast, ast.AST):
+                            _other_expr = ast.unparse(_other_ast)
+                    elif isinstance(_other_arg, (int, float)):
+                        _other_expr = repr(_other_arg)
+                    if _other_expr is None:
+                        continue
+                    if _tile_is_arg0:
+                        body.append(
+                            statement_from_string(
+                                f"nisa.tensor_tensor(dst={_cur_tile}, data1={_cur_tile}, "
+                                f"data2={_other_expr}, op={_nki_op})"
+                            )
+                        )
+                    else:
+                        # tile is arg1, other is arg0 (e.g. other - tile for sub)
+                        # Need a new tile for result since we can't do in-place reversed sub
+                        _rev_tile = device_fn.new_var("_nki_chain_tile", dce=True)
+                        device_fn._nki_sbuf_shapes[_rev_tile] = [p_count, m_count]
+                        device_fn._nki_sbuf_dtypes[_rev_tile] = dtype_str
+                        body.append(
+                            statement_from_string(
+                                f"{_rev_tile} = nl.ndarray([{p_count}, {m_count}], "
+                                f"{dtype_str}, buffer=nl.sbuf)"
+                            )
+                        )
+                        body.append(
+                            statement_from_string(
+                                f"nisa.tensor_tensor(dst={_rev_tile}, data1={_other_expr}, "
+                                f"data2={_cur_tile}, op={_nki_op})"
+                            )
+                        )
+                        _cur_tile = _rev_tile
+                    continue
+            if _chain_terminal == "reduce":
+                # Accumulate into sum: acc[p, m] += cur_tile[p, m]
+                body.append(
+                    statement_from_string(
+                        f"nisa.tensor_tensor(dst={acc_name}, data1={acc_name}, "
+                        f"data2={_cur_tile}, op=nl.add)"
+                    )
+                )
+            else:
+                # Scatter path: write the processed tile back to output tensor per k-step.
+                # Pre-allocate the NKI return buffer for the output tensor so we can
+                # reference it in the scatter DMA inside the gather loop.
+                assert _chain_store_node is not None
+                _store_tensor_arg = _chain_store_node.args[0]
+                _store_out_buf: str | None = None
+                _store_total_elems_scatter: int = total_elems
+                if isinstance(_store_tensor_arg, torch.fx.Node):
+                    _store_tensor_val = _store_tensor_arg.meta.get("val")
+                    if isinstance(_store_tensor_val, torch.Tensor):
+                        _store_total_elems_scatter = int(_store_tensor_val.numel())
+                        _store_tensor_id = id(_store_tensor_val)
+                        # Check if the return buffer is already allocated
+                        _ret_bufs = getattr(device_fn, "_nki_return_buffers", {})
+                        if _store_tensor_id in _ret_bufs:
+                            _store_out_buf = _ret_bufs[_store_tensor_id]["buf_name"]
+                        else:
+                            # Pre-allocate the return buffer for this output tensor
+                            try:
+                                from .._compiler.host_function import HostFunction as _HF
+                                _hf = _HF.current()
+                                if _hf is not None and _store_tensor_val in _hf.tensor_to_origin:
+                                    _store_origin = _hf.tensor_to_origin[_store_tensor_val]
+                                    _store_host_var = _store_origin.host_str()
+                                    # Follow view chain
+                                    _store_base = _store_tensor_val
+                                    while getattr(_store_base, "_base", None) is not None:
+                                        _store_base = _store_base._base
+                                    if _store_base is not _store_tensor_val and _store_base in _hf.tensor_to_origin:
+                                        _store_host_var = _hf.tensor_to_origin[_store_base].host_str()
+                                    _out_buf_name = device_fn.new_var("nki_return_buf")
+                                    _out_dtype_str = env.backend.dtype_str(_store_tensor_val.dtype)
+                                    # For 1D output, use free-axis layout [1, N]
+                                    _out_flat_extent = device_fn.new_var("nki_return_numel")
+                                    device_fn.constexpr_arg(
+                                        _out_flat_extent, f"{_store_host_var}.numel()"
+                                    )
+                                    _out_host_reshape = f"[{_store_host_var}.numel()]"
+                                    device_fn.preamble.append(
+                                        statement_from_string(
+                                            f"{_out_buf_name} = nl.ndarray([1, {_out_flat_extent}], "
+                                            f"dtype={_out_dtype_str}, buffer=nl.shared_hbm)"
+                                        )
+                                    )
+                                    if not hasattr(device_fn, "_nki_return_buffers"):
+                                        device_fn._nki_return_buffers = {}
+                                    device_fn._nki_return_buffers[_store_tensor_id] = {
+                                        "buf_name": _out_buf_name,
+                                        "host_var": _store_host_var,
+                                        "host_reshape": _out_host_reshape,
+                                        "flat_extent": _out_flat_extent,
+                                    }
+                                    if len(device_fn._nki_return_buffers) == 1:
+                                        device_fn._nki_return_buffer_name = _out_buf_name
+                                        device_fn._nki_return_host_var = _store_host_var
+                                        device_fn._nki_return_host_reshape = _out_host_reshape
+                                    _store_out_buf = _out_buf_name
+                            except Exception:
+                                pass
+                if _store_out_buf is None:
+                    # Can't get/create output buffer; fall back
+                    return None
+                # Emit scatter DMA: write _cur_tile back to the output tensor at this k-step.
+                body.append(
+                    statement_from_string(
+                        f"nisa.dma_copy("
+                        f"dst={_store_out_buf}.reshape([{_out_flat_extent}, 1]).ap("
+                        f"pattern=[[1, {p_count}], [1, {m_count}]], "
+                        f"vector_offset={base_u32}, indirect_dim=0), "
+                        f"src={_cur_tile}, "
+                        f"oob_mode=nisa.oob_mode.skip)"
+                    )
+                )
+
             state.codegen.add_statement(
                 create(
                     ast.For,
@@ -2320,9 +2754,37 @@ def _(state: CodegenState) -> ast.AST:
                     orelse=[],
                 )
             )
-            if not hasattr(device_fn, "_nki_pre_reduced_loads"):
-                device_fn._nki_pre_reduced_loads = {}
-            device_fn._nki_pre_reduced_loads[acc_name] = {"dim": 1}
+
+            # Install passthrough lowerings for all chain nodes AND the store node
+            # (if any) so that their normal codegen is suppressed.
+            from .._compiler.aten_lowering import Lowering as _BaseLowering
+
+            class _PassthroughLowering(_BaseLowering):
+                def __init__(self, passthrough_name: str) -> None:
+                    self._passthrough_name = passthrough_name
+
+                def codegen(self, ctx: object, node: torch.fx.Node) -> ast.AST | None:
+                    return expr_from_string(self._passthrough_name)
+
+            assert _chain_ops is not None
+            for _cn in _chain_ops:
+                _cn.meta["lowering"] = _PassthroughLowering(acc_name)
+
+            if _chain_terminal == "reduce":
+                if not hasattr(device_fn, "_nki_pre_reduced_loads"):
+                    device_fn._nki_pre_reduced_loads = {}
+                device_fn._nki_pre_reduced_loads[acc_name] = {"dim": 1}
+            else:
+                # Store terminal: mark the store node as already-emitted with a
+                # passthrough that returns None (store codegen returns None anyway).
+                assert _chain_store_node is not None
+
+                class _NullLowering(_BaseLowering):
+                    def codegen(self, ctx: object, node: torch.fx.Node) -> None:
+                        return None
+
+                _chain_store_node.meta["lowering"] = _NullLowering()
+
             return expr_from_string(acc_name)
 
         flat_gather_2d = _try_emit_flat_gather_2d(fx_subscript[0])
@@ -2658,10 +3120,13 @@ def _(state: CodegenState) -> ast.AST:
                         f"Unknown row-gather vector offset shape for {vec_offset}"
                     )
                 p_count = int(vec_shape[0])
-                tensor_shape = list(tensor.shape)
+                # Use hbm_dim_size_strs rather than tensor.shape so the 3D
+                # early-exit path (which sets hbm_dim_size_strs to [L*H, D])
+                # works correctly even though the original tensor is 3D.
+                tensor_shape = list(hbm_dim_size_strs)
                 if len(tensor_shape) != 2:
                     raise NotImplementedError(
-                        f"Row gather requires a 2D tensor, got {tensor_shape}"
+                        f"Row gather requires a 2D tensor, got {list(tensor.shape)}"
                     )
                 if isinstance(tensor_shape[1], int):
                     f_total: int | str = int(tensor_shape[1])
@@ -3185,6 +3650,7 @@ def _(state: CodegenState) -> None:
     slice_parts: list[str] = []
     is_scalar_dim_s: list[bool] = []
     partition_offset_var: str | None = None
+    hbm_dim_size_strs_s: list[str] | None = None  # set by 3D early-exit or after loop
     tensor_dim_idx = 0
     for i, sub_val in enumerate(subscript):
         if sub_val is None:
@@ -3298,6 +3764,81 @@ def _(state: CodegenState) -> None:
                     tensor_dim_idx += 1
                     continue
 
+            # 3D tensor with pattern [vec + starts, scalar_head, :] — same as load.
+            if (
+                tensor_dim_idx == 0
+                and tensor.dim() == 3
+                and isinstance(sub_val, torch.Tensor)
+                and len(subscript) >= 3
+            ):
+                # Look ahead: next subscript must be scalar, then slice
+                _remaining_subs = [s for j, s in enumerate(subscript) if j > i and s is not None]
+                if len(_remaining_subs) >= 2:
+                    _next_sub = _remaining_subs[0]
+                    _next_next_sub = _remaining_subs[1]
+                    _next_is_scalar = not isinstance(_next_sub, (slice, torch.Tensor))
+                    _next_next_is_slice = isinstance(_next_next_sub, slice)
+                    if _next_is_scalar and _next_next_is_slice and isinstance(fx_node_i, torch.fx.Node):
+                        import sympy as _sp_store3d
+                        _bs_subs_store3d: dict[_sp_store3d.Symbol, int] = {}
+                        for _bid in range(len(env.block_sizes)):
+                            _bs = env.block_sizes[_bid]
+                            _bs_subs_store3d[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+                        h_size = tensor.size(1)
+                        d_size = tensor.size(2)
+                        h_int = int(h_size._sympy_().subs(_bs_subs_store3d)) if isinstance(h_size, torch.SymInt) else int(h_size)
+                        d_int = int(d_size._sympy_().subs(_bs_subs_store3d)) if isinstance(d_size, torch.SymInt) else int(d_size)
+                        # Get scalar head expression
+                        _head_expr_s: str | None = None
+                        # Find the FX node for the next subscript
+                        _next_fx_idx = i + 1
+                        while _next_fx_idx < len(subscript) and subscript[_next_fx_idx] is None:
+                            _next_fx_idx += 1
+                        _next_fx = fx_subscript[_next_fx_idx] if fx_subscript and _next_fx_idx < len(fx_subscript) else None
+                        if isinstance(_next_fx, torch.fx.Node):
+                            _next_ast = state.codegen.ast_for_fx_node(_next_fx)
+                            if isinstance(_next_ast, ast.AST):
+                                _head_expr_s = ast.unparse(_next_ast)
+                        if _head_expr_s is None and isinstance(_next_sub, (int, bool)):
+                            _head_expr_s = str(int(_next_sub))
+                        elif _head_expr_s is None and isinstance(_next_sub, torch.SymInt):
+                            _head_expr_s = str(int(_next_sub._sympy_().subs(_bs_subs_store3d)))
+                        # Get row-gather sentinel for vec index
+                        _p_count_s = None
+                        # Determine partition_dim from the value being stored
+                        val_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
+                        val_shape = device_fn._nki_sbuf_shapes.get(val_name)
+                        if val_shape and len(val_shape) >= 1:
+                            _p_count_s = val_shape[0]
+                        _row_scatter_3d = _nki_row_index_gather(fx_node_i, state, _p_count_s)
+                        if _row_scatter_3d is not None and _head_expr_s is not None:
+                            sentinel_prefix = "__AP_ROW_GATHER__"
+                            if _row_scatter_3d.startswith(sentinel_prefix):
+                                _vec_var_s = _row_scatter_3d[len(sentinel_prefix):].rstrip("_")
+                                _flat_var_s = device_fn.new_var("_3d_flat_idx_store", dce=True)
+                                device_fn._nki_sbuf_shapes[_flat_var_s] = [_p_count_s, 1]
+                                device_fn._nki_sbuf_dtypes[_flat_var_s] = "nl.uint32"
+                                state.codegen.add_statement(statement_from_string(
+                                    f"{_flat_var_s} = nl.ndarray([{_p_count_s}, 1], nl.uint32, buffer=nl.sbuf)"
+                                ))
+                                state.codegen.add_statement(statement_from_string(
+                                    f"nisa.tensor_copy(dst={_flat_var_s}, src={_vec_var_s})"
+                                ))
+                                if h_int != 1:
+                                    state.codegen.add_statement(statement_from_string(
+                                        f"nisa.tensor_scalar(dst={_flat_var_s}, data={_flat_var_s}, op0=nl.multiply, operand0={h_int}, op1=None)"
+                                    ))
+                                state.codegen.add_statement(statement_from_string(
+                                    f"nisa.tensor_scalar(dst={_flat_var_s}, data={_flat_var_s}, op0=nl.add, operand0={_head_expr_s}, op1=None)"
+                                ))
+                                slice_parts = [f"__AP_ROW_GATHER__{_flat_var_s}__", f"0:{d_int}"]
+                                is_scalar_dim_s = [False, False]
+                                total_rows_s = int(tensor.numel()) // d_int
+                                hbm_dim_size_strs_s = [str(total_rows_s), str(d_int)]
+                                partition_offset_var = None
+                                # Skip remaining dims
+                                break
+
             size_i = tensor.size(tensor_dim_idx) if tensor_dim_idx < tensor.dim() else sub_val
             size_str = (
                 state.sympy_expr(size_i._sympy_())
@@ -3316,9 +3857,10 @@ def _(state: CodegenState) -> None:
             else str(dim_size)
         )
 
-    hbm_dim_size_strs_s = [
-        _store_tensor_dim_size_str(dim_idx) for dim_idx in range(tensor.dim())
-    ]
+    if hbm_dim_size_strs_s is None:
+        hbm_dim_size_strs_s = [
+            _store_tensor_dim_size_str(dim_idx) for dim_idx in range(tensor.dim())
+        ]
     flattened_high_rank_store = False
 
     # 3D+ tensors: reshaped to 2D at kernel entry.
@@ -4053,10 +4595,10 @@ def _(state: CodegenState) -> None:
                         f"Unknown row-scatter vector offset shape for {_vec_offset}"
                     )
                 _p_count = int(_vec_shape[0])
-                _tensor_shape = list(tensor.shape)
+                _tensor_shape = list(hbm_dim_size_strs_s)
                 if len(_tensor_shape) != 2:
                     raise NotImplementedError(
-                        f"Row scatter requires a 2D tensor, got {_tensor_shape}"
+                        f"Row scatter requires a 2D tensor, got {list(tensor.shape)}"
                     )
                 if isinstance(_tensor_shape[1], int):
                     _f_total: int | str = int(_tensor_shape[1])

@@ -265,6 +265,10 @@ class DeviceFunction:
         self._variable_renames: dict[str, list[str]] = {}
         self._nki_tile_lists: dict[str, list[str]] = {}  # var → [var_0, var_1, ...]
         self._nki_sbuf_shapes: dict[str, list[int]] = {}  # var → [p, f]
+        # Track N-D logical shapes before flattening to 2D NKI layout.
+        # Maps var → [d0, d1, ..., dn] where d0*d1*...*d(n-2) = p and d(n-1) = f.
+        # Used to preserve leading dimensions during partition-axis reductions.
+        self._nki_logical_shapes: dict[str, list[int]] = {}  # var → [d0, d1, ..., dn]
         # Loop-index SBUF tiles are generated from a scalar offset plus iota.
         # Keep the scalar origin so index arithmetic such as ``tile.index % S``
         # can lower to NKI tensor ops even when S is a lifted local variable.

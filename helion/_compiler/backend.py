@@ -688,7 +688,7 @@ class NKIOpOverrides:
 
     @staticmethod
     def _nki_tensor_tensor(a: object, b: object, op: str, prefix: str) -> str:
-        from .ast_extension import statement_from_string
+        from .ast_extension import statement_from_string, create, expr_from_string as _efrom
         from .compile_environment import CompileEnvironment
 
         env = CompileEnvironment.current()
@@ -802,8 +802,124 @@ class NKIOpOverrides:
                     return s
             return None
 
+        def _lookup_logical_shape(name: object) -> list[int] | None:
+            """Return the N-D logical shape for a 3D-gathered tensor, or None."""
+            logical = getattr(state.device_function, "_nki_logical_shapes", {})
+            s = logical.get(str(name))
+            if s is not None:
+                return s
+            _lk = str(name)
+            while "_copy" in _lk:
+                _lk = _lk[:_lk.rfind("_copy")]
+                s = logical.get(_lk)
+                if s is not None:
+                    return s
+            return None
+
         a_shape_r = _lookup_shape(a)
         b_shape_r = _lookup_shape(b)
+
+        # 3D logical shape broadcast: if one operand was loaded as a full
+        # [p*k, m] gather (logical shape [p, k, m]) and the other is a
+        # smaller tensor like [1, p] (mean_acc), we need to broadcast the
+        # smaller one to [p*k, m] by repeating each row p*k/p = k times.
+        # Example: mean_acc [1, 4] and x_slice [32, 8] with logical [4,8,8]:
+        #   broadcast [1, 4] → [1, 4] copy to [4, 1] → replicate k=8 times
+        #   into [32, 1] → then broadcast to [32, 8].
+        _a_logical = _lookup_logical_shape(a)
+        _b_logical = _lookup_logical_shape(b)
+        if (_a_logical is not None or _b_logical is not None) and a_shape_r is not None and b_shape_r is not None:
+            # Identify which operand is the 3D tensor and which is the scalar/1D
+            if _a_logical is not None and _b_logical is None:
+                _3d_name, _3d_shape, _3d_logical = str(a), a_shape_r, _a_logical
+                _small_name, _small_shape = str(b), b_shape_r
+            elif _b_logical is not None and _a_logical is None:
+                _3d_name, _3d_shape, _3d_logical = str(b), b_shape_r, _b_logical
+                _small_name, _small_shape = str(a), a_shape_r
+            else:
+                _3d_name, _3d_shape, _3d_logical, _small_name, _small_shape = None, None, None, None, None
+
+            if _3d_name is not None:
+                # _3d_logical = [p, k, m]; _3d_shape = [p*k, m]
+                _p, _k, _m = _3d_logical[0], _3d_logical[1], _3d_logical[2]
+                _pk = _p * _k
+                # The small tensor should logically be [p, 1, 1] or similar.
+                # Its 2D form: [1, p] (free-dim row vector).
+                # We need to broadcast it to [pk, m]:
+                #   [1, p] → transpose → [p, 1] → repeat k times → [pk, 1] → bcast → [pk, m]
+                if list(_small_shape) == [1, _p] or list(_small_shape) == [_p, 1]:
+                    _dtype_str = getattr(state.device_function, "_nki_sbuf_dtypes", {}).get(_3d_name, "nl.float32")
+                    _small_dtype = getattr(state.device_function, "_nki_sbuf_dtypes", {}).get(_small_name, "nl.float32")
+
+                    # Step 1: ensure small tensor is [p, 1] (col vector)
+                    if list(_small_shape) == [1, _p]:
+                        _col_var = state.device_function.new_var("_3d_bcast_col", dce=True)
+                        state.device_function._nki_sbuf_shapes[_col_var] = [_p, 1]
+                        state.device_function._nki_sbuf_dtypes[_col_var] = _small_dtype
+                        _tr_psum = state.device_function.new_var("_3d_bcast_tr_psum", dce=True)
+                        state.add_statement(statement_from_string(
+                            f"{_tr_psum} = nl.ndarray([{_p}, 1], {_small_dtype}, buffer=nl.psum)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.nc_transpose(dst={_tr_psum}, data={_small_name})"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"{_col_var} = nl.ndarray([{_p}, 1], {_small_dtype}, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={_col_var}, src={_tr_psum})"
+                        ))
+                    else:
+                        _col_var = _small_name
+
+                    # Step 2: replicate k times to get [p*k, 1]
+                    _pk_col = state.device_function.new_var("_3d_bcast_pk_col", dce=True)
+                    state.device_function._nki_sbuf_shapes[_pk_col] = [_pk, 1]
+                    state.device_function._nki_sbuf_dtypes[_pk_col] = _small_dtype
+                    state.add_statement(statement_from_string(
+                        f"{_pk_col} = nl.ndarray([{_pk}, 1], {_small_dtype}, buffer=nl.sbuf)"
+                    ))
+                    _rep_var = state.device_function.new_var("_3d_bcast_rep")
+                    state.add_statement(create(
+                        ast.For,
+                        target=create(ast.Name, id=_rep_var, ctx=ast.Store()),
+                        iter=_efrom(f"nl.affine_range({_k})"),
+                        body=[statement_from_string(
+                            f"nisa.tensor_copy("
+                            f"dst={_pk_col}[{_rep_var}*{_p}:({_rep_var}+1)*{_p}, :], "
+                            f"src={_col_var})"
+                        )],
+                        orelse=[],
+                    ))
+
+                    # Step 3: broadcast [pk, 1] → [pk, m]
+                    _pk_m = state.device_function.new_var("_3d_bcast_pk_m", dce=True)
+                    state.device_function._nki_sbuf_shapes[_pk_m] = [_pk, _m]
+                    state.device_function._nki_sbuf_dtypes[_pk_m] = _dtype_str
+                    state.add_statement(statement_from_string(
+                        f"{_pk_m} = nl.ndarray([{_pk}, {_m}], {_dtype_str}, buffer=nl.sbuf)"
+                    ))
+                    _f_var = state.device_function.new_var("_3d_bcast_f")
+                    state.add_statement(create(
+                        ast.For,
+                        target=create(ast.Name, id=_f_var, ctx=ast.Store()),
+                        iter=_efrom(f"nl.affine_range({_m})"),
+                        body=[statement_from_string(
+                            f"nisa.tensor_copy(dst={_pk_m}[0:{_pk}, {_f_var}:{_f_var}+1], "
+                            f"src={_pk_col}[0:{_pk}, 0:1])"
+                        )],
+                        orelse=[],
+                    ))
+
+                    # Now both operands are [pk, m] — substitute the broadcast result
+                    if _a_logical is not None:
+                        b = _pk_m
+                    else:
+                        a = _pk_m
+                    # Re-lookup shapes with substituted operand
+                    a_shape_r = _lookup_shape(a)
+                    b_shape_r = _lookup_shape(b)
+
         if (
             a_shape_r is not None and b_shape_r is not None
             and len(a_shape_r) == 2 and len(b_shape_r) == 2
@@ -1233,6 +1349,10 @@ class NKIOpOverrides:
                     dtype_str = env.backend.dtype_str(cur_node.meta["val"].dtype)
                 else:
                     dtype_str = "nl.float32"
+                # NKI bitwise ops require all operands to have the same integer
+                # dtype. Override bool_ output to int32 for bitwise operations.
+                if op.startswith("nl.bitwise") and dtype_str == "nl.bool_":
+                    dtype_str = "nl.int32"
 
                 # If operands have mismatched partition dims, the output must use
                 # the larger partition count (the broadcast result is [P, F]).
@@ -1719,6 +1839,9 @@ class NKIOpOverrides:
             _out_val = cur_node.meta.get("val")
             if isinstance(_out_val, torch.Tensor):
                 _bcast_dtype_str = env.backend.dtype_str(_out_val.dtype)
+        # NKI bitwise ops require all operands to have the same int dtype.
+        if op.startswith("nl.bitwise") and _bcast_dtype_str == "nl.bool_":
+            _bcast_dtype_str = "nl.int32"
 
         def _emit_sbuf_replicate(src_var: str, src_shape: list[int],
                                   p_target: int, f_target: int,
@@ -2276,17 +2399,36 @@ class NKIOpOverrides:
             and op0_shape[1] > 1
             and op0_shape[1] == dst_shape[0]
         ):
-            # Need [P, 1] but have [1, P] — emit nc_transpose
-            _dt = state.device_function._nki_sbuf_dtypes.get(operand_str, "nl.float32")
+            # Need [P, 1] but have [1, P] — emit nc_transpose.
+            # nc_transpose requires float input; cast int types to float32 first.
+            _dt = _ts_lookup_dtype(operand_str)
+            _int_dtypes_ts = {"nl.int32", "nl.int16", "nl.int8", "nl.uint32", "nl.uint16", "nl.uint8"}
+            _transpose_src = operand_str
+            _transpose_dt = _dt
+            if _dt in _int_dtypes_ts:
+                _cast_var = state.device_function.new_var("_ts_tr_cast", dce=True)
+                state.device_function._nki_sbuf_shapes[_cast_var] = [1, op0_shape[1]]
+                state.device_function._nki_sbuf_dtypes[_cast_var] = "nl.float32"
+                state.add_statement(statement_from_string(
+                    f"{_cast_var} = nl.ndarray([1, {op0_shape[1]}], nl.float32, buffer=nl.sbuf)"
+                ))
+                state.add_statement(statement_from_string(
+                    f"nisa.memset({_cast_var}, value=0)"
+                ))
+                state.add_statement(statement_from_string(
+                    f"nisa.tensor_tensor(dst={_cast_var}, data1={_cast_var}, data2={operand_str}, op=nl.add)"
+                ))
+                _transpose_src = _cast_var
+                _transpose_dt = "nl.float32"
             tr_psum = state.device_function.new_var("_ts_tr_psum", dce=True)
             tr_sbuf = state.device_function.new_var("_ts_tr_sbuf", dce=True)
             state.device_function._nki_sbuf_shapes[tr_sbuf] = [op0_shape[1], 1]
             state.device_function._nki_sbuf_dtypes[tr_sbuf] = _dt
             state.add_statement(statement_from_string(
-                f"{tr_psum} = nl.ndarray([{op0_shape[1]}, 1], {_dt}, buffer=nl.psum)"
+                f"{tr_psum} = nl.ndarray([{op0_shape[1]}, 1], {_transpose_dt}, buffer=nl.psum)"
             ))
             state.add_statement(statement_from_string(
-                f"nisa.nc_transpose(dst={tr_psum}, data={operand_str})"
+                f"nisa.nc_transpose(dst={tr_psum}, data={_transpose_src})"
             ))
             state.add_statement(statement_from_string(
                 f"{tr_sbuf} = nl.ndarray([{op0_shape[1]}, 1], {_dt}, buffer=nl.sbuf)"
@@ -2299,8 +2441,12 @@ class NKIOpOverrides:
         operand_name = str(operand_for_emit)
         operand_shape = _ts_lookup_shape(operand_name)
         operand_dtype = _ts_lookup_dtype(operand_name)
+        # Cast int operands to float32 for tensor_scalar — EXCEPT for bitwise
+        # ops which require integer operands matching the dst dtype.
+        _is_bitwise_op = "bitwise" in op0
         if (
             operand_shape is not None
+            and not _is_bitwise_op
             and operand_dtype
             in {"nl.int32", "nl.int16", "nl.int8", "nl.uint32", "nl.uint16", "nl.uint8"}
         ):
@@ -2315,6 +2461,23 @@ class NKIOpOverrides:
                 f"nisa.tensor_copy(dst={cast_operand}, src={operand_for_emit})"
             ))
             operand_for_emit = cast_operand
+        elif _is_bitwise_op and operand_shape is not None:
+            # For bitwise ops, ensure operand dtype matches the dst dtype (int32).
+            # If the operand ended up as float32 from the transpose cast above,
+            # cast it back to int32.
+            dst_dtype = _ts_lookup_dtype(dst)
+            if operand_dtype != dst_dtype and dst_dtype in {"nl.int32", "nl.uint32"}:
+                cast_operand = state.device_function.new_var("_ts_operand_i", dce=True)
+                operand_shape_str = ", ".join(str(d) for d in operand_shape)
+                state.device_function._nki_sbuf_shapes[cast_operand] = list(operand_shape)
+                state.device_function._nki_sbuf_dtypes[cast_operand] = dst_dtype
+                state.add_statement(statement_from_string(
+                    f"{cast_operand} = nl.ndarray([{operand_shape_str}], {dst_dtype}, buffer=nl.sbuf)"
+                ))
+                state.add_statement(statement_from_string(
+                    f"nisa.tensor_copy(dst={cast_operand}, src={operand_for_emit})"
+                ))
+                operand_for_emit = cast_operand
 
         operand_emit = _scalar_for_emit(operand_for_emit)
         state.add_statement(
@@ -4424,6 +4587,39 @@ class NKIOpOverrides:
         if state is None:
             return f"{a} {py_op} {b}"
 
+        # nl.affine_range loop offset variables (offset_0, offset_1, ...) are
+        # Python integers at NKI trace time, not SBUF tensors. If an operand
+        # has no registered SBUF shape and matches a known active loop offset
+        # variable, treat it as a scalar so we emit tensor_scalar instead of
+        # the invalid tensor_tensor(data=integer).
+        def _is_loop_offset_var(x: object) -> bool:
+            if not isinstance(x, str):
+                return False
+            sbuf_shapes = getattr(state.device_function, "_nki_sbuf_shapes", {})
+            if x in sbuf_shapes:
+                return False  # it is a real SBUF buffer
+            # Check if it's any active loop offset variable
+            codegen = getattr(state, "codegen", None)
+            if codegen is None:
+                return False
+            for block_id, _block_loops in codegen.active_device_loops.items():
+                for _loop in _block_loops:
+                    try:
+                        if _loop.strategy.offset_var(block_id) == x:
+                            return True
+                    except Exception:
+                        pass
+            return False
+
+        if not a_scalar and _is_loop_offset_var(str(a)):
+            a_scalar = True
+        if not b_scalar and _is_loop_offset_var(str(b)):
+            b_scalar = True
+
+        # Re-check: if both are now scalar, fall back to Python comparison.
+        if a_scalar and b_scalar:
+            return f"{a} {py_op} {b}"
+
         # Resolve PSUM aliases for tensor operands.
         if not a_scalar:
             a = NKIOpOverrides._resolve_psum_alias(state, a)
@@ -4523,6 +4719,7 @@ class NKIOpOverrides:
                 or len(shape) != 2
                 or data_shape != [1, shape[0]]
                 or shape[1] != 1
+                or shape[0] <= 1  # [1,1] → [1,1] transpose is a no-op
             ):
                 return data_name
             data_dtype = _cmp_lookup_dtype(data_name)
@@ -5840,11 +6037,152 @@ class NKIBackend(Backend):
 
             if nki_dim == 0:
                 if not leading_singleton:
-                    raise exc.BackendUnsupported(
-                        self.name,
-                        "partition-axis reduction with non-singleton leading "
-                        "dimensions is unsupported in NKI lowering",
+                    # N-D partition reduction: logical shape is (d0, d1, ..., d(n-2), d(n-1))
+                    # where we're reducing dimension `logical_dim` (somewhere in d0..d(n-2)).
+                    # The NKI 2D layout is [d0*d1*...*d(n-2), d(n-1)] = [partition, free].
+                    # We need to preserve dimensions d0..d(logical_dim-1) and d(logical_dim+1)..d(n-2).
+
+                    # Compute shape components
+                    if fake_input is None or fake_input.ndim <= 2:
+                        raise exc.BackendUnsupported(
+                            self.name,
+                            "partition-axis reduction with non-singleton leading dimensions "
+                            "requires fake_input with ndim > 2",
+                        )
+
+                    # Get full logical shape
+                    logical_shape = [_resolve_reduction_extent(fake_input.size(i))
+                                    for i in range(fake_input.ndim)]
+
+                    # Dimensions before the reduction dim (to preserve)
+                    leading_dims = logical_shape[:logical_dim]
+                    # The dimension being reduced
+                    reduce_dim_size = logical_shape[logical_dim]
+                    # Dimensions after the reduction dim but before the free dim
+                    middle_dims = logical_shape[logical_dim + 1:-1]
+                    # Free dimension
+                    free_size = logical_shape[-1]
+
+                    # Output shape: remove the reduction dimension
+                    output_leading_prod = 1
+                    for d in leading_dims:
+                        output_leading_prod *= d
+                    for d in middle_dims:
+                        output_leading_prod *= d
+
+                    # For each "slice" of preserved dimensions, we need to:
+                    # 1. Extract the slice from the flattened partition dim
+                    # 2. Apply partition reduce
+                    # 3. Store in the output
+
+                    # Determine dtype
+                    if reduction_type == "mean":
+                        dtype_str = "nl.float32"
+                    elif fake_output is not None:
+                        dtype_str = env.backend.dtype_str(fake_output.dtype)
+                    else:
+                        dtype_str = env.backend.dtype_str(fake_input.dtype)
+
+                    _NKI_PARTITION_REDUCE_OPS = {"sum": "nl.add", "max": "nl.max", "mean": "nl.add"}
+                    part_op = _NKI_PARTITION_REDUCE_OPS.get(reduction_type)
+                    if part_op is None:
+                        raise exc.BackendUnsupported(
+                            self.name,
+                            f"partition-axis reduction {reduction_type!r} not supported by "
+                            "nisa.tensor_partition_reduce (supports add, max)",
+                        )
+
+                    # Allocate output buffer with shape [output_leading_prod, free_size]
+                    result_var = state.device_function.new_var("nki_part_reduce_nd", dce=True)
+                    state.device_function._nki_sbuf_shapes[result_var] = [output_leading_prod, free_size]
+                    state.device_function._nki_sbuf_dtypes[result_var] = dtype_str
+                    state.add_statement(
+                        f"{result_var} = nl.ndarray([{output_leading_prod}, {free_size}], "
+                        f"{dtype_str}, buffer=nl.sbuf)"
                     )
+
+                    # Generate loop over preserved dimensions
+                    # The input has shape [leading_prod * reduce_dim_size * middle_prod, free_size]
+                    # We need to process it in chunks
+
+                    # Calculate strides in the flattened partition dimension
+                    middle_prod = 1
+                    for d in middle_dims:
+                        middle_prod *= d
+                    leading_prod = 1
+                    for d in leading_dims:
+                        leading_prod *= d
+
+                    # Stride for the reduction dimension in the partition axis
+                    reduce_stride = middle_prod
+                    # Total elements per output position
+                    input_part_size = leading_prod * reduce_dim_size * middle_prod
+
+                    # We'll process one output row at a time
+                    # Each output row corresponds to one combination of (leading_idx, middle_idx)
+                    for out_idx in range(output_leading_prod):
+                        # Decompose out_idx into leading and middle indices
+                        middle_idx = out_idx % middle_prod
+                        leading_idx = out_idx // middle_prod
+
+                        # Calculate the starting position in the input partition dimension
+                        # Input layout: [leading][reduce][middle][free]
+                        # Flattened:    pos = leading * (reduce_dim_size * middle_prod) +
+                        #                     reduce_offset * middle_prod + middle_idx
+
+                        # For this output position, we need to reduce over reduce_dim_size slices
+                        # Each slice is at: leading_idx * (reduce_dim_size * middle_prod) +
+                        #                   k * middle_prod + middle_idx
+                        # where k in range(reduce_dim_size)
+
+                        # Create a temporary buffer for this slice's reduction
+                        temp_var = state.device_function.new_var("nki_part_reduce_temp", dce=True)
+                        state.add_statement(
+                            f"{temp_var} = nl.ndarray([1, {free_size}], {dtype_str}, buffer=nl.sbuf)"
+                        )
+
+                        # Initialize accumulator
+                        if reduction_type in ("sum", "mean"):
+                            state.add_statement(f"{temp_var}[:, :] = 0.0")
+                        elif reduction_type == "max":
+                            state.add_statement(f"{temp_var}[:, :] = float('-inf')")
+
+                        # Loop over the reduction dimension
+                        for k in range(reduce_dim_size):
+                            # Calculate the row index in the input tensor
+                            input_row = leading_idx * (reduce_dim_size * middle_prod) + k * middle_prod + middle_idx
+
+                            # Extract this row and accumulate
+                            slice_var = state.device_function.new_var("nki_slice", dce=True)
+                            state.add_statement(
+                                f"{slice_var} = {input_name}[{input_row}:{input_row+1}, :]"
+                            )
+
+                            if reduction_type == "sum" or reduction_type == "mean":
+                                state.add_statement(
+                                    f"nisa.tensor_tensor(dst={temp_var}, data1={temp_var}, "
+                                    f"data2={slice_var}, op=nl.add)"
+                                )
+                            elif reduction_type == "max":
+                                state.add_statement(
+                                    f"nisa.tensor_tensor(dst={temp_var}, data1={temp_var}, "
+                                    f"data2={slice_var}, op=nl.maximum)"
+                                )
+
+                        # Handle mean scaling
+                        if reduction_type == "mean":
+                            scale = 1.0 / reduce_dim_size
+                            state.add_statement(
+                                f"nisa.tensor_scalar(dst={temp_var}, data={temp_var}, "
+                                f"op0=nl.multiply, operand0={scale}, op1=None)"
+                            )
+
+                        # Store result in output
+                        state.add_statement(
+                            f"{result_var}[{out_idx}:{out_idx+1}, :] = {temp_var}"
+                        )
+
+                    return result_var
                 input_shape = state.device_function._nki_sbuf_shapes.get(input_name)
                 if (
                     fake_input is not None

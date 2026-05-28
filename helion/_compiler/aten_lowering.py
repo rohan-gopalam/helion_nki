@@ -596,6 +596,16 @@ def codegen_permute_nki(ctx: LoweringContext, node: Node) -> object:
 
         # Check if source is a tile-list (multi-tile split from partition > 128 load).
         src_name = _ast.unparse(tensor)
+
+        # Prefer the registered SBUF shape over the FX val shape, which may
+        # have wrong size hints for dynamic block sizes (e.g. tile_kv with
+        # unbacked SymInt whose hint differs from the configured block_size).
+        registered_src = state.device_function._nki_sbuf_shapes.get(src_name)
+        if registered_src is not None and len(registered_src) == 2:
+            src_shape = list(registered_src)
+            # Infer dst_shape as the transpose
+            dst_shape = [src_shape[1], src_shape[0]]
+
         src_tile_vars = state.device_function.get_tile_list_vars(src_name)
         if src_tile_vars is not None:
             # Use actual per-tile SBUF shapes (not FX val shape, which may

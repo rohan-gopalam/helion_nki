@@ -1782,14 +1782,40 @@ def _(state: CodegenState) -> ast.AST:
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
             if tdi == 0:
                 partition_offset_var = offset_var
+            # Check if the subscript FX node is a SHIFTED tile (e.g.
+            # tile_k.index + tile_c.begin * chunk_size). If so, emit the
+            # shifted slice instead of the plain offset:offset+block range.
+            _shifted_s = _nki_shifted_tile_subscript(fx_node_tdi_check, state, env)
             # Check if this block is inside a dynamic_range loop - if so, we
             # can't use offset_var in a slice (it's a register). Mark this
             # subscript with a sentinel token that the DMA emit will recognize
             # and substitute with .ap(scalar_offset=counter).
             _dyn_loops = getattr(state.device_function, "_nki_dyn_loops", {})
-            if block_id in _dyn_loops:
+            if _shifted_s is not None:
+                if tdi == 0:
+                    partition_offset_var = _shifted_s.split(":", 1)[0].strip()
+                slice_parts.append(_shifted_s)
+                used_shifted_subscript = True
+            elif block_id in _dyn_loops:
                 _counter = _dyn_loops[block_id]["counter"]
                 slice_parts.append(f"__DYN_AP__{_counter}__{int(block_size)}")
+            elif (
+                tdi == 0
+                and tensor.dim() == 2
+                and isinstance(_sub_val_load, torch.Tensor)
+            ):
+                # Check if the subscript is a non-contiguous gather (indirect load).
+                # When block_id was found via size match but the subscript is a gather
+                # (e.g. sorted_to_orig_token_idx[indices] or torch.where result),
+                # use the row gather (.ap() with vector_offset) mechanism.
+                row_gather = _nki_row_index_gather(fx_node_tdi_check, state, partition_dim)
+                if row_gather is not None:
+                    if tdi == 0:
+                        partition_offset_var = row_gather.split(":", 1)[0].strip() if ":" in row_gather else row_gather
+                    slice_parts.append(row_gather)
+                    is_scalar_dim.append(False)
+                    continue
+                slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
             else:
                 slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
             is_scalar_dim.append(False)
@@ -3416,7 +3442,11 @@ def _(state: CodegenState) -> ast.AST:
             multiplier_parts = [str(original_dim_sizes[k]) for k in range(j + 1, len(original_dim_sizes))]
             if multiplier_parts:
                 multiplier = " * ".join(multiplier_parts)
-                flat_offset_parts.append(f"{off} * {multiplier}")
+                # Parenthesize compound offset expressions to ensure correct precedence.
+                # e.g. "offset_2 + mul_chunk" * 2 must become "(offset_2 + mul_chunk) * 2"
+                # not "offset_2 + mul_chunk * 2" (wrong due to operator precedence).
+                off_expr = f"({off})" if ("+" in off or "-" in off) else off
+                flat_offset_parts.append(f"{off_expr} * {multiplier}")
             else:
                 flat_offset_parts.append(off)
         flat_offset = " + ".join(flat_offset_parts)
@@ -3431,14 +3461,13 @@ def _(state: CodegenState) -> ast.AST:
         # Fix partition_offset_var to point to the flat offset expression
         partition_offset_var = f"({flat_offset})"
 
-        # Squeeze output_shape to 2D: combine leading dims
-        flat_partition = 1
-        for dim_i in range(tensor.dim() - 1):
-            flat_partition *= _resolve_dim(output_shape[dim_i]) if dim_i < len(output_shape) else 1
-        if len(output_shape) > 2:
-            output_shape = [flat_partition] + [output_shape[-1]]
-        partition_dim = _resolve_dim(output_shape[0])
-        free_dims = [_resolve_dim(s) for s in output_shape[1:]]
+        # Squeeze output_shape to 2D using flat_block_size from the slice computation.
+        # flat_block_size is derived from the actual DMA slice ranges and is always
+        # correct. output_shape may have extra leading trivial dimensions (block_size=1)
+        # from outer loop tiles, making it unreliable for partition_dim computation.
+        partition_dim = flat_block_size
+        free_dims = [_resolve_dim(output_shape[-1])]
+        output_shape = [partition_dim] + free_dims
         flat_hbm_partition = 1
         for dim_size in original_dim_sizes:
             flat_hbm_partition *= dim_size
@@ -4299,6 +4328,25 @@ def _(state: CodegenState) -> None:
                 slice_parts.append(_shifted_s)
                 if tensor_dim_idx == 0 and tensor.dim() != 1:
                     partition_offset_var = _shifted_s.split(":", 1)[0].strip()
+            elif (
+                tensor_dim_idx == 0
+                and tensor.dim() == 2
+                and isinstance(sub_val, torch.Tensor)
+            ):
+                # Check if the subscript is a non-contiguous gather (indirect scatter).
+                # When block_id was found via size match but the subscript is a gather
+                # (e.g. sorted_to_orig_token_idx[indices] or torch.where result),
+                # use the row scatter (.ap() with vector_offset) mechanism.
+                _value_name_s2 = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
+                _val_sbuf_shape = device_fn._nki_sbuf_shapes.get(_value_name_s2)
+                _p_count_s2 = _val_sbuf_shape[0] if _val_sbuf_shape and len(_val_sbuf_shape) >= 1 else None
+                _row_scatter_s2 = _nki_row_index_gather(fx_node_i, state, _p_count_s2)
+                if _row_scatter_s2 is not None:
+                    slice_parts.append(_row_scatter_s2)
+                    is_scalar_dim_s.append(False)
+                    tensor_dim_idx += 1
+                    continue
+                slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
             else:
                 slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
             is_scalar_dim_s.append(False)
@@ -4473,7 +4521,8 @@ def _(state: CodegenState) -> None:
             multiplier_parts = [str(original_dim_sizes_s[k]) for k in range(j + 1, len(original_dim_sizes_s))]
             if multiplier_parts:
                 multiplier = " * ".join(multiplier_parts)
-                flat_offset_parts_s.append(f"{off} * {multiplier}")
+                off_expr_s = f"({off})" if ("+" in off or "-" in off) else off
+                flat_offset_parts_s.append(f"{off_expr_s} * {multiplier}")
             else:
                 flat_offset_parts_s.append(off)
         flat_offset_s = " + ".join(flat_offset_parts_s)

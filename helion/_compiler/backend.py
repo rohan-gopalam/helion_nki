@@ -3668,44 +3668,24 @@ class NKIOpOverrides:
                         and len(_b_sbuf) == 2 and len(_a_sbuf) == 2
                         and _b_sbuf[0] == 1 and _b_sbuf[1] > 1
                         and _a_sbuf[0] > 1 and _a_sbuf[1] == _b_sbuf[1]):
-                    # [1, F] * [P, F]: transpose b to [F, 1] then use tensor_scalar
+                    # [1, F] * [P, F]: broadcast b to [P, F] then use tensor_tensor
+                    # (tensor_scalar would need [P, 1] but F broadcast across partition
+                    #  is needed here, not partition broadcast across free)
                     from .ast_extension import statement_from_string as _sfs_mul
                     _b_dtype = _mul_state.device_function._nki_sbuf_dtypes.get(b_name_m, "nl.float32")
-                    _tr_dtype = "nl.float32" if _b_dtype in ("nl.int32", "nl.uint32") else _b_dtype
+                    _P = _a_sbuf[0]
                     _F = _b_sbuf[1]
-                    _tr_psum = _mul_state.device_function.new_var("_nki_bcast_tr_psum", dce=True)
-                    _tr_sbuf = _mul_state.device_function.new_var("_nki_bcast_tr_sbuf", dce=True)
-                    _mul_state.device_function._nki_sbuf_shapes[_tr_sbuf] = [_F, 1]
-                    _mul_state.device_function._nki_sbuf_dtypes[_tr_sbuf] = _b_dtype
-                    if _tr_dtype != _b_dtype:
-                        _cast = _mul_state.device_function.new_var("_nki_bcast_cast", dce=True)
-                        _mul_state.device_function._nki_sbuf_shapes[_cast] = [1, _F]
-                        _mul_state.device_function._nki_sbuf_dtypes[_cast] = _tr_dtype
-                        _mul_state.codegen.add_statement(_sfs_mul(
-                            f"{_cast} = nl.ndarray([1, {_F}], {_tr_dtype}, buffer=nl.sbuf)"
-                        ))
-                        _mul_state.codegen.add_statement(_sfs_mul(
-                            f"nisa.memset({_cast}, value=0)"
-                        ))
-                        _mul_state.codegen.add_statement(_sfs_mul(
-                            f"nisa.tensor_tensor(dst={_cast}, data1={_cast}, data2={b_name_m}, op=nl.add)"
-                        ))
-                        b_for_tr = _cast
-                    else:
-                        b_for_tr = b_name_m
+                    _bc = _mul_state.device_function.new_var("_nki_pf_bcast", dce=True)
+                    _mul_state.device_function._nki_sbuf_shapes[_bc] = [_P, _F]
+                    _mul_state.device_function._nki_sbuf_dtypes[_bc] = _b_dtype
                     _mul_state.codegen.add_statement(_sfs_mul(
-                        f"{_tr_psum} = nl.ndarray([{_F}, 1], {_tr_dtype}, buffer=nl.psum)"
+                        f"{_bc} = nl.broadcast_to({b_name_m}, shape=({_P}, {_F}))"
                     ))
-                    _mul_state.codegen.add_statement(_sfs_mul(
-                        f"nisa.nc_transpose(dst={_tr_psum}, data={b_for_tr})"
-                    ))
-                    _mul_state.codegen.add_statement(_sfs_mul(
-                        f"{_tr_sbuf} = nl.ndarray([{_F}, 1], {_b_dtype}, buffer=nl.sbuf)"
-                    ))
-                    _mul_state.codegen.add_statement(_sfs_mul(
-                        f"nisa.tensor_copy(dst={_tr_sbuf}, src={_tr_psum})"
-                    ))
-                    return self._nki_tensor_scalar(a, _tr_sbuf, "nl.multiply")
+                    # Now tensor_tensor([P,F] * [P,F]) — pass strings, not AST
+                    return self._nki_binary_op(a_name_m, _bc,
+                                               op_tensor_tensor="nl.multiply",
+                                               op_tensor_scalar="nl.multiply",
+                                               allow_tensor_tensor=True)
 
         return self._nki_binary_op(
             a,

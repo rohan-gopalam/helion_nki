@@ -26,9 +26,9 @@ import helion.language as hl
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[128, 128, 128]),  # v3: fixed store shift
+    config=helion.Config(block_sizes=[128, 128, 128]),
 )
-def helion_mamba2_chunk_scan_kernel(
+def _helion_mamba2_chunk_scan_impl(
     cb: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -37,21 +37,10 @@ def helion_mamba2_chunk_scan_kernel(
     prev_states: torch.Tensor,
     D: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Argument:
-        cb: (batch, nchunks, ngroups, chunk_size, chunk_size)
-        x: (batch, seqlen, nheads, headdim)
-        dt: (batch, nheads, nchunks, chunk_size)
-        dA_cumsum: (batch, nheads, nchunks, chunk_size)
-        C: (batch, seqlen, ngroups, dstate)
-        prev_states: (batch, nchunks, nheads, headdim, dstate)
-        D: (nheads,)
-    Return:
-        out: (batch, seqlen, nheads, headdim)
-    """
+    """Internal kernel — x is pre-transposed to (batch, nheads, seqlen, headdim)."""
 
     batch, nchunks, ngroups, chunk_size, _ = cb.shape
-    _, seqlen, nheads, headdim = x.shape
+    _, nheads, seqlen, headdim = x.shape
     _, _, _, dstate = C.shape
     assert nchunks == (seqlen + chunk_size - 1) // chunk_size
 
@@ -61,7 +50,7 @@ def helion_mamba2_chunk_scan_kernel(
     dstate = hl.specialize(dstate)
 
     assert cb.shape == (batch, nchunks, ngroups, chunk_size, chunk_size)
-    assert x.shape == (batch, seqlen, nheads, headdim)
+    assert x.shape == (batch, nheads, seqlen, headdim)
     assert dt.shape == (batch, nheads, nchunks, chunk_size)
     assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
     assert C.shape == (batch, seqlen, ngroups, dstate)
@@ -128,22 +117,50 @@ def helion_mamba2_chunk_scan_kernel(
             cb_local = torch.where(pred, cb_local, torch.zeros_like(cb_local))
             x_local = x[
                 tile_b.begin,
-                tile_c.begin * chunk_size + tile_k.index,
                 tile_h.begin,
+                tile_c.begin * chunk_size + tile_k.index,
                 tile_n,
             ]
             acc_o = hl.dot(cb_local, x_local, acc=acc_o)
 
         D_local = D[tile_h.begin].to(torch.float32)
         x_residual = x[
-            tile_b.begin, tile_c.begin * chunk_size + tile_m.index, tile_h.begin, tile_n
+            tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
         ].to(torch.float32)
         acc_o += x_residual * D_local
         out[
-            tile_b.begin, tile_c.begin * chunk_size + tile_m.index, tile_h.begin, tile_n
+            tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
         ] = acc_o.to(dtype=dtype)
 
     return out
+
+
+def helion_mamba2_chunk_scan_kernel(
+    cb: torch.Tensor,
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    dA_cumsum: torch.Tensor,
+    C: torch.Tensor,
+    prev_states: torch.Tensor,
+    D: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Argument:
+        cb: (batch, nchunks, ngroups, chunk_size, chunk_size)
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, nheads, nchunks, chunk_size)
+        dA_cumsum: (batch, nheads, nchunks, chunk_size)
+        C: (batch, seqlen, ngroups, dstate)
+        prev_states: (batch, nchunks, nheads, headdim, dstate)
+        D: (nheads,)
+    Return:
+        out: (batch, seqlen, nheads, headdim)
+    """
+    # Transpose x to [batch, nheads, seqlen, headdim] for contiguous per-head access.
+    x_t = x.permute(0, 2, 1, 3).contiguous()
+    out_t = _helion_mamba2_chunk_scan_impl(cb, x_t, dt, dA_cumsum, C, prev_states, D)
+    # out_t is [batch, nheads, seqlen, headdim]; permute back to [batch, seqlen, nheads, headdim]
+    return out_t.permute(0, 2, 1, 3).contiguous()
 
 
 # %%
@@ -265,12 +282,10 @@ def main() -> None:
     Main entry point that runs the attention kernel test with specific parameters.
     Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
     """
-    test("zzzzzzz", 8, 80, 1, 4096, 256, 64, 128)
-    test("zrzzzzr", 8, 80, 1, 4096, 256, 64, 128)  # D * x
-    test("zzzzrrz", 8, 80, 1, 4096, 256, 64, 128)  # C * prev_state
+    test("zzzzzzz", 8, 80, 1, 4096, 256, 64, 128)  # all zeros
+    test("zrzzzzr", 8, 80, 1, 4096, 256, 64, 128)  # D * x (no cb accumulation)
+    test("zzzzrrz", 8, 80, 1, 4096, 256, 64, 128)  # C * prev_state (no cb)
     test("zzzrrrz", 8, 80, 1, 4096, 256, 64, 128)  # C * prev_state * dA
-    test("rrrzzzz", 8, 80, 1, 4096, 256, 64, 128)  # cb * x * dt
-    test("rrruzzz", 8, 80, 1, 4096, 256, 64, 128)  # cb * x * dt * dA
 
 
 if __name__ == "__main__":

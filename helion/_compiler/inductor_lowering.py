@@ -1236,7 +1236,13 @@ class GraphInterpreter(LoweringContext, Interpreter):
                     raise InductorLoweringError(
                         f"Error in codegen for node {n.name} ({n.target}): {e}"
                     ) from e
-        return super().run_node(n)
+        result = super().run_node(n)
+        # For placeholder nodes, register their AST in fx_node_to_ast so that
+        # inner-loop subscript analysis (e.g. _nki_shifted_tile_subscript) can
+        # look up outer-loop variables like tile_c.begin * chunk_size.
+        if n.op == "placeholder" and isinstance(result, ast.AST):
+            self.cg.record_fx_node_ast(n, result)
+        return result
 
 
 def codegen_call_with_graph(

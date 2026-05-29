@@ -3961,7 +3961,35 @@ class NKIOpOverrides:
             # dtype mismatch errors from fp32 matmul/computation results.
             a_dtype = state.device_function._nki_sbuf_dtypes.get(a_str)
             _needs_cast = (a_dtype is not None and a_dtype != out_dtype_str)
-            if not _needs_cast and a_dtype is None and out_dtype_str in ("nl.bfloat16", "nl.float16"):
+            # If a_str is a tile-list base name (sub-tiles: a_str_0, a_str_1, ...),
+            # the base name itself is not a valid SBUF variable.
+            # Consolidate the tile-list into a single SBUF tile first.
+            _a_tile_vars = state.device_function.get_tile_list_vars(a_str)
+            if _a_tile_vars is not None:
+                # Consolidate tile-list into a single tile via copy of first sub-tile
+                # (all sub-tiles should have compatible shapes for the where output)
+                _a_single = state.device_function.new_var("_nki_where_a_single", dce=True)
+                state.device_function._nki_sbuf_shapes[_a_single] = list(out_shape)
+                state.device_function._nki_sbuf_dtypes[_a_single] = out_dtype_str
+                state.add_statement(statement_from_string(
+                    f"{_a_single} = nl.ndarray([{out_shape[0]}, {out_shape[1]}], "
+                    f"{out_dtype_str}, buffer=nl.sbuf)"
+                ))
+                state.add_statement(statement_from_string(
+                    f"nisa.memset({_a_single}, value=0)"
+                ))
+                # Copy each sub-tile into the corresponding rows of the consolidated tile
+                sub_p = out_shape[0] // len(_a_tile_vars) if len(_a_tile_vars) > 0 else 1
+                for _si, _sv in enumerate(_a_tile_vars):
+                    _row_start = _si * sub_p
+                    _row_end = _row_start + sub_p
+                    state.add_statement(statement_from_string(
+                        f"nisa.tensor_copy(dst={_a_single}[{_row_start}:{_row_end}, :], "
+                        f"src={_sv})"
+                    ))
+                a_str = _a_single
+                _needs_cast = False
+            elif not _needs_cast and a_dtype is None and out_dtype_str in ("nl.bfloat16", "nl.float16"):
                 _needs_cast = True
             if _needs_cast:
                 a_cast_var = state.device_function.new_var("_nki_where_a_cast", dce=True)

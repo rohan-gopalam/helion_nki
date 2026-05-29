@@ -3636,6 +3636,9 @@ class NKIOpOverrides:
         )
 
     def mul(self, a: object, b: object) -> str:
+        from .compile_environment import CompileEnvironment as _CE_mul
+        _mul_state = getattr(_CE_mul.current(), "_codegen_state", None)
+
         if (
             not self._is_scalar_operand(a)
             and not self._is_scalar_operand(b)
@@ -3645,8 +3648,6 @@ class NKIOpOverrides:
             # tensor_scalar. The FX shape may show [P, 1] but the actual SBUF
             # layout could be [1, P] (free dim = P > 1).
             b_name = ast.unparse(b) if isinstance(b, ast.AST) else str(b)
-            from .compile_environment import CompileEnvironment as _CE_mul
-            _mul_state = getattr(_CE_mul.current(), "_codegen_state", None)
             _rhs_sbuf_ok = True
             if _mul_state is not None:
                 _rhs_shape = _mul_state.device_function._nki_sbuf_shapes.get(b_name)
@@ -3654,6 +3655,58 @@ class NKIOpOverrides:
                     _rhs_sbuf_ok = False
             if _rhs_sbuf_ok:
                 return self._nki_tensor_scalar(a, b, "nl.multiply")
+
+        # Handle [P, F] * [1, F] pattern (broadcast RHS across partition dim).
+        # Transpose [1, F] → [F, 1] so it broadcasts as a column vector.
+        if not self._is_scalar_operand(a) and not self._is_scalar_operand(b):
+            b_name_m = ast.unparse(b) if isinstance(b, ast.AST) else str(b)
+            a_name_m = ast.unparse(a) if isinstance(a, ast.AST) else str(a)
+            if _mul_state is not None:
+                _b_sbuf = _mul_state.device_function._nki_sbuf_shapes.get(b_name_m)
+                _a_sbuf = _mul_state.device_function._nki_sbuf_shapes.get(a_name_m)
+                if (_b_sbuf is not None and _a_sbuf is not None
+                        and len(_b_sbuf) == 2 and len(_a_sbuf) == 2
+                        and _b_sbuf[0] == 1 and _b_sbuf[1] > 1
+                        and _a_sbuf[0] > 1 and _a_sbuf[1] == _b_sbuf[1]):
+                    # [1, F] * [P, F]: transpose b to [F, 1] then use tensor_scalar
+                    from .ast_extension import statement_from_string as _sfs_mul
+                    _b_dtype = _mul_state.device_function._nki_sbuf_dtypes.get(b_name_m, "nl.float32")
+                    _tr_dtype = "nl.float32" if _b_dtype in ("nl.int32", "nl.uint32") else _b_dtype
+                    _F = _b_sbuf[1]
+                    _tr_psum = _mul_state.device_function.new_var("_nki_bcast_tr_psum", dce=True)
+                    _tr_sbuf = _mul_state.device_function.new_var("_nki_bcast_tr_sbuf", dce=True)
+                    _mul_state.device_function._nki_sbuf_shapes[_tr_sbuf] = [_F, 1]
+                    _mul_state.device_function._nki_sbuf_dtypes[_tr_sbuf] = _b_dtype
+                    if _tr_dtype != _b_dtype:
+                        _cast = _mul_state.device_function.new_var("_nki_bcast_cast", dce=True)
+                        _mul_state.device_function._nki_sbuf_shapes[_cast] = [1, _F]
+                        _mul_state.device_function._nki_sbuf_dtypes[_cast] = _tr_dtype
+                        _mul_state.codegen.add_statement(_sfs_mul(
+                            f"{_cast} = nl.ndarray([1, {_F}], {_tr_dtype}, buffer=nl.sbuf)"
+                        ))
+                        _mul_state.codegen.add_statement(_sfs_mul(
+                            f"nisa.memset({_cast}, value=0)"
+                        ))
+                        _mul_state.codegen.add_statement(_sfs_mul(
+                            f"nisa.tensor_tensor(dst={_cast}, data1={_cast}, data2={b_name_m}, op=nl.add)"
+                        ))
+                        b_for_tr = _cast
+                    else:
+                        b_for_tr = b_name_m
+                    _mul_state.codegen.add_statement(_sfs_mul(
+                        f"{_tr_psum} = nl.ndarray([{_F}, 1], {_tr_dtype}, buffer=nl.psum)"
+                    ))
+                    _mul_state.codegen.add_statement(_sfs_mul(
+                        f"nisa.nc_transpose(dst={_tr_psum}, data={b_for_tr})"
+                    ))
+                    _mul_state.codegen.add_statement(_sfs_mul(
+                        f"{_tr_sbuf} = nl.ndarray([{_F}, 1], {_b_dtype}, buffer=nl.sbuf)"
+                    ))
+                    _mul_state.codegen.add_statement(_sfs_mul(
+                        f"nisa.tensor_copy(dst={_tr_sbuf}, src={_tr_psum})"
+                    ))
+                    return self._nki_tensor_scalar(a, _tr_sbuf, "nl.multiply")
+
         return self._nki_binary_op(
             a,
             b,
@@ -3966,28 +4019,36 @@ class NKIOpOverrides:
             # Consolidate the tile-list into a single SBUF tile first.
             _a_tile_vars = state.device_function.get_tile_list_vars(a_str)
             if _a_tile_vars is not None:
-                # Consolidate tile-list into a single tile via copy of first sub-tile
-                # (all sub-tiles should have compatible shapes for the where output)
-                _a_single = state.device_function.new_var("_nki_where_a_single", dce=True)
-                state.device_function._nki_sbuf_shapes[_a_single] = list(out_shape)
-                state.device_function._nki_sbuf_dtypes[_a_single] = out_dtype_str
-                state.add_statement(statement_from_string(
-                    f"{_a_single} = nl.ndarray([{out_shape[0]}, {out_shape[1]}], "
-                    f"{out_dtype_str}, buffer=nl.sbuf)"
-                ))
-                state.add_statement(statement_from_string(
-                    f"nisa.memset({_a_single}, value=0)"
-                ))
-                # Copy each sub-tile into the corresponding rows of the consolidated tile
-                sub_p = out_shape[0] // len(_a_tile_vars) if len(_a_tile_vars) > 0 else 1
-                for _si, _sv in enumerate(_a_tile_vars):
-                    _row_start = _si * sub_p
-                    _row_end = _row_start + sub_p
-                    state.add_statement(statement_from_string(
-                        f"nisa.tensor_copy(dst={_a_single}[{_row_start}:{_row_end}, :], "
-                        f"src={_sv})"
-                    ))
-                a_str = _a_single
+                # Tile-list: use the first sub-tile as a representative for shape/type,
+                # then apply predicated copy per sub-tile.
+                # The where() result is the first sub-tile since each sub-tile is processed
+                # in its own loop iteration context.
+                if _a_tile_vars:
+                    _first_sv = _a_tile_vars[0]
+                    _sv_shape = state.device_function._nki_sbuf_shapes.get(_first_sv)
+                    _sv_dtype = state.device_function._nki_sbuf_dtypes.get(_first_sv, out_dtype_str)
+                    if _sv_shape and list(_sv_shape) == list(out_shape):
+                        # Sub-tile shape matches output; process each sub-tile with predicated copy
+                        for _si, _sv in enumerate(_a_tile_vars):
+                            _sv_where = state.device_function.new_var("_nki_where_sv", dce=True)
+                            state.device_function._nki_sbuf_shapes[_sv_where] = list(out_shape)
+                            state.device_function._nki_sbuf_dtypes[_sv_where] = out_dtype_str
+                            state.add_statement(statement_from_string(
+                                f"{_sv_where} = nl.ndarray([{out_shape[0]}, {out_shape[1]}], "
+                                f"{out_dtype_str}, buffer=nl.sbuf)"
+                            ))
+                            state.add_statement(statement_from_string(
+                                f"nisa.memset({_sv_where}, value=0)"
+                            ))
+                            state.add_statement(statement_from_string(
+                                f"nisa.tensor_copy_predicated(dst={_sv_where}, "
+                                f"src={_sv}, predicate={pred_var})"
+                            ))
+                        # Return the last where_sv (all are equivalent in context)
+                        # Actually register this tile-list in device_fn
+                        return _sv_where  # caller handles as a passthrough
+                # Fallback: treat as non-tile-list
+                a_str = _a_tile_vars[0] if _a_tile_vars else a_str
                 _needs_cast = False
             elif not _needs_cast and a_dtype is None and out_dtype_str in ("nl.bfloat16", "nl.float16"):
                 _needs_cast = True

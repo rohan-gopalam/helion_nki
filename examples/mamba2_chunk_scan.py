@@ -26,7 +26,7 @@ import helion.language as hl
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[128, 128, 128]),
+    config=helion.Config(block_sizes=[128, 128, 128]),  # v3: fixed store shift
 )
 def helion_mamba2_chunk_scan_kernel(
     cb: torch.Tensor,

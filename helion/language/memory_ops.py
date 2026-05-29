@@ -617,7 +617,10 @@ def _nki_shifted_tile_subscript(
             try:
                 return int(node._sympy_())
             except Exception:
-                return env.size_hint(node)
+                # Don't use size_hint here — it gives a fake concrete value
+                # that may not represent the actual runtime value (e.g. 8192
+                # for a loop variable that will be 0..1 at runtime).
+                return None
         if isinstance(node, torch.fx.Node):
             val = node.meta.get("val")
             if isinstance(val, int):
@@ -626,7 +629,7 @@ def _nki_shifted_tile_subscript(
                 try:
                     return int(val._sympy_())
                 except Exception:
-                    return env.size_hint(val)
+                    return None  # Same: don't use size_hint
         try:
             return int(node)  # type: ignore[arg-type]
         except (TypeError, ValueError):
@@ -636,27 +639,47 @@ def _nki_shifted_tile_subscript(
     lhs_bid = _get_tile_index_block_id(args[0])
     rhs_const = _get_const_int(args[1]) if lhs_bid is not None else None
 
-    if lhs_bid is not None and rhs_const is not None and lhs_bid in state.codegen.active_device_loops:
+    if lhs_bid is not None and lhs_bid in state.codegen.active_device_loops:
         offset_var = state.codegen.offset_var(lhs_bid)
         block_size = int(env.block_sizes[lhs_bid].from_config_assert(state.config))
-        if is_sub:
-            start = f"{offset_var} - {rhs_const}"
-        else:  # is_add
-            start = f"{offset_var} + {rhs_const}"
-        return f"{start}:{start}+{block_size}"
+        # Get the shift expression — either numeric const or AST expression
+        # (e.g. tile_c.begin * chunk_size → "offset_5 * 128")
+        _rhs_expr: str | None = None
+        if rhs_const is not None:
+            _rhs_expr = str(rhs_const)
+        elif isinstance(args[1], torch.fx.Node):
+            _rhs_ast = state.codegen.ast_for_fx_node(args[1])
+            if isinstance(_rhs_ast, ast.AST):
+                _rhs_expr = ast.unparse(_rhs_ast)
+        if _rhs_expr is not None:
+            if is_sub:
+                start = f"{offset_var} - {_rhs_expr}"
+            else:  # is_add
+                start = f"{offset_var} + {_rhs_expr}"
+            return f"{start}:{start}+{block_size}"
 
     # Reverse: const ± tile
     rhs_bid = _get_tile_index_block_id(args[1])
     lhs_const = _get_const_int(args[0]) if rhs_bid is not None else None
-    if rhs_bid is not None and lhs_const is not None and rhs_bid in state.codegen.active_device_loops:
+    if rhs_bid is not None and rhs_bid in state.codegen.active_device_loops:
         offset_var = state.codegen.offset_var(rhs_bid)
         block_size = int(env.block_sizes[rhs_bid].from_config_assert(state.config))
-        if is_add:
-            start = f"{lhs_const} + {offset_var}"
-            return f"{start}:{start}+{block_size}"
-        # const - tile: only safe when block_size == 1
-        if is_sub and block_size == 1:
-            return f"{lhs_const} - {offset_var}"
+        # Get the LHS expression — either a numeric const or an AST expression
+        # (e.g. tile_c.begin * chunk_size → "offset_5 * 128")
+        _lhs_expr: str | None = None
+        if lhs_const is not None:
+            _lhs_expr = str(lhs_const)
+        elif isinstance(args[0], torch.fx.Node):
+            _lhs_ast = state.codegen.ast_for_fx_node(args[0])
+            if isinstance(_lhs_ast, ast.AST):
+                _lhs_expr = ast.unparse(_lhs_ast)
+        if _lhs_expr is not None:
+            if is_add:
+                start = f"{_lhs_expr} + {offset_var}"
+                return f"{start}:{start}+{block_size}"
+            # const - tile: only safe when block_size == 1
+            if is_sub and block_size == 1:
+                return f"{_lhs_expr} - {offset_var}"
 
     return None
 
@@ -1274,6 +1297,28 @@ def _nki_subscript_block_id(
             bid = env.get_block_id(sym_expr)
             if bid is not None:
                 return bid
+
+    # 1b. FakeTensor subscript (1D tile): look at size(0) for the block_id.
+    # Handles compound subscripts like "tile_c * chunk_size + tile_m.index"
+    # which trace as 1D FakeTensors whose size is the tile_m block_size.
+    if isinstance(sub_val, torch.Tensor) and sub_val.ndim == 1:
+        size0 = sub_val.size(0)
+        if isinstance(size0, torch.SymInt):
+            bid = env.get_block_id(size0)
+            if bid is not None:
+                return bid
+            sym_expr0 = size0._sympy_()
+            if isinstance(sym_expr0, _sp.Symbol):
+                bid = env.get_block_id(sym_expr0)
+                if bid is not None:
+                    return bid
+            # Also try free symbols (for expressions like u2 in tensor size)
+            free0 = getattr(sym_expr0, "free_symbols", None)
+            if free0:
+                for sym in free0:
+                    bid = env.get_block_id(sym)
+                    if bid is not None:
+                        return bid
 
     # 2. FX node's meta["val"] (survives even if sub_val was concretized).
     if isinstance(fx_node_i, torch.fx.Node):
@@ -3337,8 +3382,9 @@ def _(state: CodegenState) -> ast.AST:
                 off_str = off_str.strip()
                 leading_offsets.append(off_str)
                 # Try to extract numeric block size
-                # end_str is like "offset_0+128" or "offset_0 + 128"
-                plus_idx = end_str.find("+")
+                # end_str is like "offset_0+128" or "expr_a + expr_b+128"
+                # Use rfind to handle compound expressions: "a + b+128" → last '+' before 128
+                plus_idx = end_str.rfind("+")
                 if plus_idx >= 0:
                     bs_str = end_str[plus_idx + 1:].strip()
                     try:
@@ -4204,11 +4250,55 @@ def _(state: CodegenState) -> None:
             # allocation based on the value's SBUF shape.
             if tensor_dim_idx == 0 and tensor.dim() != 1:
                 partition_offset_var = offset_var
+            # Check if the subscript is a SHIFTED tile: e.g. tile_c * chunk_size + tile_m
+            # In that case, use the shifted offset instead of just offset_var.
+            # First try _nki_shifted_tile_subscript; if that fails, try direct AST lookup
+            # for compound patterns like "mul_expr + tile.index".
+            _shifted_s = _nki_shifted_tile_subscript(fx_node_i, state, env)
+            if _shifted_s is None and isinstance(fx_node_i, torch.fx.Node):
+                _t_name = str(getattr(fx_node_i, "target", ""))
+                if "add.Tensor" in _t_name or fx_node_i.target is torch.ops.aten.add.Tensor:
+                    _add_args = fx_node_i.args
+                    if len(_add_args) == 2:
+                        _a0, _a1 = _add_args
+                        # Try: "scalar_expr + tile.index" → find the scalar ast
+                        for _tile_arg, _scalar_arg in [(_a0, _a1), (_a1, _a0)]:
+                            if isinstance(_tile_arg, torch.fx.Node):
+                                _tile_val = _tile_arg.meta.get("val")
+                                if isinstance(_tile_val, torch.Tensor) and _tile_val.ndim == 1:
+                                    _tile_size = _tile_val.size(0)
+                                    if isinstance(_tile_size, torch.SymInt):
+                                        _tile_bid = env.get_block_id(_tile_size)
+                                        if _tile_bid is None:
+                                            _sym_expr0 = _tile_size._sympy_()
+                                            if hasattr(_sym_expr0, "free_symbols"):
+                                                for _s in _sym_expr0.free_symbols:
+                                                    _tile_bid = env.get_block_id(_s)
+                                                    if _tile_bid is not None:
+                                                        break
+                                        if _tile_bid == block_id and _tile_bid in state.codegen.active_device_loops:
+                                            # Found the tile arg; get AST for scalar arg
+                                            if isinstance(_scalar_arg, torch.fx.Node):
+                                                _scalar_ast = state.codegen.ast_for_fx_node(_scalar_arg)
+                                                if isinstance(_scalar_ast, ast.AST):
+                                                    _scalar_expr = ast.unparse(_scalar_ast)
+                                                    _start = f"{_scalar_expr} + {offset_var}"
+                                                    _shifted_s = f"{_start}:{_start}+{int(block_size)}"
+                                                    break
+                                            elif isinstance(_scalar_arg, (int, float)):
+                                                _start = f"{_scalar_arg} + {offset_var}"
+                                                _shifted_s = f"{_start}:{_start}+{int(block_size)}"
+                                                break
             # Check dynamic loop
             _dyn_loops_st = getattr(device_fn, "_nki_dyn_loops", {})
             if block_id in _dyn_loops_st:
                 _counter_st = _dyn_loops_st[block_id]["counter"]
                 slice_parts.append(f"__DYN_AP__{_counter_st}__{int(block_size)}")
+            elif _shifted_s is not None:
+                # Use the shifted slice (includes both the static offset and the tile offset)
+                slice_parts.append(_shifted_s)
+                if tensor_dim_idx == 0 and tensor.dim() != 1:
+                    partition_offset_var = _shifted_s.split(":", 1)[0].strip()
             else:
                 slice_parts.append(f"{offset_var} : {offset_var}+{int(block_size)}")
             is_scalar_dim_s.append(False)
@@ -4350,10 +4440,12 @@ def _(state: CodegenState) -> None:
         for dim_i in range(tensor.dim() - 1):
             sp = slice_parts[dim_i]
             if ":" in sp:
-                off_str, end_str = sp.split(":")
+                off_str, end_str = sp.split(":", 1)
                 off_str = off_str.strip()
                 leading_offsets_s.append(off_str)
-                plus_idx = end_str.find("+")
+                # Use rfind to find the LAST '+' — avoids compound expressions like
+                # "offset_0 + mul_1+128" being split at the first '+' in "offset_0 + mul_1"
+                plus_idx = end_str.rfind("+")
                 if plus_idx >= 0:
                     bs_str = end_str[plus_idx + 1:].strip()
                     try:
@@ -4433,6 +4525,7 @@ def _(state: CodegenState) -> None:
             # Use per-tensor return buffers dict for multi-output support
             if not hasattr(device_fn, "_nki_return_buffers"):
                 device_fn._nki_return_buffers = {}
+
 
             tensor_id = id(tensor)
             if tensor_id in device_fn._nki_return_buffers:

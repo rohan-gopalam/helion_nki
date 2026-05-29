@@ -3775,7 +3775,24 @@ def _(state: CodegenState) -> ast.AST:
                 _part0 = parts[0]
                 if ":" in _part0 and not _part0.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__")):
                     _p0_start, _p0_end = _part0.split(":", 1)
-                    _p0_start = _p0_start.strip().strip("()")
+                    _p0_start = _p0_start.strip()
+                    # Strip exactly one outer paren pair if balanced, e.g. "(expr)" → "expr"
+                    # Use explicit check rather than .strip("()") which over-strips "((x)..."
+                    if _p0_start.startswith("(") and _p0_start.endswith(")"):
+                        _inner = _p0_start[1:-1]
+                        # Verify the stripped parens were a balanced outer pair
+                        depth = 0
+                        _balanced = True
+                        for _ch in _inner:
+                            if _ch == "(":
+                                depth += 1
+                            elif _ch == ")":
+                                if depth == 0:
+                                    _balanced = False
+                                    break
+                                depth -= 1
+                        if _balanced and depth == 0:
+                            _p0_start = _inner
                     _inner_m2 = _re_guard.match(r'^(.+\*\s*(\d+))\s*\+\s*(offset_\d+)$', _p0_start)
                     if _inner_m2:
                         _stride2 = _inner_m2.group(2)

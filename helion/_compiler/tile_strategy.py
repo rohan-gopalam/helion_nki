@@ -1159,17 +1159,36 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
                 def _prod_body_leading() -> int:
                     # How many of THIS loop's block_sizes end up as
-                    # partition dims for the largest body allocation. For
-                    # a 3D+ tile loop (e.g. bmm [B,M,N]), the kernel
-                    # reshape flattens [B,M,K]→[B*M,K], so all but the
-                    # last tile dim are partition → N-1 leading. For a 2D
-                    # tile loop where the body allocates a 3D tile like
-                    # ``hl.zeros([tile_b, tile_m, head_dim])``, the
-                    # allocation's partition = tile_b * tile_m, i.e. BOTH
-                    # loop block_sizes become partition. The helper
-                    # ``_nki_body_leading_count`` scans the FX graph for
-                    # these 3D+ allocations and returns the max count.
-                    count = max(len(block_sizes) - 1, _body_leading_count)
+                    # partition dims for the largest body allocation.
+                    #
+                    # For a simple 2D tile loop (e.g. bmm [B,M,N]), the
+                    # kernel reshape flattens [B,M,K]→[B*M,K] so N-1
+                    # leading dims contribute to the partition.
+                    #
+                    # For a higher-rank loop (e.g. 5D mamba2 tile), the
+                    # body allocations may only use 1-2 of the loop's
+                    # block_ids — scanning the FX graph via
+                    # ``_body_leading_count`` gives the actual count.
+                    #
+                    # Use _body_leading_count when > 0 (the scan found real
+                    # body allocations). Fall back to len(block_sizes)-1
+                    # only when the scan returned 0 (couldn't detect any),
+                    # and only when the loop rank is ≤ 3 (the simple case
+                    # the conservative floor was designed for). For loops
+                    # with rank > 3, using len-1 as the floor causes
+                    # over-clamping: a 5D loop with a 2D body allocation
+                    # would get floor=4 instead of 1, collapsing the
+                    # partition-contributing tile dim to block_size=1.
+                    if _body_leading_count > 0:
+                        count = _body_leading_count
+                    elif len(block_sizes) <= 3:
+                        # Conservative fallback for simple 2D/3D loops
+                        count = len(block_sizes) - 1
+                    else:
+                        # High-rank loop with no detected body allocations:
+                        # use 1 as the minimal safe count rather than
+                        # len-1 which would over-clamp.
+                        count = 1
                     count = min(count, len(block_sizes))  # can't exceed loop rank
                     p = 1
                     for r in resolved[:count]:

@@ -824,11 +824,22 @@ def codegen_stack_nki(ctx: LoweringContext, node: Node) -> object:
     ))
     state.add_statement(statement_from_string(f"nisa.memset({result_var}, value=0)"))
 
+    # Determine whether this stack interleaves (dim inserts between existing dims)
+    # or creates contiguous blocks (dim inserts at the front).
+    # For 2D inputs [P, F]:
+    #   dim=0 → output [n, P, F] → [n*P, F]: block copy (each input = one block)
+    #   dim=1 → output [P, n, F] → [P*n, F]: interleave (elements alternate per row)
+    #   dim=-1 or dim=2 → output [P, F, n] → [P, F*n]: free-dim stack
+    # Normalize dim for the input rank
+    _input_rank = len(in_shape_full)
+    _dim_norm = dim if dim >= 0 else dim + _input_rank + 1
+    _stack_interleave = (_dim_norm > 0 and _dim_norm <= _input_rank - 1)
+
     # Copy each input tile into the correct position
     # After squeeze_shape_2d, the output [P_out, F_out] = [n*P_in, F_in] for dim=0
     # or [P_in, n*F_in] for dim=-1 on the original shape.
     # Determine the interleave strategy from the shapes:
-    if p_out == n * p_in and f_out == f_in:
+    if p_out == n * p_in and f_out == f_in and not _stack_interleave:
         # Stack along partition dimension: output[i*p_in:(i+1)*p_in, :] = input_i
         for i, tensor_ast in enumerate(tensor_asts):
             src_name = _ast.unparse(tensor_ast) if isinstance(tensor_ast, _ast.AST) else str(tensor_ast)

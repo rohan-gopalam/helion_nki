@@ -33,7 +33,7 @@ import helion.language as hl
 @helion.kernel(
     backend="nki",
     autotune_effort="none",
-    config=helion.Config(block_sizes=[64, 128, 128]),
+    config=helion.Config(block_sizes=[32, 128, 128]),
     static_shapes=False,
 )
 def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
@@ -63,35 +63,22 @@ def matmul_bf16_int4(A: Tensor, B: Tensor) -> Tensor:
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
 
         for tile_k_packed in hl.tile(K // 2, block_size=block_size_k_packed):
-            # Load corresponding tiles from A (need to load twice the packed tile size)
-            # We need to map tile_k_packed to the corresponding range in A
-            a_tile_begin = tile_k_packed.begin * 2
-            a_tile_len = block_size_k_packed * 2
-            a_tile = A[tile_m, a_tile_begin : (a_tile_begin + a_tile_len)].to(
-                torch.float32
-            )  # [BLOCK_SIZE_M, BLOCK_SIZE_K]
+            # Load packed int8 data from B (lo=first K//2, hi=second K//2)
+            b_tile = B[tile_k_packed, tile_n]  # [k_packed, N]
+            b_lo = ((b_tile << 4) >> 4).to(torch.float32)  # [k_packed, N] first-half rows
+            b_hi = (b_tile >> 4).to(torch.float32)          # [k_packed, N] second-half rows
 
-            # Load packed int8 data from B
-            b_tile = B[tile_k_packed, tile_n]  # [BLOCK_SIZE_K//2, BLOCK_SIZE_N]
-
-            # Extract low and high 4-bit values with sign extension
-            # Low nibble: sign-extend from 4-bit to 8-bit using left shift then arithmetic right shift
-            b_lo = ((b_tile << 4) >> 4).to(torch.int8)  # Sign-extend low 4 bits
-            b_hi = (b_tile >> 4).to(torch.int8)  # Sign-extend high 4 bits
-
-            # Stack and reshape to interleave low and high bits
-            # Stack along a new dimension to get [BLOCK_SIZE_K//2, 2, BLOCK_SIZE_N]
-            b_stacked = torch.stack([b_lo, b_hi], dim=1)
-
-            # Reshape to interleave: [BLOCK_SIZE_K//2, 2, BLOCK_SIZE_N] -> [BLOCK_SIZE_K, BLOCK_SIZE_N]
-            # This will place elements in the order: b_lo[0], b_hi[0], b_lo[1], b_hi[1], ...
-            b_unpacked = b_stacked.reshape(
-                tile_k_packed.block_size * 2, tile_n.block_size
-            ).to(torch.float32)
-
-            a_tile = a_tile.unsqueeze(2)  # [BLOCK_SIZE_M, BLOCK_SIZE_K, 1]
-            b_unpacked = b_unpacked.unsqueeze(0)
-            acc = acc + (a_tile * b_unpacked).sum(dim=1)  # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+            # A[:, 0:k_packed] corresponds to b_lo, A[:, k_packed:2*k_packed] to b_hi
+            # Packing: b_lo[k] = B_unpacked[k, :], b_hi[k] = B_unpacked[k + K//2, :]
+            # A columns that pair with b_lo: A[:, k_begin:k_begin+k_packed]
+            # A columns that pair with b_hi: A[:, K//2 + k_begin : K//2 + k_begin + k_packed]
+            k_begin = tile_k_packed.begin
+            k_packed = tile_k_packed.block_size
+            K_half = K // 2
+            a_lo = A[tile_m, k_begin : k_begin + k_packed].to(torch.float32)
+            a_hi = A[tile_m, K_half + k_begin : K_half + k_begin + k_packed].to(torch.float32)
+            acc = hl.dot(a_lo, b_lo, acc=acc)
+            acc = hl.dot(a_hi, b_hi, acc=acc)
 
         C[tile_m, tile_n] = acc.to(torch.bfloat16)
 
@@ -121,8 +108,8 @@ def int4_gemm_tritonbench(tb_op: object, x: torch.Tensor, w: torch.Tensor) -> Ca
     # Pack w to int4 format (two 4-bit values per int8 byte)
     x_2d = x.reshape(-1, x.size(-1))
     w_int8 = w.to(torch.int8)
-    w_reshaped = w_int8.reshape(w.shape[0] // 2, 2, w.shape[1]).permute(1, 0, 2)
-    w_packed = ((w_reshaped[0] & 0xF) | (w_reshaped[1] << 4)).to(torch.int8)
+    k = w_int8.shape[0]
+    w_packed = ((w_int8[:k // 2, :] & 0xF) | (w_int8[k // 2:, :] << 4)).to(torch.int8)
 
     def run_kernel() -> torch.Tensor:
         return matmul_bf16_int4(x_2d, w_packed)
@@ -139,6 +126,8 @@ def int4_gemm_tritonbench(tb_op: object, x: torch.Tensor, w: torch.Tensor) -> Ca
 def _pack_int4_matrix(unpacked: torch.Tensor) -> torch.Tensor:
     """
     Pack int4 matrix into int8 container with two values per byte.
+    Packing convention: lo nibble = first half of K, hi nibble = second half of K.
+    This enables contiguous A-tile slicing in the NKI kernel.
 
     Args:
         unpacked (torch.Tensor): Tensor of shape [K, N] with values in [-8, 7].
@@ -148,13 +137,15 @@ def _pack_int4_matrix(unpacked: torch.Tensor) -> torch.Tensor:
     """
     k, n = unpacked.shape
     assert k % 2 == 0, "K dimension must be even for int4 packing"
-    reshaped = unpacked.reshape(k // 2, 2, n).permute(1, 0, 2)
-    return ((reshaped[0] & 0xF) | (reshaped[1] << 4)).to(torch.int8)
+    lo = unpacked[:k // 2, :]   # First half = lo nibbles
+    hi = unpacked[k // 2:, :]   # Second half = hi nibbles
+    return ((lo & 0xF) | (hi << 4)).to(torch.int8)
 
 
 def _unpack_int4_matrix(packed: torch.Tensor) -> torch.Tensor:
     """
     Unpack an int4 matrix stored as two 4-bit values per int8 byte.
+    Packing convention: lo=first_half, hi=second_half.
 
     Args:
         packed (torch.Tensor): Packed tensor of shape [K//2, N] in int8 format.
@@ -162,10 +153,9 @@ def _unpack_int4_matrix(packed: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: Unpacked tensor of shape [K, N] in int8 format.
     """
-    b_lo = ((packed << 4) >> 4).to(torch.int8)
-    b_hi = (packed >> 4).to(torch.int8)
-    stacked = torch.stack([b_lo, b_hi], dim=1)
-    return stacked.reshape(packed.shape[0] * 2, packed.shape[1])
+    b_lo = ((packed << 4) >> 4).to(torch.int8)   # first K//2 rows
+    b_hi = (packed >> 4).to(torch.int8)            # second K//2 rows
+    return torch.cat([b_lo, b_hi], dim=0)          # [K, N]
 
 
 def reference_matmul_bf16_int4(A: Tensor, B_packed: Tensor) -> Tensor:

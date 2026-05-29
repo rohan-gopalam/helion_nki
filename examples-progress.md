@@ -88,13 +88,13 @@ Special pass clarification:
 
 Stage tally:
 
-- `runtime_passed`: `44`
+- `runtime_passed`: `45`
 - `runtime_passed_special/no-op`: `2`
 - `runtime_passed_special/custom_path`: `1`
 - `runtime_numeric_fail`: `0`
 - `nki_backend_compile_timeout`: `1`
 - `nki_compile_passed_runtime_or_baseline_blocked`: `0`
-- `nki_frontend_or_codegen_blocked`: `4`
+- `nki_frontend_or_codegen_blocked`: `3`
 - Total runner-selected examples: `51`
 
 Per-example stage index:
@@ -121,7 +121,7 @@ Per-example stage index:
 | `geglu.py` | `runtime_passed` | Lowered through NKI and passed runtime correctness. |
 | `grouped_gemm.py` | `runtime_passed` | g+1 subscript fix, K-tile offset fix, persistent kernel skipped on NKI. |
 | `grpo_loss.py` | `nki_backend_compile_timeout` | Reached runner/Neuron backend compile timeout. |
-| `int4_gemm.py` | `nki_frontend_or_codegen_blocked` | Packed low-bit shift lowering improved; packed reshape/interleave remains blocked. |
+| `int4_gemm.py` | `runtime_passed` | Rewrote to use two hl.dot calls; fixed stack interleave in aten_lowering.py; new packing convention. |
 | `jagged_dense_add.py` | `runtime_passed` | Lowered through NKI and passed runtime correctness. |
 | `jagged_hstu_attn.py` | `runtime_passed` | dtype cast fix in where(); reduced test size. |
 | `jagged_layer_norm.py` | `runtime_passed` | Chain transform fixes (subscript walk-up, transpose, squaring); B≥256 variance bug tracked in JAGGED_LAYER_NORM_BUG.md. |

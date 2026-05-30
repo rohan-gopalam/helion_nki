@@ -32,16 +32,16 @@ def helion_gdn_fwd_h(
 ) -> torch.Tensor:
     """
     Argument:
-        k: (batch, seqlen, nheads, dhead)
-        w: (batch, seqlen, nheads, dhead)
-        u: (batch, seqlen, nheads, expand_v*dhead)
-        g: (batch, seqlen, nheads)
+        k: (batch, nheads, seqlen, dhead)  — NOTE: head-major layout for NKI contiguous access
+        w: (batch, nheads, seqlen, dhead)
+        u: (batch, nheads, seqlen, expand_v*dhead)
+        g: (batch, nheads, seqlen)
         chunk_size: int
     Return:
         h: (batch, nchunks, nheads, dhead, expand_v*dhead)
     """
 
-    batch, seqlen, nheads, dhead = k.shape
+    batch, nheads, seqlen, dhead = k.shape
     dhead = hl.specialize(dhead)
     chunk_size = hl.specialize(chunk_size)
     dstate = u.shape[-1]
@@ -61,20 +61,20 @@ def helion_gdn_fwd_h(
         b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
         for t_i in hl.tile(seqlen, block_size=chunk_size):
             h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(dtype)
-            b_w = w[i_b, t_i, i_h, :]
+            b_w = w[i_b, i_h, t_i, :]  # contiguous: head-major → t_i is innermost
             c_h = b_h.to(dtype)
             b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
-            p_v = u[i_b, t_i, i_h, tile_v].to(acc_dtype)
+            p_v = u[i_b, i_h, t_i, tile_v].to(acc_dtype)
             b_v = p_v - b_v
             m_t = t_i.index < seqlen
             t_i_last = min(t_i.begin + chunk_size, seqlen) - 1
-            b_g_last = g[i_b, t_i_last, i_h].to(acc_dtype)
-            b_g = g[i_b, t_i, i_h].to(acc_dtype)
+            b_g_last = g[i_b, i_h, t_i_last].to(acc_dtype)
+            b_g = g[i_b, i_h, t_i].to(acc_dtype)
             b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
             b_g_last = torch.exp(b_g_last)
             b_h *= b_g_last
             b_v = b_v.to(dtype)
-            p_k = k[i_b, t_i, i_h, :]
+            p_k = k[i_b, i_h, t_i, :]  # contiguous
             b_h = hl.dot(p_k.T, b_v, acc=b_h)
     return h
 
@@ -196,8 +196,17 @@ def test(
         * torch.rand(batch, seqlen, nheads, dtype=torch.float32, device=DEVICE),
         dim=1,
     )
-    args = (k, w, u, g, chunk_size)
-    run_example(helion_gdn_fwd_h, ref_gdn_fwd_h, args)
+    # Permute to head-major layout [batch, nheads, seqlen, ...] for NKI contiguous DMA.
+    # In the original [batch, seqlen, nheads, dhead] layout, accessing a single head
+    # across the seqlen chunk requires strided DMA (stride=nheads).  NKI cannot do
+    # strided partition-dim DMA without complex ap() patterns.  Permuting to head-major
+    # puts the seqlen dimension last before dhead, making it contiguous for each head.
+    k_hm = k.permute(0, 2, 1, 3).contiguous()  # [batch, nheads, seqlen, dhead]
+    w_hm = w.permute(0, 2, 1, 3).contiguous()
+    u_hm = u.permute(0, 2, 1, 3).contiguous()
+    g_hm = g.permute(0, 2, 1).contiguous()  # [batch, nheads, seqlen]
+    args = (k_hm, w_hm, u_hm, g_hm, chunk_size)
+    run_example(helion_gdn_fwd_h, lambda *a: ref_gdn_fwd_h(k, w, u, g, chunk_size), args)
 
 
 # %%

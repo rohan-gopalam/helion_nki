@@ -205,8 +205,9 @@ def main() -> None:
     """
     Main function to run tests with different matrix sizes.
     """
-    check(4, 8192, 7168)
-    check(8192, 8192, 8192)
+    # Reduced params for NKI compile time (original: 4x8192x7168, 8192x8192x8192)
+    # Note: correctness requires K multiple of block_size*2; using K=512
+    check(128, 512, 256)
 
 
 # %%

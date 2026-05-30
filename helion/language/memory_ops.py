@@ -650,7 +650,25 @@ def _nki_shifted_tile_subscript(
         elif isinstance(args[1], torch.fx.Node):
             _rhs_ast = state.codegen.ast_for_fx_node(args[1])
             if isinstance(_rhs_ast, ast.AST):
-                _rhs_expr = ast.unparse(_rhs_ast)
+                _candidate = ast.unparse(_rhs_ast)
+                # Only use as a shift if it's a scalar expression — not an
+                # SBUF tile variable. SBUF tiles (iota indices, loaded tiles,
+                # etc.) cannot be used as integer offsets in DMA slice
+                # expressions. Check both the sbuf_shapes dict and variable
+                # naming conventions (_nki_*, indices_*).
+                _sbuf_shapes = getattr(
+                    getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
+                )
+                # Block SBUF tile variables from being used as DMA slice offsets.
+                # SBUF tiles cannot be used as Python integers in DMA slice
+                # expressions — they cause NKI compile errors like
+                # "'add' expected (int, int) ... got (int, object)".
+                _is_sbuf_tile = (
+                    _candidate in _sbuf_shapes
+                    or _candidate.startswith(("_nki_", "indices_"))
+                )
+                if not _is_sbuf_tile:
+                    _rhs_expr = _candidate
         if _rhs_expr is not None:
             if is_sub:
                 start = f"{offset_var} - {_rhs_expr}"
@@ -672,7 +690,16 @@ def _nki_shifted_tile_subscript(
         elif isinstance(args[0], torch.fx.Node):
             _lhs_ast = state.codegen.ast_for_fx_node(args[0])
             if isinstance(_lhs_ast, ast.AST):
-                _lhs_expr = ast.unparse(_lhs_ast)
+                _candidate_lhs = ast.unparse(_lhs_ast)
+                _sbuf_shapes_rev = getattr(
+                    getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
+                )
+                _is_sbuf_tile_lhs = (
+                    _candidate_lhs in _sbuf_shapes_rev
+                    or _candidate_lhs.startswith(("_nki_", "indices_"))
+                )
+                if not _is_sbuf_tile_lhs:
+                    _lhs_expr = _candidate_lhs
         if _lhs_expr is not None:
             if is_add:
                 start = f"{_lhs_expr} + {offset_var}"
@@ -1796,17 +1823,21 @@ def _(state: CodegenState) -> ast.AST:
                     partition_offset_var = _shifted_s.split(":", 1)[0].strip()
                 slice_parts.append(_shifted_s)
                 used_shifted_subscript = True
+                is_scalar_dim.append(False)
+                continue
             elif block_id in _dyn_loops:
                 _counter = _dyn_loops[block_id]["counter"]
                 slice_parts.append(f"__DYN_AP__{_counter}__{int(block_size)}")
+                is_scalar_dim.append(False)
+                continue
             elif (
                 tdi == 0
                 and tensor.dim() == 2
                 and isinstance(_sub_val_load, torch.Tensor)
             ):
                 # Check if the subscript is a non-contiguous gather (indirect load).
-                # When block_id was found via size match but the subscript is a gather
-                # (e.g. sorted_to_orig_token_idx[indices] or torch.where result),
+                # When block_id was found via size match but the subscript is a
+                # computed gather (sorted_to_orig[indices], torch.where result, etc.),
                 # use the row gather (.ap() with vector_offset) mechanism.
                 row_gather = _nki_row_index_gather(fx_node_tdi_check, state, partition_dim)
                 if row_gather is not None:
@@ -1815,10 +1846,52 @@ def _(state: CodegenState) -> ast.AST:
                     slice_parts.append(row_gather)
                     is_scalar_dim.append(False)
                     continue
-                slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
+                # row_gather returned None. Check if the shift was blocked because
+                # of an SBUF operand. If so, this needs the flat gather path (else
+                # branch below) — don't emit a plain slice. We detect this by
+                # checking if fx_node_tdi_check is an add/sub involving an SBUF tile.
+                _sbuf_shapes_ck = getattr(
+                    getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
+                )
+                _needs_flat_gather = False
+                if isinstance(fx_node_tdi_check, torch.fx.Node):
+                    _ck_target = str(getattr(fx_node_tdi_check, "target", ""))
+                    if "add.Tensor" in _ck_target or "sub.Tensor" in _ck_target:
+                        for _ck_arg in fx_node_tdi_check.args[:2]:
+                            if isinstance(_ck_arg, torch.fx.Node):
+                                _ck_ast = state.codegen.ast_for_fx_node(_ck_arg)
+                                if isinstance(_ck_ast, ast.AST):
+                                    _ck_nm = ast.unparse(_ck_ast)
+                                    if (
+                                        _ck_nm in _sbuf_shapes_ck
+                                        or _ck_nm.startswith(("_nki_", "indices_"))
+                                    ):
+                                        _needs_flat_gather = True
+                                        break
+                if not _needs_flat_gather:
+                    slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
+                    is_scalar_dim.append(False)
+                    continue
+                # _needs_flat_gather=True: this subscript has a SBUF-scalar shift
+                # (e.g. A[start + tile.index]). Use the shifted subscript path
+                # via _nki_row_index_gather which handles the SBUF broadcast.
+                row_gather_sbuf = _nki_row_index_gather(
+                    fx_node_tdi_check, state, int(block_size)
+                )
+                if row_gather_sbuf is not None:
+                    if tdi == 0:
+                        partition_offset_var = row_gather_sbuf.split(":", 1)[0].strip() if ":" in row_gather_sbuf else row_gather_sbuf
+                    slice_parts.append(row_gather_sbuf)
+                    is_scalar_dim.append(False)
+                else:
+                    # Last resort: use plain slice (may be wrong but avoids crash)
+                    slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
+                    is_scalar_dim.append(False)
+                continue
             else:
                 slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
-            is_scalar_dim.append(False)
+                is_scalar_dim.append(False)
+                continue
         else:
             # Tensor-valued row indexers such as ``weight[indices, tile_f]``
             # and ``A[start + tile_m.index, tile_k]`` lower to an HBM
@@ -3711,7 +3784,7 @@ def _(state: CodegenState) -> ast.AST:
         for dim_idx, part in enumerate(parts):
             if dim_idx >= len(hbm_dim_size_strs):
                 break
-            if part.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__")):
+            if part.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__", "__AP_ROW_GATHER__")):
                 continue
             if ":" not in part:
                 continue

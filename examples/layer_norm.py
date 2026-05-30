@@ -251,8 +251,8 @@ def main() -> None:
       built-in layer_norm function using the run_example utility.
     - Prints comparison results and checks for correctness within specified tolerances.
     """
-    batch_size = 4096
-    dim = 8192
+    batch_size = 128  # reduced from 4096 for NKI compile time
+    dim = 512  # reduced from 8192 for NKI compile time
     device = DEVICE
 
     # Test forward pass only

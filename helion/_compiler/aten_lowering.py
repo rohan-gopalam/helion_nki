@@ -1384,6 +1384,11 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     TILE_M = actual_tile_m
     TILE_K = actual_tile_k
 
+    # Trainium2 (gen3+) nc_matmul: when stationary is [TILE_K, TILE_M] (taller
+    # than wide), use is_transpose=True and match psum dtype to input dtype.
+    _is_transpose_mode = TILE_K > TILE_M
+    _nc_matmul_transpose_arg = ", is_transpose=True" if _is_transpose_mode else ""
+
     lhs_name = ast.unparse(lhs)
     rhs_name = ast.unparse(rhs)
 
@@ -1532,7 +1537,7 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         stmts = _transpose_stmts(_lhs_k_slice(m_i, k_expr))
         stmts.append(
             statement_from_string(
-                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
                 f"moving={_rhs_ref(0, n_expr) if not rhs_is_list else _rhs_ref(0, n_expr)})"
             ),
         )
@@ -1557,7 +1562,7 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         stmts = _transpose_stmts(_lhs_k_slice(m_i, k_expr))
         stmts.append(
             statement_from_string(
-                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
                 f"moving={rhs_ref})"
             ),
         )
@@ -1566,9 +1571,14 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     def _emit_one_m_stripe(m_i: int, n_expr: str) -> None:
         """Emit all statements for a single M-stripe (fully unrolled, no sub_m loop)."""
         mm_sbuf_tmp = state.device_function.new_var("_mm_sbuf_tmp")
+        # Trainium2 (gen3+) nc_matmul psum dtype rules:
+        # - Non-transpose mode (TILE_M >= TILE_K): psum must be float32
+        # - Transpose mode (TILE_K > TILE_M, is_transpose=True): psum dtype
+        #   must match the matmul operand dtype
+        _psum_dtype = matmul_dtype_str if _is_transpose_mode else "nl.float32"
         state.add_statement(
             statement_from_string(
-                f"{mm_psum} = nl.ndarray([{TILE_M}, {N_sub}], nl.float32, buffer=nl.psum)"
+                f"{mm_psum} = nl.ndarray([{TILE_M}, {N_sub}], {_psum_dtype}, buffer=nl.psum)"
             )
         )
         if n_sub_k > 1 and rhs_is_list:
@@ -1586,7 +1596,7 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
                     state.add_statement(s)
                 state.add_statement(
                     statement_from_string(
-                        f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                        f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
                         f"moving={rhs_ref})"
                     )
                 )
@@ -1595,7 +1605,7 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
             k_body = _transpose_stmts(_lhs_k_slice(m_i, sub_k_var))
             k_body.append(
                 statement_from_string(
-                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
                     f"moving={_rhs_ref(sub_k_var, n_expr)})"
                 ),
             )
@@ -1619,7 +1629,7 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
                 state.add_statement(s)
             state.add_statement(
                 statement_from_string(
-                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
                     f"moving={rhs_ref_0})"
                 )
             )

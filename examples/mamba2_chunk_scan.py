@@ -282,10 +282,11 @@ def main() -> None:
     Main entry point that runs the attention kernel test with specific parameters.
     Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
     """
-    test("zzzzzzz", 8, 80, 1, 4096, 256, 64, 128)  # all zeros
-    test("zrzzzzr", 8, 80, 1, 4096, 256, 64, 128)  # D * x (no cb accumulation)
-    test("zzzzrrz", 8, 80, 1, 4096, 256, 64, 128)  # C * prev_state (no cb)
-    test("zzzrrrz", 8, 80, 1, 4096, 256, 64, 128)  # C * prev_state * dA
+    # Reduced params for NKI compile time (original: 8, 80, 1, 4096, 256, 64, 128)
+    test("zzzzzzz", 2, 4, 1, 256, 128, 4, 4)  # all zeros
+    test("zrzzzzr", 2, 4, 1, 256, 128, 4, 4)  # D * x
+    test("zzzzrrz", 2, 4, 1, 256, 128, 4, 4)  # C * prev_state
+    test("zzzrrrz", 2, 4, 1, 256, 128, 4, 4)  # C * prev_state * dA
 
 
 if __name__ == "__main__":

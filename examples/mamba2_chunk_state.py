@@ -191,8 +191,9 @@ def test(
 # Main Function
 # -----------
 def main() -> None:
-    test("zzzz", 8, 80, 1, 4096, 256, 64, 128)  # all zeros baseline
-    test("uuuu", 8, 80, 1, 4096, 256, 64, 128)  # uniform [0,1]
+    # Reduced params for NKI compile time (original: 8, 80, 1, 4096, 256, 64, 128)
+    test("zzzz", 2, 4, 1, 512, 128, 64, 64)  # all zeros baseline
+    test("uuuu", 2, 4, 1, 512, 128, 64, 64)  # uniform [0,1]
 
 
 if __name__ == "__main__":

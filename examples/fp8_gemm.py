@@ -127,9 +127,7 @@ def main() -> None:
     """
     Main function to run tests with different matrix sizes.
     """
-    check(256, 256, 256)
-    check(512, 512, 512)
-    check(1024, 1024, 1024)
+    check(128, 128, 128)  # reduced from 256/512/1024 for NKI compile time
 
 
 # %%

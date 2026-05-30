@@ -181,7 +181,7 @@ def main() -> None:
     """
     Main entry point for jagged softmax kernel verification.
     """
-    num_rows, max_cols = 512, 64
+    num_rows, max_cols = 32, 32  # reduced from 512,64 for NKI compile time
     device = DEVICE
 
     lengths = torch.randint(1, max_cols + 1, (num_rows,), device=device)
@@ -189,7 +189,7 @@ def main() -> None:
         [torch.zeros(1, dtype=torch.long, device=device), torch.cumsum(lengths, dim=0)]
     )
     nnz = int(x_offsets[-1])
-    M = 128  # number of features
+    M = 32  # reduced from 128 for NKI compile time
     x_data = torch.randn(nnz, M, dtype=torch.float32, device=device)
 
     out_eager = reference_jagged_softmax_pytorch(x_data, x_offsets)

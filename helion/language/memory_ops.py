@@ -534,17 +534,20 @@ def _nki_shifted_tile_subscript(
 
     target = getattr(fx_node, "target", None)
     target_name = str(target) if target else ""
+    import operator as _operator
     is_add = (
         "add.Tensor" in target_name
         or "add.Scalar" in target_name
         or target is torch.ops.aten.add.Tensor
         or target is torch.ops.aten.add.Scalar
+        or target is _operator.add
     )
     is_sub = (
         "sub.Tensor" in target_name
         or "sub.Scalar" in target_name
         or target is torch.ops.aten.sub.Tensor
         or target is torch.ops.aten.sub.Scalar
+        or target is _operator.sub
     )
     if not (is_add or is_sub):
         return None

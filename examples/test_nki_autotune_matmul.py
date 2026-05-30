@@ -29,7 +29,7 @@ def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
-    m, k, n = 512, 512, 512
+    m, k, n = 256, 256, 256
     x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
     y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
 

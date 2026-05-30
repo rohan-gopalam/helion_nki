@@ -3854,40 +3854,66 @@ def _(state: CodegenState) -> ast.AST:
         return start, end, count, dim_size_str
 
     def _single_tail_load_cases(dst: str, hbm_base: str, parts: list[str]) -> list[ast.If]:
+        # Generate DMA cases for tiles that partially overlap HBM tensor boundaries.
+        # Enumerates all 3^N combinations of per-dimension states (FULL / NEG_START /
+        # TAIL_OVERFLOW), skipping the all-FULL case (handled by the main fast path).
+        # This covers corner cases where multiple dimensions are partial simultaneously,
+        # e.g. the last row-tile overlapping a shifted-subscript column boundary.
+        import itertools
+
         cases: list[ast.If] = []
         infos = [_slice_info(part, i) for i, part in enumerate(parts)]
         if any(info is None for info in infos):
             return cases
-        for tail_dim, tail_info in enumerate(infos):
-            assert tail_info is not None
-            start, end, count, dim_size_str = tail_info
-            checks = [f"({start}) >= 0", f"({start}) < {dim_size_str}", f"({end}) > {dim_size_str}"]
-            dst_parts: list[str] = []
+
+        FULL, NEG_START, TAIL_OVERFLOW = "full", "neg_start", "tail_overflow"
+
+        for dim_states in itertools.product([FULL, NEG_START, TAIL_OVERFLOW], repeat=len(infos)):
+            if all(s == FULL for s in dim_states):
+                continue  # handled by main fast path
+
+            checks: list[str] = []
             src_parts: list[str] = []
-            for dim_idx, info in enumerate(infos):
+            dst_parts: list[str] = []
+            valid = True
+
+            for dim_idx, (info, state) in enumerate(zip(infos, dim_states)):
                 assert info is not None
                 dim_start, dim_end, dim_count, dim_size = info
-                if dim_idx == tail_dim:
-                    src_parts.append(f"{dim_start}:{dim_size}")
-                    dst_parts.append(f"0:{dim_size} - ({dim_start})")
-                else:
+
+                if state == FULL:
                     checks.append(f"({dim_start}) >= 0")
                     checks.append(f"({dim_end}) <= {dim_size}")
                     src_parts.append(parts[dim_idx])
                     dst_parts.append(f"0:{dim_count}")
-            cases.append(
-                create(
-                    ast.If,
-                    test=expr_from_string(" and ".join(checks)),
-                    body=[
-                        statement_from_string(
-                            f"nisa.dma_copy(dst={dst}[{', '.join(dst_parts)}], "
-                            f"src={hbm_base}[{', '.join(src_parts)}])"
-                        )
-                    ],
-                    orelse=[],
+                elif state == NEG_START:
+                    # Tile starts before the tensor; load [0:end] -> dst[(count-end):count]
+                    checks.append(f"({dim_start}) < 0")
+                    checks.append(f"({dim_end}) > 0")
+                    src_parts.append(f"0:{dim_end}")
+                    dst_parts.append(f"({dim_count}) - ({dim_end}):({dim_count})")
+                else:  # TAIL_OVERFLOW
+                    # Tile overflows past the tensor end; load [start:size] -> dst[0:(size-start)]
+                    checks.append(f"({dim_start}) >= 0")
+                    checks.append(f"({dim_start}) < {dim_size}")
+                    checks.append(f"({dim_end}) > {dim_size}")
+                    src_parts.append(f"{dim_start}:{dim_size}")
+                    dst_parts.append(f"0:{dim_size} - ({dim_start})")
+
+            if valid:
+                cases.append(
+                    create(
+                        ast.If,
+                        test=expr_from_string(" and ".join(checks)),
+                        body=[
+                            statement_from_string(
+                                f"nisa.dma_copy(dst={dst}[{', '.join(dst_parts)}], "
+                                f"src={hbm_base}[{', '.join(src_parts)}])"
+                            )
+                        ],
+                        orelse=[],
+                    )
                 )
-            )
         return cases
 
     def _emit_dma_copy(
@@ -5131,31 +5157,39 @@ def _(state: CodegenState) -> None:
         def _single_tail_store_cases(
             dst_base: str, parts: list[str], src_name: str
         ) -> list[ast.If]:
+            import itertools
+
             cases: list[ast.If] = []
             infos = [_store_slice_info(part, i) for i, part in enumerate(parts)]
             if any(info is None for info in infos):
                 return cases
-            for tail_dim, tail_info in enumerate(infos):
-                assert tail_info is not None
-                start, end, _width, dim_size_str = tail_info
-                checks = [
-                    f"({start}) >= 0",
-                    f"({start}) < {dim_size_str}",
-                    f"({end}) > {dim_size_str}",
-                ]
+
+            FULL, TAIL_OVERFLOW = "full", "tail_overflow"
+
+            for dim_states in itertools.product([FULL, TAIL_OVERFLOW], repeat=len(infos)):
+                if all(s == FULL for s in dim_states):
+                    continue  # handled by the main fast path
+
+                checks: list[str] = []
                 dst_parts: list[str] = []
                 src_parts: list[str] = []
-                for dim_idx, info in enumerate(infos):
+
+                for dim_idx, (info, state_d) in enumerate(zip(infos, dim_states)):
                     assert info is not None
                     dim_start, dim_end, dim_width, dim_size = info
-                    if dim_idx == tail_dim:
-                        dst_parts.append(f"{dim_start}:{dim_size}")
-                        src_parts.append(f"0:{dim_size} - ({dim_start})")
-                    else:
+
+                    if state_d == FULL:
                         checks.append(f"({dim_start}) >= 0")
                         checks.append(f"({dim_end}) <= {dim_size}")
                         dst_parts.append(parts[dim_idx])
                         src_parts.append(f"0:{dim_width}")
+                    else:  # TAIL_OVERFLOW
+                        checks.append(f"({dim_start}) >= 0")
+                        checks.append(f"({dim_start}) < {dim_size}")
+                        checks.append(f"({dim_end}) > {dim_size}")
+                        dst_parts.append(f"{dim_start}:{dim_size}")
+                        src_parts.append(f"0:{dim_size} - ({dim_start})")
+
                 cases.append(
                     create(
                         ast.If,

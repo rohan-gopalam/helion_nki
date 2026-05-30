@@ -1844,7 +1844,48 @@ def _(state: CodegenState) -> ast.AST:
                 is_scalar_dim.append(False)
                 continue
             elif block_id in _dyn_loops:
-                _counter = _dyn_loops[block_id]["counter"]
+                # If the subscript is compound (e.g. start + tile.index where
+                # start is an SBUF scalar), the simple __DYN_AP__ sentinel is
+                # insufficient — the counter doesn't include the SBUF offset.
+                # In that case, try _nki_row_index_gather which handles
+                # SBUF-scalar + tile.index combinations correctly.
+                _dyn_counter_raw = _dyn_loops[block_id]["counter"]
+                _needs_sbuf_offset = False
+                if (
+                    tdi == 0
+                    and tensor.dim() == 2
+                    and isinstance(_sub_val_load, torch.Tensor)
+                    and isinstance(fx_node_tdi_check, torch.fx.Node)
+                ):
+                    _ck_target_dyn = str(getattr(fx_node_tdi_check, "target", ""))
+                    if "add.Tensor" in _ck_target_dyn or "sub.Tensor" in _ck_target_dyn:
+                        _sbuf_shapes_dyn = getattr(
+                            getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
+                        )
+                        for _dyn_ck_arg in fx_node_tdi_check.args[:2]:
+                            if isinstance(_dyn_ck_arg, torch.fx.Node):
+                                _dyn_ck_ast = state.codegen.ast_for_fx_node(_dyn_ck_arg)
+                                if isinstance(_dyn_ck_ast, ast.AST):
+                                    _dyn_ck_nm = ast.unparse(_dyn_ck_ast)
+                                    if _dyn_ck_nm in _sbuf_shapes_dyn:
+                                        _needs_sbuf_offset = True
+                                        break
+                if _needs_sbuf_offset:
+                    # Use row_gather path to handle SBUF-offset + dyn-tile.index
+                    _row_gather_dyn = _nki_row_index_gather(
+                        fx_node_tdi_check, state, int(block_size)
+                    )
+                    if _row_gather_dyn is not None:
+                        if tdi == 0:
+                            partition_offset_var = (
+                                _row_gather_dyn.split(":", 1)[0].strip()
+                                if ":" in _row_gather_dyn
+                                else _row_gather_dyn
+                            )
+                        slice_parts.append(_row_gather_dyn)
+                        is_scalar_dim.append(False)
+                        continue
+                _counter = _dyn_counter_raw
                 slice_parts.append(f"__DYN_AP__{_counter}__{int(block_size)}")
                 is_scalar_dim.append(False)
                 continue
@@ -4448,6 +4489,36 @@ def _(state: CodegenState) -> None:
             _dyn_loops_st = getattr(device_fn, "_nki_dyn_loops", {})
             if block_id in _dyn_loops_st:
                 _counter_st = _dyn_loops_st[block_id]["counter"]
+                # If subscript is start + tile.index where start is an SBUF scalar,
+                # __DYN_AP__ would miss the start offset; use row_gather instead.
+                _needs_sbuf_offset_st = False
+                if (
+                    tensor_dim_idx == 0
+                    and tensor.dim() == 2
+                    and isinstance(sub_val, torch.Tensor)
+                    and isinstance(fx_node_i, torch.fx.Node)
+                ):
+                    _ck_target_st = str(getattr(fx_node_i, "target", ""))
+                    if "add.Tensor" in _ck_target_st or "sub.Tensor" in _ck_target_st:
+                        _sbuf_shapes_st = getattr(device_fn, "_nki_sbuf_shapes", {})
+                        for _st_ck_arg in fx_node_i.args[:2]:
+                            if isinstance(_st_ck_arg, torch.fx.Node):
+                                _st_ck_ast = state.codegen.ast_for_fx_node(_st_ck_arg)
+                                if isinstance(_st_ck_ast, ast.AST):
+                                    _st_ck_nm = ast.unparse(_st_ck_ast)
+                                    if _st_ck_nm in _sbuf_shapes_st:
+                                        _needs_sbuf_offset_st = True
+                                        break
+                if _needs_sbuf_offset_st:
+                    _value_name_sst = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
+                    _val_sbuf_shape_sst = device_fn._nki_sbuf_shapes.get(_value_name_sst)
+                    _p_count_sst = _val_sbuf_shape_sst[0] if _val_sbuf_shape_sst and len(_val_sbuf_shape_sst) >= 1 else int(block_size)
+                    _row_gather_sst = _nki_row_index_gather(fx_node_i, state, _p_count_sst)
+                    if _row_gather_sst is not None:
+                        slice_parts.append(_row_gather_sst)
+                        is_scalar_dim_s.append(False)
+                        tensor_dim_idx += 1
+                        continue
                 slice_parts.append(f"__DYN_AP__{_counter_st}__{int(block_size)}")
             elif _shifted_s is not None:
                 # Use the shifted slice (includes both the static offset and the tile offset)

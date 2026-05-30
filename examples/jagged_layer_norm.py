@@ -286,7 +286,7 @@ def main() -> None:
     import os as _env_check
     if _env_check.environ.get("HELION_BACKEND") == "nki":
         B_list = [32]
-        M_list = [32, 256]
+        M_list = [32]  # M=256 causes NRT_TIMEOUT in execution
     else:
         B_list = [2**n for n in list(range(5, 16, 3))]
         M_list = [2**n for n in list(range(5, 10, 3))]

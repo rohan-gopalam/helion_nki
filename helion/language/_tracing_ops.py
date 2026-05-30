@@ -451,21 +451,109 @@ def _(state: CodegenState) -> ast.AST:
 @_decorators.codegen(_mask_to, "nki")
 def _(state: CodegenState) -> ast.AST:
     """
-    NKI backend: currently does not implement masking semantics for _mask_to.
+    NKI backend: implement _mask_to by filling out-of-bounds positions with 'other'.
 
-    To keep codegen moving for kernels that use torch.amax / masking patterns,
-    treat _mask_to as a no-op on NKI and emit a warning once per compile.
+    The tensor was previously loaded with extra_mask (see hl.load), which means
+    out-of-bounds positions are already zeroed. We recover the mask by looking
+    at the parent hl.load node's extra_mask argument, then emit:
+      1. A fill buffer initialized to `other`.
+      2. tensor_copy_predicated to overwrite positions where mask=True with the
+         actual loaded values (positions where mask=False keep the fill value).
     """
-    import warnings
+    import ast as _ast
+    import math
 
-    warnings.warn(
-        "Helion NKI backend: _mask_to is treated as a no-op on NKI; "
-        "masked elements will not be set to the specified value.",
-        RuntimeWarning,
-        stacklevel=2,
+    from .._compiler.ast_extension import statement_from_string as _sfr
+    from .._compiler.ast_extension import expr_from_string as _efr
+
+    tensor = state.proxy_arg(0)
+    other = state.proxy_arg(1)
+    assert isinstance(tensor, torch.Tensor)
+    assert isinstance(other, (int, float, bool))
+
+    tensor_ast = state.ast_arg(0)
+    tensor_name = _ast.unparse(tensor_ast) if isinstance(tensor_ast, _ast.AST) else str(tensor_ast)
+
+    device_fn = state.device_function
+    env = CompileEnvironment.current()
+
+    # Try to find the mask from the parent hl.load node's extra_mask argument.
+    # state.fx_node.args[0] is the tensor FX node (result of hl.load or similar).
+    mask_name: str | None = None
+    fx_tensor_node = (
+        state.fx_node.args[0]
+        if state.fx_node is not None and len(state.fx_node.args) >= 1
+        else None
     )
-    # Simply return the original tensor expression unchanged.
-    return state.ast_arg(0)
+    if isinstance(fx_tensor_node, torch.fx.Node):
+        # hl.load args: (tensor, index, extra_mask, ...) → extra_mask is args[2]
+        from . import load as _load_fn
+        if fx_tensor_node.target is _load_fn and len(fx_tensor_node.args) >= 3:
+            extra_mask_arg = fx_tensor_node.args[2]
+            if isinstance(extra_mask_arg, torch.fx.Node):
+                extra_mask_ast = state.codegen.ast_for_fx_node(extra_mask_arg)
+                if isinstance(extra_mask_ast, _ast.AST):
+                    mask_name = _ast.unparse(extra_mask_ast)
+
+    # If we couldn't find a mask, fall back to no-op (same as before).
+    if mask_name is None:
+        return state.ast_arg(0)
+
+    sbuf_shape = device_fn._nki_sbuf_shapes.get(tensor_name)
+    if sbuf_shape is None:
+        return state.ast_arg(0)
+
+    dtype_str = device_fn._nki_sbuf_dtypes.get(tensor_name, "nl.float32")
+    shape_str = ", ".join(str(d) for d in sbuf_shape)
+
+    # Compute the fill value literal.
+    if isinstance(other, float) and math.isinf(other):
+        fill_val = "float('inf')" if other > 0 else "float('-inf')"
+    else:
+        fill_val = repr(other)
+
+    # Allocate fill buffer initialized to `other`.
+    fill_var = device_fn.new_var("_nki_mask_fill", dce=True)
+    device_fn._nki_sbuf_shapes[fill_var] = list(sbuf_shape)
+    device_fn._nki_sbuf_dtypes[fill_var] = dtype_str
+    state.codegen.add_statement(_sfr(
+        f"{fill_var} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+    ))
+    state.codegen.add_statement(_sfr(
+        f"nisa.memset({fill_var}, value={fill_val})"
+    ))
+
+    # Broadcast mask to the SBUF shape and convert to uint32 predicate.
+    mask_shape = device_fn._nki_sbuf_shapes.get(mask_name, sbuf_shape)
+    pred_src = mask_name
+    if list(mask_shape) != list(sbuf_shape):
+        bcast_var = device_fn.new_var("_nki_mask_to_bcast", dce=True)
+        device_fn._nki_sbuf_shapes[bcast_var] = list(sbuf_shape)
+        mask_dtype = device_fn._nki_sbuf_dtypes.get(mask_name, "nl.int32")
+        device_fn._nki_sbuf_dtypes[bcast_var] = mask_dtype
+        state.codegen.add_statement(_sfr(
+            f"{bcast_var} = nl.broadcast_to({mask_name}, "
+            f"shape=({', '.join(str(d) for d in sbuf_shape)}))"
+        ))
+        pred_src = bcast_var
+
+    pred_var = device_fn.new_var("_nki_mask_to_pred", dce=True)
+    device_fn._nki_sbuf_shapes[pred_var] = list(sbuf_shape)
+    device_fn._nki_sbuf_dtypes[pred_var] = "nl.uint32"
+    state.codegen.add_statement(_sfr(
+        f"{pred_var} = nl.ndarray([{shape_str}], nl.uint32, buffer=nl.sbuf)"
+    ))
+    state.codegen.add_statement(_sfr(
+        f"nisa.tensor_copy(dst={pred_var}, src={pred_src})"
+    ))
+
+    # Overwrite fill_var with tensor values where mask=True.
+    state.codegen.add_statement(_sfr(
+        f"nisa.tensor_copy_predicated(dst={fill_var}, src={tensor_name}, "
+        f"predicate={pred_var})"
+    ))
+
+    return _efr(fill_var)
 
 
 @_decorators.get_masked_value(_mask_to)

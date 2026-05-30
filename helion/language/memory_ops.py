@@ -3891,8 +3891,25 @@ def _(state: CodegenState) -> ast.AST:
                 )
                 if _end_m:
                     _block_size = _end_m.group(2)
-                    # Check tile_offset + block_size <= stride (inner bound)
-                    checks.append(f"({_tile_offset}) + {_block_size} <= {_stride_str}")
+                    # Only add the inner-bound check if the block_size matches
+                    # the actual block_size of _tile_offset in the active loops.
+                    # This prevents spurious checks like "offset_head + 128 <= 4"
+                    # when the match is a multi-term expression like
+                    # "chunk * nheads + offset_head" (stride=nheads, not K).
+                    _tile_offset_bs = None
+                    for _bid_check in state.codegen.active_device_loops:
+                        if state.codegen.offset_var(_bid_check) == _tile_offset:
+                            try:
+                                _tile_offset_bs = int(
+                                    env.block_sizes[_bid_check].from_config_assert(state.config)
+                                )
+                            except Exception:
+                                pass
+                            break
+                    # Only emit the inner bound if the block_size matches or if
+                    # we couldn't verify (conservative: skip to avoid false guards).
+                    if _tile_offset_bs is not None and _tile_offset_bs == int(_block_size):
+                        checks.append(f"({_tile_offset}) + {_block_size} <= {_stride_str}")
         if not checks:
             return None
         return " and ".join(checks)

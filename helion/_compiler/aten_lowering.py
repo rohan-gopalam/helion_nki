@@ -227,7 +227,12 @@ def codegen_full_nki(ctx: LoweringContext, node: Node) -> ast.AST:
     # leaving [1, N] broadcast vectors untouched (they typically have
     # only .to()/reshape users).
     transpose_to_partition_major = False
-    if len(size) == 2 and _resolve_dim(size[0]) == 1:
+    # NOTE: The transpose_to_partition_major heuristic below is disabled
+    # because it causes shape cascades in attention-style kernels where
+    # [1,N] × [1,N] operations are incorrectly treated as [N,N] broadcasts.
+    # The correct fix requires semantic understanding of accumulator vs.
+    # result shapes which is beyond a simple FX-shape heuristic.
+    if False and len(size) == 2 and _resolve_dim(size[0]) == 1:
         _n = _resolve_dim(size[1])
         if _n > 1:
             _binary_op_names = {

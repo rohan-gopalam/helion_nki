@@ -2227,6 +2227,41 @@ class NKIOpOverrides:
                     _ts_base_dst = _ts_base_dst[:_ts_base_dst.rfind("_copy")]
                 if _ts_base_dst in _ts_sbuf_shapes and _ts_base_dst != dst:
                     _operand_emit_ts = _scalar_for_emit(operand0)
+                    # Apply layout reconcile: if operand is [1, N] but dst is [N, F],
+                    # transpose operand to [N, 1] before emitting tensor_scalar.
+                    _op_str_lo = str(operand0) if not isinstance(operand0, str) else operand0
+                    # Copy-strip the operand name to find its registered shape
+                    _op_lookup_lo = _op_str_lo
+                    _op_shape_lo = _ts_sbuf_shapes.get(_op_lookup_lo)
+                    while _op_shape_lo is None and "_copy" in _op_lookup_lo:
+                        _op_lookup_lo = _op_lookup_lo[:_op_lookup_lo.rfind("_copy")]
+                        _op_shape_lo = _ts_sbuf_shapes.get(_op_lookup_lo)
+                    _base_shape_lo = _ts_sbuf_shapes.get(_ts_base_dst)
+                    if (
+                        _op_shape_lo is not None and _base_shape_lo is not None
+                        and len(_op_shape_lo) == 2 and len(_base_shape_lo) >= 2
+                        and _op_shape_lo[0] == 1 and _op_shape_lo[1] > 1
+                        and _op_shape_lo[1] == _base_shape_lo[0]
+                    ):
+                        _dt_lo = state.device_function._nki_sbuf_dtypes.get(_op_str_lo, "nl.float32")
+                        _tr_p_lo = state.device_function.new_var("_ts_tr_psum", dce=True)
+                        _tr_s_lo = state.device_function.new_var("_ts_tr_sbuf", dce=True)
+                        _n_lo = _op_shape_lo[1]
+                        state.device_function._nki_sbuf_shapes[_tr_s_lo] = [_n_lo, 1]
+                        state.device_function._nki_sbuf_dtypes[_tr_s_lo] = _dt_lo
+                        state.add_statement(statement_from_string(
+                            f"{_tr_p_lo} = nl.ndarray([{_n_lo}, 1], {_dt_lo}, buffer=nl.psum)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.nc_transpose(dst={_tr_p_lo}, data={_op_str_lo})"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"{_tr_s_lo} = nl.ndarray([{_n_lo}, 1], {_dt_lo}, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={_tr_s_lo}, src={_tr_p_lo})"
+                        ))
+                        _operand_emit_ts = _tr_s_lo
                     state.add_statement(
                         statement_from_string(
                             f"nisa.tensor_scalar(dst={_ts_base_dst}, data={_ts_base_dst}, "
@@ -3495,6 +3530,31 @@ class NKIOpOverrides:
                 f"nisa.activation(dst={operand_str}, op=nl.reciprocal, data={operand_str})"
             )
         )
+        # If operand is [1, N] (free-dim vector), transpose to [N, 1] so that
+        # downstream tensor_scalar can use it as a per-partition scalar (operand0
+        # must have free dim = 1 for tensor_scalar). This handles the case
+        # acc = acc / l_i where l_i is stored as [1, N] after softmax accumulation.
+        _recip_shape = state.device_function._nki_sbuf_shapes.get(operand_str)
+        if _recip_shape is not None and len(_recip_shape) == 2 and _recip_shape[0] == 1 and _recip_shape[1] > 1:
+            _dt_recip = state.device_function._nki_sbuf_dtypes.get(operand_str, "nl.float32")
+            _n_recip = _recip_shape[1]
+            _tr_p_recip = state.device_function.new_var("_ts_tr_psum", dce=True)
+            _tr_s_recip = state.device_function.new_var("_ts_tr_sbuf", dce=True)
+            state.device_function._nki_sbuf_shapes[_tr_s_recip] = [_n_recip, 1]
+            state.device_function._nki_sbuf_dtypes[_tr_s_recip] = _dt_recip
+            state.add_statement(statement_from_string(
+                f"{_tr_p_recip} = nl.ndarray([{_n_recip}, 1], {_dt_recip}, buffer=nl.psum)"
+            ))
+            state.add_statement(statement_from_string(
+                f"nisa.nc_transpose(dst={_tr_p_recip}, data={operand_str})"
+            ))
+            state.add_statement(statement_from_string(
+                f"{_tr_s_recip} = nl.ndarray([{_n_recip}, 1], {_dt_recip}, buffer=nl.sbuf)"
+            ))
+            state.add_statement(statement_from_string(
+                f"nisa.tensor_copy(dst={_tr_s_recip}, src={_tr_p_recip})"
+            ))
+            return _tr_s_recip
         return operand
 
     @staticmethod

@@ -674,7 +674,19 @@ def _nki_shifted_tile_subscript(
                 start = f"{offset_var} - {_rhs_expr}"
             else:  # is_add
                 start = f"{offset_var} + {_rhs_expr}"
-            return f"{start}:{start}+{block_size}"
+            # Build the end expression.  When the shift is a numeric constant,
+            # fold it with block_size arithmetically to avoid emitting
+            # "(offset_var + N) + block_size" which NKI's symbolic tracer
+            # cannot evaluate for compound affine expressions.
+            try:
+                _rhs_int = int(_rhs_expr)
+                if is_sub:
+                    end = f"{offset_var} - {_rhs_int - block_size}"
+                else:
+                    end = f"{offset_var} + {_rhs_int + block_size}"
+            except (ValueError, TypeError):
+                end = f"{start}+{block_size}"
+            return f"{start}:{end}"
 
     # Reverse: const ± tile
     rhs_bid = _get_tile_index_block_id(args[1])
@@ -703,7 +715,13 @@ def _nki_shifted_tile_subscript(
         if _lhs_expr is not None:
             if is_add:
                 start = f"{_lhs_expr} + {offset_var}"
-                return f"{start}:{start}+{block_size}"
+                # Fold numeric LHS with block_size to avoid double-addition.
+                try:
+                    _lhs_int = int(_lhs_expr)
+                    end = f"{offset_var} + {_lhs_int + block_size}"
+                except (ValueError, TypeError):
+                    end = f"{start}+{block_size}"
+                return f"{start}:{end}"
             # const - tile: only safe when block_size == 1
             if is_sub and block_size == 1:
                 return f"{_lhs_expr} - {offset_var}"
@@ -3795,7 +3813,16 @@ def _(state: CodegenState) -> ast.AST:
                 continue
             dim_size_str = hbm_dim_size_strs[dim_idx]
             checks.append(f"({start}) >= 0")
-            checks.append(f"({end}) <= {dim_size_str}")
+            # For unit-block slices "start:start + 1" use "start < dim_size"
+            # instead of "(start + 1) <= dim_size".  When 'start' contains a
+            # NKI affine loop variable (e.g. "1 + offset_0") NKI's symbolic
+            # tracer cannot evaluate "(start + 1) <= dim" and errors with
+            # "'add' expected (int, int) got (object, int)".  The two forms
+            # are logically identical for integers.
+            if end in (f"{start} + 1", f"({start}) + 1"):
+                checks.append(f"({start}) < {dim_size_str}")
+            else:
+                checks.append(f"({end}) <= {dim_size_str}")
             # Additional inner-dimension bound: when start is "A * stride + tile_offset"
             # (scalar * constant + loop_var), add "tile_offset + block <= stride" so
             # the tile doesn't overflow into the next scalar block. This prevents

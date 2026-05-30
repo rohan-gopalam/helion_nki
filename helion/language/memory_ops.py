@@ -3895,6 +3895,8 @@ def _(state: CodegenState) -> ast.AST:
         return " and ".join(checks)
 
     def _slice_info(part: str, dim_idx: int) -> tuple[str, str, int, str] | None:
+        import re as _re_si
+
         if dim_idx >= len(hbm_dim_size_strs) or ":" not in part:
             return None
         if part.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__", "__AP_ROW_GATHER__")):
@@ -3905,12 +3907,36 @@ def _(state: CodegenState) -> ast.AST:
         if not start or not end:
             return None
         count: int | None = None
-        plus_idx = end.rfind("+")
-        if plus_idx >= 0:
+
+        # First, try "X ± C1 : X ± C2" pattern where start and end share the
+        # same base expression. The block size is C2 - C1.  This handles both
+        # negative shifts ("offset_1 - 400:offset_1 - 144") and folded positive
+        # shifts ("offset_0 + 1:offset_0 + 2").  This takes priority over the
+        # simpler "+N suffix" extraction to avoid confusion when start is also
+        # "expr + C".
+        _m_start = _re_si.match(r'^(.+?)\s*([+-])\s*(\d+)$', start)
+        _m_end = _re_si.match(r'^(.+?)\s*([+-])\s*(\d+)$', end)
+        if _m_start and _m_end and _m_start.group(1).strip() == _m_end.group(1).strip():
+            _s_sign = 1 if _m_start.group(2) == '+' else -1
+            _e_sign = 1 if _m_end.group(2) == '+' else -1
             try:
-                count = int(end[plus_idx + 1 :].strip())
+                _s_const = _s_sign * int(_m_start.group(3))
+                _e_const = _e_sign * int(_m_end.group(3))
+                _candidate = _e_const - _s_const
+                if _candidate > 0:
+                    count = _candidate
             except ValueError:
-                count = None
+                pass
+
+        # Fallback: try "...+ N" at the end of `end` (for plain "offset:offset+N" slices).
+        if count is None:
+            plus_idx = end.rfind("+")
+            if plus_idx >= 0:
+                try:
+                    count = int(end[plus_idx + 1 :].strip())
+                except ValueError:
+                    count = None
+
         if count is None:
             try:
                 count = int(end) - int(start)

@@ -1419,20 +1419,23 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     # consumers resolve the name through device_function._nki_psum_aliases.
     mm_result = state.device_function.new_var("_nki_mm_result")
     mm_result_tile_vars: list[str] = []
+    # In transpose mode (gen3+) the psum dst must match the input dtype, so the
+    # accumulated result buffer also uses matmul_dtype_str instead of float32.
+    _mm_result_dtype = matmul_dtype_str if _is_transpose_mode else "nl.float32"
     if result_is_list:
         for i in range(n_sub_m):
             rv = state.device_function.new_var(f"{mm_result}_{i}")
             mm_result_tile_vars.append(rv)
             state.add_statement(
                 statement_from_string(
-                    f"{rv} = nl.ndarray([{TILE_M}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                    f"{rv} = nl.ndarray([{TILE_M}, {N_tile}], {_mm_result_dtype}, buffer=nl.sbuf)"
                 )
             )
         state.device_function.register_tile_list(mm_result, mm_result_tile_vars)
     elif not _keep_in_psum:
         state.add_statement(
             statement_from_string(
-                f"{mm_result} = nl.ndarray([{TILE_M}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                f"{mm_result} = nl.ndarray([{TILE_M}, {N_tile}], {_mm_result_dtype}, buffer=nl.sbuf)"
             )
         )
 
@@ -1576,7 +1579,10 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     def _emit_one_m_stripe(m_i: int, n_expr: str) -> None:
         """Emit all statements for a single M-stripe (fully unrolled, no sub_m loop)."""
         mm_sbuf_tmp = state.device_function.new_var("_mm_sbuf_tmp")
-        _psum_dtype = "nl.float32"
+        # In NKI transpose mode (TILE_K > TILE_M), gen3+ requires the psum dst
+        # dtype to match the input dtype. Use float32 in normal mode (accumulates
+        # higher precision), or matmul_dtype_str in transpose mode.
+        _psum_dtype = matmul_dtype_str if _is_transpose_mode else "nl.float32"
         state.add_statement(
             statement_from_string(
                 f"{mm_psum} = nl.ndarray([{TILE_M}, {N_sub}], {_psum_dtype}, buffer=nl.psum)"
@@ -1641,7 +1647,7 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
             return
         state.add_statement(
             statement_from_string(
-                f"{mm_sbuf_tmp} = nl.ndarray([{TILE_M}, {N_sub}], nl.float32, buffer=nl.sbuf)"
+                f"{mm_sbuf_tmp} = nl.ndarray([{TILE_M}, {N_sub}], {_psum_dtype}, buffer=nl.sbuf)"
             )
         )
         state.add_statement(

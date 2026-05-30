@@ -47,7 +47,7 @@ from helion._testing import DEVICE
 
 
 _IS_TRN2 = os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE", "").startswith("trn2")
-_CACHE_DIR = "/tmp/torchinductor_ubuntu"
+_CACHE_DIR = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_ubuntu")
 
 
 # ---------------------------------------------------------------------------

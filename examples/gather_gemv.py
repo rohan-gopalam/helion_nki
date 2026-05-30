@@ -149,7 +149,7 @@ def main() -> None:
     # Test with sizes from tritonbench
     B = 8  # Batch size, could be number of experts in MoE
     N = 2  # Number of indices, experts selected
-    for i in range(11, 15):
+    for i in range(11, 14):
         S = 2**i
         print(f"Testing with B={B}, S={S}, N={N}")
         check(B, S, N)

@@ -1703,16 +1703,50 @@ class NDTileStrategy(_BaseNDTileStrategy):
         index_var: str,
         end: object,
     ) -> ast.stmt | None:
+        env = CompileEnvironment.current()
         if (
-            CompileEnvironment.current()
-            .block_sizes[block_idx]
-            .known_multiple(block_size)
+            not env.backend.force_tile_mask()
+            and env.block_sizes[block_idx].known_multiple(block_size)
+            and not env.is_jagged_tile(block_idx)
         ):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
+
+        if env.is_jagged_tile(block_idx):
+            jagged_tile_parents_ast = state.ast_args[3]
+            jagged_tile_parents_proxy = state.proxy_args[3]
+            assert isinstance(jagged_tile_parents_ast, list)
+            assert isinstance(jagged_tile_parents_proxy, list)
+            # We guarantee the first lifted loop input is the jagged_tile parent tensor.
+            jagged_tile_parent = jagged_tile_parents_ast[0]
+            jagged_tile_block_size = env.block_sizes[block_idx].var
+            jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
+            assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
+            parent_dims: list[torch.SymInt] = []
+            for d in jagged_tile_parent_proxy.size():
+                assert isinstance(d, torch.SymInt)
+                parent_dims.append(d)
+            assert len(parent_dims) >= 1
+            env.jagged_tile_mask_shapes[block_idx] = [
+                *parent_dims,
+                jagged_tile_block_size,
+            ]
+            if not self.supports_index_rank_expansion():
+                return statement_from_string(
+                    f"{mask_var} = ({index_var}) < {{parent}}",
+                    parent=self._to_ast(jagged_tile_parent),
+                )
+            k = len(parent_dims)
+            child_expand = "[" + ", ".join(["None"] * k + [":"]) + "]"
+            parent_expand = "[" + ", ".join([":"] * k + ["None"]) + "]"
+            return statement_from_string(
+                f"{mask_var} = ({index_var}){child_expand} < {{parent}}{parent_expand}",
+                parent=self._to_ast(jagged_tile_parent),
+            )
+
         return statement_from_string(
             f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )

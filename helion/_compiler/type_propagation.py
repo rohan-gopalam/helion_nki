@@ -1170,6 +1170,24 @@ class TileIndexType(TypeInfo):
         return super().propagate_attribute(attr, origin)
 
 
+class JaggedTileIndexType(TileIndexType):
+    parent_block_ids: list[int]
+
+    def __init__(self, origin: Origin, block_id: int, parent_block_ids: list[int]) -> None:
+        super().__init__(origin, block_id)
+        self.parent_block_ids = parent_block_ids
+
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        if isinstance(other, JaggedTileIndexType):
+            if self.block_id == other.block_id and self.parent_block_ids == other.parent_block_ids:
+                return self
+            raise exc.TypeInferenceError(
+                f"JaggedTileIndexType mismatch: block/parents {self.block_id}/{self.parent_block_ids} "
+                f"vs {other.block_id}/{other.parent_block_ids}"
+            )
+        return super().merge(other, var_name=var_name)
+
+
 class BlockSizeType(SymIntType):
     """Type for block sizes registered via register_block_size"""
 

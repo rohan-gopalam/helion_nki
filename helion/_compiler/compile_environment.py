@@ -160,6 +160,8 @@ class CompileEnvironment:
             for pid_type in ("flat", "xyz"):
                 self.config_spec.disallow_pid_type(pid_type)
         self.has_barrier: bool = False
+        self.jagged_tile_parent_ids: dict[int, list[int]] = {}
+        self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
         # Set during codegen so backends (e.g. NKI) can emit statements; see NKI_STATEMENT_BASED_CODEGEN.md Option B.
         self._codegen_state: object | None = None
 
@@ -172,6 +174,12 @@ class CompileEnvironment:
             yield
         finally:
             self._codegen_state = old
+
+    def register_jagged_tile(self, block_id: int, parent_ids: list[int]) -> None:
+        self.jagged_tile_parent_ids[block_id] = parent_ids
+
+    def is_jagged_tile(self, block_id: int) -> bool:
+        return block_id in self.jagged_tile_parent_ids
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""

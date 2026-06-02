@@ -63,6 +63,7 @@ from .type_propagation import NumericType
 from .type_propagation import SequenceType
 from .type_propagation import StackTensorType
 from .type_propagation import TensorType
+from .type_propagation import JaggedTileIndexType
 from .type_propagation import TileIndexType
 from .type_propagation import TypeInfo
 from .type_propagation import _eval_binary
@@ -771,7 +772,7 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(func_node, ExtendedAST)
         func_type = func_node._type_info
         assert isinstance(func_type, CallableType)
-        assert func_type.value in (hl.tile, hl.grid, builtins.range)
+        assert func_type.value in (hl.jagged_tile, hl.tile, hl.grid, builtins.range)
         args = call_node.args
         assert len(args) >= 1
         if len(args) == 1:
@@ -866,6 +867,16 @@ class WalkDeviceAST(NodeVisitor):
                 if begin is None:
                     begin = [0] * len(iter_vars)
             else:
+                if isinstance(inner_type, JaggedTileIndexType):
+                    # hl.jagged_tile takes an N-D parent tensor, not a scalar bound.
+                    # end is the parent tensor; compute amax() as the true loop end.
+                    assert isinstance(end, torch.Tensor)
+                    jagged_parent = end
+                    # The first lifted loop input must be the jagged parent tensor.
+                    # _setup_mask uses that parent tensor to recover each lane's true end.
+                    assert inputs.flat_values[0] is jagged_parent
+                    # Flatten so the global max becomes a single-axis reduction.
+                    end = torch.amax(jagged_parent.reshape(-1))
                 iter_vars = [inner_type]
                 begin = [0] if begin is None else [begin]
                 end = [end]

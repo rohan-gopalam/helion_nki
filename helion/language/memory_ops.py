@@ -1425,6 +1425,335 @@ def _nki_subscript_block_id(
     return None
 
 
+def _classify_load_dim(
+    tdi: int,
+    subscript_block_ids: list,
+    subscript_positions: list,
+    subscript: list | tuple,
+    fx_subscript,
+    tensor: "torch.Tensor",
+    state: "CodegenState",
+    env: "CompileEnvironment",
+    partition_dim: int,
+    _bs_subs: dict,
+    device_fn,
+    slice_parts_so_far: list[str],
+) -> tuple[str, bool, "str | None", bool]:
+    """Classify a single leading dimension and return its slice expression.
+
+    This is a mechanical extraction of the per-dim loop body from the NKI load
+    codegen.  It has the same side effects as the original: it may emit NKI
+    statements via ``state.codegen.add_statement`` (e.g. SBUF allocations for
+    row gather).
+
+    Returns:
+        (slice_part, is_scalar, partition_offset_update, used_shifted)
+
+        - slice_part: the string slice expression for this dim
+        - is_scalar: True if this dim has width 1 (scalar access)
+        - partition_offset_update: if not None, the value to assign to
+          partition_offset_var (only meaningful when tdi == 0)
+        - used_shifted: True if a shifted tile subscript was used
+    """
+    import torch
+    import ast
+
+    block_id = subscript_block_ids[tdi]
+    sub_pos_tdi_check = subscript_positions[tdi] if tdi < len(subscript_positions) else None
+    fx_node_tdi_check = (
+        fx_subscript[sub_pos_tdi_check]
+        if fx_subscript is not None
+        and sub_pos_tdi_check is not None
+        and sub_pos_tdi_check < len(fx_subscript)
+        else None
+    )
+
+    partition_offset_update: str | None = None
+    used_shifted = False
+
+    # Detect tile_id (or other scalar-index) subscripts
+    _is_tile_id = False
+    _is_tile_begin = False
+    if isinstance(fx_node_tdi_check, torch.fx.Node):
+        from .tile_ops import tile_id as _tile_id_fn
+        try:
+            from .tile_ops import tile_begin as _tile_begin_fn
+        except ImportError:
+            _tile_begin_fn = None
+        if fx_node_tdi_check.target is _tile_id_fn:
+            _is_tile_id = True
+        elif _tile_begin_fn is not None and fx_node_tdi_check.target is _tile_begin_fn:
+            _is_tile_begin = True
+        elif fx_node_tdi_check.op == "call_function":
+            _tname = str(getattr(fx_node_tdi_check.target, "__name__", fx_node_tdi_check.target))
+            if "tile_id" in _tname:
+                _is_tile_id = True
+            elif "tile_begin" in _tname:
+                _is_tile_begin = True
+
+    # Also detect plain scalar subscripts
+    _sub_val_load = subscript[subscript_positions[tdi]] if tdi < len(subscript_positions) else None
+    _is_scalar_subscript = (
+        not _is_tile_id
+        and block_id is None
+        and not isinstance(_sub_val_load, slice)
+        and (
+            isinstance(_sub_val_load, (int, bool))
+            or (isinstance(_sub_val_load, torch.SymInt))
+        )
+    )
+
+    if _is_tile_id and block_id is not None:
+        offset_var = state.codegen.offset_var(block_id)
+        block_size = env.block_sizes[block_id].from_config_assert(state.config)
+        if int(block_size) == 1:
+            id_expr = offset_var
+        else:
+            id_expr = f"{offset_var} // {int(block_size)}"
+        if tdi == 0:
+            partition_offset_update = f"({id_expr})"
+        return (f"({id_expr}):({id_expr})+1", True, partition_offset_update, False)
+
+    elif _is_tile_begin and block_id is not None:
+        offset_var = state.codegen.offset_var(block_id)
+        if tdi == 0:
+            partition_offset_update = f"({offset_var})"
+        return (f"({offset_var}):({offset_var})+1", True, partition_offset_update, False)
+
+    elif _is_scalar_subscript:
+        shifted = _nki_shifted_tile_subscript(fx_node_tdi_check, state, env)
+        if shifted is not None:
+            if tdi == 0:
+                partition_offset_update = shifted.split(":", 1)[0].strip()
+            return (shifted, True, partition_offset_update, False)
+        scalar_ast = (
+            state.codegen.ast_for_fx_node(fx_node_tdi_check)
+            if isinstance(fx_node_tdi_check, torch.fx.Node)
+            else None
+        )
+        if isinstance(scalar_ast, ast.AST):
+            scalar_expr = ast.unparse(scalar_ast)
+            if scalar_expr and not scalar_expr.isdigit():
+                if tdi == 0:
+                    partition_offset_update = scalar_expr
+                return (f"{scalar_expr}:{scalar_expr}+1", True, partition_offset_update, False)
+        # Plain scalar subscript (literal int / concretized SymInt).
+        if isinstance(_sub_val_load, torch.SymInt):
+            try:
+                _scalar_val = int(_sub_val_load._sympy_().subs(_bs_subs))
+            except (TypeError, ValueError):
+                _scalar_val = int(env.size_hint(_sub_val_load))
+        else:
+            _scalar_val = int(_sub_val_load)
+        if tdi == 0:
+            partition_offset_update = f"{_scalar_val}"
+        return (f"{_scalar_val}:{_scalar_val}+1", True, partition_offset_update, False)
+
+    elif block_id is not None and block_id in state.codegen.active_device_loops:
+        offset_var = state.codegen.offset_var(block_id)
+        block_size = env.block_sizes[block_id].from_config_assert(state.config)
+        if tdi == 0:
+            partition_offset_update = offset_var
+
+        # Check if the subscript FX node is a SHIFTED tile
+        _shifted_s = _nki_shifted_tile_subscript(fx_node_tdi_check, state, env)
+
+        # Check if this block is inside a dynamic_range loop
+        _dyn_loops = getattr(state.device_function, "_nki_dyn_loops", {})
+
+        if _shifted_s is not None:
+            if tdi == 0:
+                partition_offset_update = _shifted_s.split(":", 1)[0].strip()
+            return (_shifted_s, False, partition_offset_update, True)
+
+        elif block_id in _dyn_loops:
+            _dyn_counter_raw = _dyn_loops[block_id]["counter"]
+            _needs_sbuf_offset = False
+            if (
+                tdi == 0
+                and tensor.dim() == 2
+                and isinstance(_sub_val_load, torch.Tensor)
+                and isinstance(fx_node_tdi_check, torch.fx.Node)
+            ):
+                _ck_target_dyn = str(getattr(fx_node_tdi_check, "target", ""))
+                if "add.Tensor" in _ck_target_dyn or "sub.Tensor" in _ck_target_dyn:
+                    _sbuf_shapes_dyn = getattr(
+                        getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
+                    )
+                    for _dyn_ck_arg in fx_node_tdi_check.args[:2]:
+                        if isinstance(_dyn_ck_arg, torch.fx.Node):
+                            _dyn_ck_ast = state.codegen.ast_for_fx_node(_dyn_ck_arg)
+                            if isinstance(_dyn_ck_ast, ast.AST):
+                                _dyn_ck_nm = ast.unparse(_dyn_ck_ast)
+                                if _dyn_ck_nm in _sbuf_shapes_dyn:
+                                    _needs_sbuf_offset = True
+                                    break
+            if _needs_sbuf_offset:
+                _row_gather_dyn = _nki_row_index_gather(
+                    fx_node_tdi_check, state, int(block_size)
+                )
+                if _row_gather_dyn is not None:
+                    if tdi == 0:
+                        partition_offset_update = (
+                            _row_gather_dyn.split(":", 1)[0].strip()
+                            if ":" in _row_gather_dyn
+                            else _row_gather_dyn
+                        )
+                    return (_row_gather_dyn, False, partition_offset_update, False)
+            _counter = _dyn_counter_raw
+            return (f"__DYN_AP__{_counter}__{int(block_size)}", False, partition_offset_update, False)
+
+        elif (
+            tdi == 0
+            and tensor.dim() == 2
+            and isinstance(_sub_val_load, torch.Tensor)
+        ):
+            row_gather = _nki_row_index_gather(fx_node_tdi_check, state, partition_dim)
+            if row_gather is not None:
+                if tdi == 0:
+                    partition_offset_update = row_gather.split(":", 1)[0].strip() if ":" in row_gather else row_gather
+                return (row_gather, False, partition_offset_update, False)
+            # Check if shift was blocked because of an SBUF operand.
+            _sbuf_shapes_ck = getattr(
+                getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
+            )
+            _needs_flat_gather = False
+            if isinstance(fx_node_tdi_check, torch.fx.Node):
+                _ck_target = str(getattr(fx_node_tdi_check, "target", ""))
+                if "add.Tensor" in _ck_target or "sub.Tensor" in _ck_target:
+                    for _ck_arg in fx_node_tdi_check.args[:2]:
+                        if isinstance(_ck_arg, torch.fx.Node):
+                            _ck_ast = state.codegen.ast_for_fx_node(_ck_arg)
+                            if isinstance(_ck_ast, ast.AST):
+                                _ck_nm = ast.unparse(_ck_ast)
+                                if (
+                                    _ck_nm in _sbuf_shapes_ck
+                                    or _ck_nm.startswith(("_nki_", "indices_"))
+                                ):
+                                    _needs_flat_gather = True
+                                    break
+            if not _needs_flat_gather:
+                return (f"{offset_var}:{offset_var}+{int(block_size)}", False, partition_offset_update, False)
+            # _needs_flat_gather=True
+            row_gather_sbuf = _nki_row_index_gather(
+                fx_node_tdi_check, state, int(block_size)
+            )
+            if row_gather_sbuf is not None:
+                if tdi == 0:
+                    partition_offset_update = row_gather_sbuf.split(":", 1)[0].strip() if ":" in row_gather_sbuf else row_gather_sbuf
+                return (row_gather_sbuf, False, partition_offset_update, False)
+            else:
+                return (f"{offset_var}:{offset_var}+{int(block_size)}", False, partition_offset_update, False)
+        else:
+            return (f"{offset_var}:{offset_var}+{int(block_size)}", False, partition_offset_update, False)
+
+    else:
+        # No block_id or not in active_device_loops
+        # Tensor-valued row indexers
+        if (
+            tdi == 0
+            and tensor.dim() == 2
+            and isinstance(_sub_val_load, torch.Tensor)
+        ):
+            row_gather = _nki_row_index_gather(
+                fx_node_tdi_check, state, partition_dim
+            )
+            if row_gather is not None:
+                return (row_gather, False, None, False)
+
+        # Detect "tile_index +/- constant" subscripts
+        shifted = _nki_shifted_tile_subscript(fx_node_tdi_check, state, env)
+        if shifted is not None:
+            return (shifted, False, None, True)
+
+        # Detect "base_per_partition + tile_index" pattern
+        _gather = _nki_indirect_gather(
+            fx_node_tdi_check, state, env, tensor, slice_parts_so_far
+        )
+        if _gather is not None:
+            return (_gather, False, None, False)
+
+        # Iota/tensor subscript at non-partition dim
+        if (
+            tdi > 0
+            and isinstance(_sub_val_load, torch.Tensor)
+            and isinstance(fx_node_tdi_check, torch.fx.Node)
+        ):
+            _fx_target_name = str(getattr(fx_node_tdi_check, "target", ""))
+            _is_iota = "iota" in _fx_target_name
+            if _is_iota:
+                _fx_val = fx_node_tdi_check.meta.get("val")
+                if isinstance(_fx_val, torch.Tensor) and _fx_val.ndim == 1:
+                    _iota_len_sym = _fx_val.size(0)
+                    if isinstance(_iota_len_sym, torch.SymInt):
+                        try:
+                            _iota_len = int(_iota_len_sym._sympy_().subs(_bs_subs))
+                        except (TypeError, ValueError):
+                            _iota_len = int(env.size_hint(_iota_len_sym))
+                    else:
+                        _iota_len = int(_iota_len_sym)
+                    _iota_start_node = fx_node_tdi_check.kwargs.get("start")
+                    _start_expr = "0"
+                    if isinstance(_iota_start_node, torch.fx.Node):
+                        _start_ast = state.codegen.ast_for_fx_node(_iota_start_node)
+                        if isinstance(_start_ast, ast.AST):
+                            _start_expr = ast.unparse(_start_ast)
+                    elif isinstance(_iota_start_node, (int, float)):
+                        _start_expr = str(int(_iota_start_node))
+                    return (f"{_start_expr}:{_start_expr}+{_iota_len}", False, None, False)
+
+        # Computed partial slice: slice(start, stop) where start is not None.
+        if isinstance(_sub_val_load, slice) and _sub_val_load.start is not None:
+            if isinstance(fx_node_tdi_check, torch.fx.Node):
+                _start_val = _sub_val_load.start
+                _stop_val = _sub_val_load.stop
+                if isinstance(_start_val, torch.SymInt):
+                    _start_expr = state.sympy_expr(_start_val._sympy_())
+                elif isinstance(_start_val, int):
+                    _start_expr = str(_start_val)
+                else:
+                    _start_expr = str(_start_val)
+                if isinstance(_stop_val, torch.SymInt):
+                    _stop_expr = state.sympy_expr(_stop_val._sympy_())
+                elif isinstance(_stop_val, int):
+                    _stop_expr = str(_stop_val)
+                else:
+                    _stop_expr = str(_stop_val)
+                # Check if the dynamic range loop has a counter
+                _dyn_loops = getattr(state.device_function, "_nki_dyn_loops", {})
+                _is_in_dyn_loop = any(
+                    bid_candidate in _dyn_loops
+                    for bid_candidate in state.codegen.active_device_loops
+                )
+                if _is_in_dyn_loop:
+                    try:
+                        _slice_len = int(_stop_val) - int(_start_val) if isinstance(_start_val, int) and isinstance(_stop_val, int) else None
+                    except (TypeError, ValueError):
+                        _slice_len = None
+                    if _slice_len is None:
+                        if isinstance(_start_val, torch.SymInt) and isinstance(_stop_val, torch.SymInt):
+                            _len_sympy = _stop_val._sympy_() - _start_val._sympy_()
+                            _len_sympy_subbed = _len_sympy.subs(_bs_subs)
+                            try:
+                                _slice_len = int(_len_sympy_subbed)
+                            except (TypeError, ValueError):
+                                _slice_len = int(env.size_hint(_stop_val)) - int(env.size_hint(_start_val))
+                    if _slice_len is not None:
+                        for _bid_c, _dyn_info_c in _dyn_loops.items():
+                            _counter_c = _dyn_info_c.get("counter_float") or _dyn_info_c.get("counter")
+                            if _counter_c:
+                                return (f"__DYN_AP__{_counter_c}__{_slice_len}", False, None, False)
+                return (f"{_start_expr}:{_stop_expr}", False, None, False)
+
+        # Fixed slice for this dimension (fallback).
+        size_i = tensor.size(tdi)
+        if isinstance(size_i, torch.SymInt):
+            size_str = state.sympy_expr(size_i._sympy_())
+        else:
+            size_str = str(size_i)
+        return (f"0:{size_str}", False, None, False)
+
+
 @_decorators.codegen(load, "nki")
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import create
@@ -1723,383 +2052,26 @@ def _(state: CodegenState) -> ast.AST:
     # populated by the 3D early-exit above).
     used_shifted_subscript = False
     for tdi in range(len(subscript_block_ids)):
-        block_id = subscript_block_ids[tdi]
-        sub_pos_tdi_check = subscript_positions[tdi] if tdi < len(subscript_positions) else None
-        fx_node_tdi_check = (
-            fx_subscript[sub_pos_tdi_check]
-            if fx_subscript is not None
-            and sub_pos_tdi_check is not None
-            and sub_pos_tdi_check < len(fx_subscript)
-            else None
+        slice_part, is_scalar, p_offset_update, dim_used_shifted = _classify_load_dim(
+            tdi=tdi,
+            subscript_block_ids=subscript_block_ids,
+            subscript_positions=subscript_positions,
+            subscript=subscript,
+            fx_subscript=fx_subscript,
+            tensor=tensor,
+            state=state,
+            env=env,
+            partition_dim=partition_dim,
+            _bs_subs=_bs_subs,
+            device_fn=device_fn,
+            slice_parts_so_far=slice_parts,
         )
-
-        # Detect tile_id (or other scalar-index) subscripts: FX node target is
-        # ``tile_id`` / ``tile_index`` / ``tile_begin`` / a _get_symnode whose
-        # expression contains ``offset // block_size``. For these, emit a
-        # scalar index (size-1 slice) rather than a range.
-        _is_tile_id = False
-        _is_tile_begin = False
-        if isinstance(fx_node_tdi_check, torch.fx.Node):
-            from .tile_ops import tile_id as _tile_id_fn
-            try:
-                from .tile_ops import tile_begin as _tile_begin_fn
-            except ImportError:
-                _tile_begin_fn = None
-            if fx_node_tdi_check.target is _tile_id_fn:
-                _is_tile_id = True
-            elif _tile_begin_fn is not None and fx_node_tdi_check.target is _tile_begin_fn:
-                _is_tile_begin = True
-            elif fx_node_tdi_check.op == "call_function":
-                _tname = str(getattr(fx_node_tdi_check.target, "__name__", fx_node_tdi_check.target))
-                if "tile_id" in _tname:
-                    _is_tile_id = True
-                elif "tile_begin" in _tname:
-                    _is_tile_begin = True
-
-        # Also detect plain scalar subscripts (int / SymInt resolved to int /
-        # arithmetic expression evaluating to a compile-time scalar). These
-        # happen with things like ``x[:, chunk_size - 1]``. Only fires when
-        # no block_id is resolved (otherwise it's a tile reference).
-        _sub_val_load = subscript[subscript_positions[tdi]] if tdi < len(subscript_positions) else None
-        _is_scalar_subscript = (
-            not _is_tile_id
-            and block_id is None
-            and not isinstance(_sub_val_load, slice)
-            and (
-                isinstance(_sub_val_load, (int, bool))
-                or (isinstance(_sub_val_load, torch.SymInt))
-            )
-        )
-        if _is_tile_id and block_id is not None:
-            # Scalar access: dst[.., offset//block_size, ...] maps to a single
-            # element in that dim. Emit `tile_id_expr : tile_id_expr + 1` so the
-            # slice has width 1.
-            offset_var = state.codegen.offset_var(block_id)
-            block_size = env.block_sizes[block_id].from_config_assert(state.config)
-            # ``tile.id`` == offset // block_size
-            if int(block_size) == 1:
-                id_expr = offset_var
-            else:
-                id_expr = f"{offset_var} // {int(block_size)}"
-            if tdi == 0:
-                partition_offset_var = f"({id_expr})"
-            slice_parts.append(f"({id_expr}):({id_expr})+1")
-            is_scalar_dim.append(True)
-        elif _is_tile_begin and block_id is not None:
-            # tile.begin is a scalar == offset (no divide).
-            offset_var = state.codegen.offset_var(block_id)
-            if tdi == 0:
-                partition_offset_var = f"({offset_var})"
-            slice_parts.append(f"({offset_var}):({offset_var})+1")
-            is_scalar_dim.append(True)
-        elif _is_scalar_subscript:
-            shifted = _nki_shifted_tile_subscript(fx_node_tdi_check, state, env)
-            if shifted is not None:
-                if tdi == 0:
-                    partition_offset_var = shifted.split(":", 1)[0].strip()
-                slice_parts.append(shifted)
-                is_scalar_dim.append(True)
-                continue
-            scalar_ast = (
-                state.codegen.ast_for_fx_node(fx_node_tdi_check)
-                if isinstance(fx_node_tdi_check, torch.fx.Node)
-                else None
-            )
-            if isinstance(scalar_ast, ast.AST):
-                scalar_expr = ast.unparse(scalar_ast)
-                if scalar_expr and not scalar_expr.isdigit():
-                    if tdi == 0:
-                        partition_offset_var = scalar_expr
-                    slice_parts.append(f"{scalar_expr}:{scalar_expr}+1")
-                    is_scalar_dim.append(True)
-                    continue
-            # Plain scalar subscript (literal int / concretized SymInt).
-            if isinstance(_sub_val_load, torch.SymInt):
-                try:
-                    _scalar_val = int(_sub_val_load._sympy_().subs(_bs_subs))
-                except (TypeError, ValueError):
-                    _scalar_val = int(env.size_hint(_sub_val_load))
-            else:
-                _scalar_val = int(_sub_val_load)
-            if tdi == 0:
-                partition_offset_var = f"{_scalar_val}"
-            slice_parts.append(f"{_scalar_val}:{_scalar_val}+1")
-            is_scalar_dim.append(True)
-        elif block_id is not None and block_id in state.codegen.active_device_loops:
-            offset_var = state.codegen.offset_var(block_id)
-            block_size = env.block_sizes[block_id].from_config_assert(state.config)
-            if tdi == 0:
-                partition_offset_var = offset_var
-            # Check if the subscript FX node is a SHIFTED tile (e.g.
-            # tile_k.index + tile_c.begin * chunk_size). If so, emit the
-            # shifted slice instead of the plain offset:offset+block range.
-            _shifted_s = _nki_shifted_tile_subscript(fx_node_tdi_check, state, env)
-            # Check if this block is inside a dynamic_range loop - if so, we
-            # can't use offset_var in a slice (it's a register). Mark this
-            # subscript with a sentinel token that the DMA emit will recognize
-            # and substitute with .ap(scalar_offset=counter).
-            _dyn_loops = getattr(state.device_function, "_nki_dyn_loops", {})
-            if _shifted_s is not None:
-                if tdi == 0:
-                    partition_offset_var = _shifted_s.split(":", 1)[0].strip()
-                slice_parts.append(_shifted_s)
-                used_shifted_subscript = True
-                is_scalar_dim.append(False)
-                continue
-            elif block_id in _dyn_loops:
-                # If the subscript is compound (e.g. start + tile.index where
-                # start is an SBUF scalar), the simple __DYN_AP__ sentinel is
-                # insufficient — the counter doesn't include the SBUF offset.
-                # In that case, try _nki_row_index_gather which handles
-                # SBUF-scalar + tile.index combinations correctly.
-                _dyn_counter_raw = _dyn_loops[block_id]["counter"]
-                _needs_sbuf_offset = False
-                if (
-                    tdi == 0
-                    and tensor.dim() == 2
-                    and isinstance(_sub_val_load, torch.Tensor)
-                    and isinstance(fx_node_tdi_check, torch.fx.Node)
-                ):
-                    _ck_target_dyn = str(getattr(fx_node_tdi_check, "target", ""))
-                    if "add.Tensor" in _ck_target_dyn or "sub.Tensor" in _ck_target_dyn:
-                        _sbuf_shapes_dyn = getattr(
-                            getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
-                        )
-                        for _dyn_ck_arg in fx_node_tdi_check.args[:2]:
-                            if isinstance(_dyn_ck_arg, torch.fx.Node):
-                                _dyn_ck_ast = state.codegen.ast_for_fx_node(_dyn_ck_arg)
-                                if isinstance(_dyn_ck_ast, ast.AST):
-                                    _dyn_ck_nm = ast.unparse(_dyn_ck_ast)
-                                    if _dyn_ck_nm in _sbuf_shapes_dyn:
-                                        _needs_sbuf_offset = True
-                                        break
-                if _needs_sbuf_offset:
-                    # Use row_gather path to handle SBUF-offset + dyn-tile.index
-                    _row_gather_dyn = _nki_row_index_gather(
-                        fx_node_tdi_check, state, int(block_size)
-                    )
-                    if _row_gather_dyn is not None:
-                        if tdi == 0:
-                            partition_offset_var = (
-                                _row_gather_dyn.split(":", 1)[0].strip()
-                                if ":" in _row_gather_dyn
-                                else _row_gather_dyn
-                            )
-                        slice_parts.append(_row_gather_dyn)
-                        is_scalar_dim.append(False)
-                        continue
-                _counter = _dyn_counter_raw
-                slice_parts.append(f"__DYN_AP__{_counter}__{int(block_size)}")
-                is_scalar_dim.append(False)
-                continue
-            elif (
-                tdi == 0
-                and tensor.dim() == 2
-                and isinstance(_sub_val_load, torch.Tensor)
-            ):
-                # Check if the subscript is a non-contiguous gather (indirect load).
-                # When block_id was found via size match but the subscript is a
-                # computed gather (sorted_to_orig[indices], torch.where result, etc.),
-                # use the row gather (.ap() with vector_offset) mechanism.
-                row_gather = _nki_row_index_gather(fx_node_tdi_check, state, partition_dim)
-                if row_gather is not None:
-                    if tdi == 0:
-                        partition_offset_var = row_gather.split(":", 1)[0].strip() if ":" in row_gather else row_gather
-                    slice_parts.append(row_gather)
-                    is_scalar_dim.append(False)
-                    continue
-                # row_gather returned None. Check if the shift was blocked because
-                # of an SBUF operand. If so, this needs the flat gather path (else
-                # branch below) — don't emit a plain slice. We detect this by
-                # checking if fx_node_tdi_check is an add/sub involving an SBUF tile.
-                _sbuf_shapes_ck = getattr(
-                    getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
-                )
-                _needs_flat_gather = False
-                if isinstance(fx_node_tdi_check, torch.fx.Node):
-                    _ck_target = str(getattr(fx_node_tdi_check, "target", ""))
-                    if "add.Tensor" in _ck_target or "sub.Tensor" in _ck_target:
-                        for _ck_arg in fx_node_tdi_check.args[:2]:
-                            if isinstance(_ck_arg, torch.fx.Node):
-                                _ck_ast = state.codegen.ast_for_fx_node(_ck_arg)
-                                if isinstance(_ck_ast, ast.AST):
-                                    _ck_nm = ast.unparse(_ck_ast)
-                                    if (
-                                        _ck_nm in _sbuf_shapes_ck
-                                        or _ck_nm.startswith(("_nki_", "indices_"))
-                                    ):
-                                        _needs_flat_gather = True
-                                        break
-                if not _needs_flat_gather:
-                    slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
-                    is_scalar_dim.append(False)
-                    continue
-                # _needs_flat_gather=True: this subscript has a SBUF-scalar shift
-                # (e.g. A[start + tile.index]). Use the shifted subscript path
-                # via _nki_row_index_gather which handles the SBUF broadcast.
-                row_gather_sbuf = _nki_row_index_gather(
-                    fx_node_tdi_check, state, int(block_size)
-                )
-                if row_gather_sbuf is not None:
-                    if tdi == 0:
-                        partition_offset_var = row_gather_sbuf.split(":", 1)[0].strip() if ":" in row_gather_sbuf else row_gather_sbuf
-                    slice_parts.append(row_gather_sbuf)
-                    is_scalar_dim.append(False)
-                else:
-                    # Last resort: use plain slice (may be wrong but avoids crash)
-                    slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
-                    is_scalar_dim.append(False)
-                continue
-            else:
-                slice_parts.append(f"{offset_var}:{offset_var}+{int(block_size)}")
-                is_scalar_dim.append(False)
-                continue
-        else:
-            # Tensor-valued row indexers such as ``weight[indices, tile_f]``
-            # and ``A[start + tile_m.index, tile_k]`` lower to an HBM
-            # vector-offset access pattern.  NKI expects row ids in a
-            # ``[P, 1]`` uint32 SBUF tile; the column/K tile remains an
-            # ordinary contiguous AP dimension.
-            if (
-                tdi == 0
-                and tensor.dim() == 2
-                and isinstance(_sub_val_load, torch.Tensor)
-            ):
-                row_gather = _nki_row_index_gather(
-                    fx_node_tdi_check, state, partition_dim
-                )
-                if row_gather is not None:
-                    slice_parts.append(row_gather)
-                    is_scalar_dim.append(False)
-                    continue
-
-            # Detect "tile_index ± constant" subscripts (common in
-            # concatenate / jagged kernels): if the FX subscript is an
-            # aten.add/sub with tile_index as LHS and an int-constant RHS,
-            # rewrite as a shifted slice of the underlying block.
-            shifted = _nki_shifted_tile_subscript(fx_node_tdi_check, state, env)
-            if shifted is not None:
-                slice_parts.append(shifted)
-                is_scalar_dim.append(False)
-                used_shifted_subscript = True
-                continue
-
-            # Detect "base_per_partition + tile_index" pattern for indirect
-            # gather (e.g. starts[:, None] + tile.index[None, :]). This is
-            # the common jagged pattern: for each partition, a contiguous
-            # F-element slice starting at base[p].
-            # Emit .ap(pattern=..., vector_offset=base_tile, indirect_dim=0).
-            _gather = _nki_indirect_gather(
-                fx_node_tdi_check, state, env, tensor, slice_parts
-            )
-            if _gather is not None:
-                slice_parts.append(_gather)
-                is_scalar_dim.append(False)
-                continue
-
-            # Iota/tensor subscript at non-partition dim: represents a contiguous
-            # range in the free dimension. Detect iota-based subscripts (common for
-            # computed slices like a_tile_begin:a_tile_begin+a_tile_len which trace
-            # as prims.iota) and emit the correct offset+length slice.
-            if (
-                tdi > 0
-                and isinstance(_sub_val_load, torch.Tensor)
-                and isinstance(fx_node_tdi_check, torch.fx.Node)
-            ):
-                # Check if this is an iota-based subscript (prims.iota.default).
-                # The iota represents a contiguous range in the free dimension.
-                # Its kwargs['start'] gives the offset and args[0] gives the length.
-                _fx_target_name = str(getattr(fx_node_tdi_check, "target", ""))
-                _is_iota = "iota" in _fx_target_name
-                if _is_iota:
-                    _fx_val = fx_node_tdi_check.meta.get("val")
-                    if isinstance(_fx_val, torch.Tensor) and _fx_val.ndim == 1:
-                        _iota_len_sym = _fx_val.size(0)
-                        _iota_len = _resolve_dim(_iota_len_sym) if isinstance(_iota_len_sym, torch.SymInt) else int(_iota_len_sym)
-                        # Get the start offset from kwargs['start']
-                        _iota_start_node = fx_node_tdi_check.kwargs.get("start")
-                        _start_expr = "0"
-                        if isinstance(_iota_start_node, torch.fx.Node):
-                            _start_ast = state.codegen.ast_for_fx_node(_iota_start_node)
-                            if isinstance(_start_ast, ast.AST):
-                                _start_expr = ast.unparse(_start_ast)
-                        elif isinstance(_iota_start_node, (int, float)):
-                            _start_expr = str(int(_iota_start_node))
-                        # Emit slice: start:start+len
-                        slice_parts.append(f"{_start_expr}:{_start_expr}+{_iota_len}")
-                        is_scalar_dim.append(False)
-                        continue
-
-            # Computed partial slice: slice(start, stop) where start is not None.
-            # Emit the slice as "start_expr:stop_expr" using FX AST evaluation.
-            if isinstance(_sub_val_load, slice) and _sub_val_load.start is not None:
-                # Get AST for the slice start and stop from FX
-                _slice_start_ast = None
-                _slice_stop_ast = None
-                if isinstance(fx_node_tdi_check, torch.fx.Node):
-                    # FX slice nodes have args[0]=start, args[1]=stop or similar
-                    # Actually the FX subscript for a slice is represented differently.
-                    # The slice values are in sub_val directly.
-                    _start_val = _sub_val_load.start
-                    _stop_val = _sub_val_load.stop
-                    if isinstance(_start_val, torch.SymInt):
-                        _start_expr = state.sympy_expr(_start_val._sympy_())
-                    elif isinstance(_start_val, int):
-                        _start_expr = str(_start_val)
-                    else:
-                        _start_expr = str(_start_val)
-                    if isinstance(_stop_val, torch.SymInt):
-                        _stop_expr = state.sympy_expr(_stop_val._sympy_())
-                    elif isinstance(_stop_val, int):
-                        _stop_expr = str(_stop_val)
-                    else:
-                        _stop_expr = str(_stop_val)
-                    # Check if the dynamic range loop has a counter that can be used
-                    _dyn_loops = getattr(state.device_function, "_nki_dyn_loops", {})
-                    _is_in_dyn_loop = any(
-                        bid_candidate in _dyn_loops
-                        for bid_candidate in state.codegen.active_device_loops
-                    )
-                    if _is_in_dyn_loop:
-                        # Use __DYN_AP__ sentinel with the slice extent
-                        try:
-                            _slice_len = int(_stop_val) - int(_start_val) if isinstance(_start_val, int) and isinstance(_stop_val, int) else None
-                        except (TypeError, ValueError):
-                            _slice_len = None
-                        if _slice_len is None:
-                            # Try computing length from SymInt
-                            if isinstance(_start_val, torch.SymInt) and isinstance(_stop_val, torch.SymInt):
-                                _len_sympy = _stop_val._sympy_() - _start_val._sympy_()
-                                _len_sympy_subbed = _len_sympy.subs(_bs_subs)
-                                try:
-                                    _slice_len = int(_len_sympy_subbed)
-                                except (TypeError, ValueError):
-                                    _slice_len = int(env.size_hint(_stop_val)) - int(env.size_hint(_start_val))
-                        if _slice_len is not None:
-                            # Find the dyn loop counter to express start in terms of
-                            for _bid_c, _dyn_info_c in _dyn_loops.items():
-                                _counter_c = _dyn_info_c.get("counter_float") or _dyn_info_c.get("counter")
-                                if _counter_c:
-                                    slice_parts.append(f"__DYN_AP__{_counter_c}__{_slice_len}")
-                                    is_scalar_dim.append(False)
-                                    break
-                            else:
-                                slice_parts.append(f"{_start_expr}:{_stop_expr}")
-                                is_scalar_dim.append(False)
-                            continue
-                    slice_parts.append(f"{_start_expr}:{_stop_expr}")
-                    is_scalar_dim.append(False)
-                    continue
-
-            # Fixed slice for this dimension.
-            size_i = tensor.size(tdi)
-            size_str = (
-                state.sympy_expr(size_i._sympy_())
-                if isinstance(size_i, torch.SymInt)
-                else str(size_i)
-            )
-            slice_parts.append(f"0:{size_str}")
-            is_scalar_dim.append(False)
+        slice_parts.append(slice_part)
+        is_scalar_dim.append(is_scalar)
+        if p_offset_update is not None:
+            partition_offset_var = p_offset_update
+        if dim_used_shifted:
+            used_shifted_subscript = True
 
     if (
         tensor.dim() == 1

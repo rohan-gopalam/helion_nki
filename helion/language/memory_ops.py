@@ -2415,7 +2415,11 @@ def _(state: CodegenState) -> ast.AST:
                 elif index_dim0 == 1:
                     p_count = index_dim1
                 else:
-                    return None
+                    # [P, K, F] — neither leading dim is 1.
+                    # Treat P*K as the flat partition count and F as free.
+                    # The base tensor (lhs or rhs with dim[2]==1) must be
+                    # reshapeable to [P*K, 1] for ap() vector_offset.
+                    p_count = index_dim0 * index_dim1
                 f_count = _resolve_index_dim(index_val.shape[2])
             else:
                 p_count = _resolve_index_dim(index_val.shape[0])
@@ -2425,18 +2429,17 @@ def _(state: CodegenState) -> ast.AST:
                 if value.ndim == 3:
                     dim0 = _resolve_index_dim(value.shape[0])
                     dim1 = _resolve_index_dim(value.shape[1])
+                    dim2 = _resolve_index_dim(value.shape[2])
                     if dim1 == 1:
-                        return (
-                            dim0,
-                            _resolve_index_dim(value.shape[2]),
-                        )
+                        return (dim0, dim2)
                     if dim0 == 1:
-                        return (
-                            dim1,
-                            _resolve_index_dim(value.shape[2]),
-                        )
-                    else:
-                        return None
+                        return (dim1, dim2)
+                    # [P, K, 1]: base indices, P*K rows, single feature column.
+                    # Flatten to (P*K, 1) for use as gather base.
+                    if dim2 == 1:
+                        return (dim0 * dim1, 1)
+                    # [P, K, F]: gather over P*K rows with F features.
+                    return (dim0 * dim1, dim2)
                 return (
                     _resolve_index_dim(value.shape[0]),
                     _resolve_index_dim(value.shape[1]),
@@ -3517,12 +3520,30 @@ def _(state: CodegenState) -> ast.AST:
             if isinstance(lhs_ast, ast.AST) and isinstance(rhs_ast, ast.AST):
                 lhs_name = ast.unparse(lhs_ast)
                 rhs_name = ast.unparse(rhs_ast)
+                # Determine output shape: if either operand is [P, F] with P > 1,
+                # the result is also [P, F] (broadcast add), not [1, p_count].
+                # This handles flat_indices = base_indices[P, nnz] * M + tile_m[1, M].
+                lhs_sbuf = _nki_lookup_sbuf_shape_dtype(state, lhs_name)[0]
+                rhs_sbuf = _nki_lookup_sbuf_shape_dtype(state, rhs_name)[0]
+                _out_shape: list[int] = [1, p_count]
+                for _s in (lhs_sbuf, rhs_sbuf):
+                    if _s is not None and len(_s) == 2 and _s[0] > 1:
+                        # [P, F] operand — result has same shape
+                        _out_shape = list(_s)
+                        break
+                # Also take the larger of each dimension (broadcast semantics)
+                if lhs_sbuf is not None and rhs_sbuf is not None and len(lhs_sbuf) == 2 and len(rhs_sbuf) == 2:
+                    _out_shape = [
+                        max(lhs_sbuf[0], rhs_sbuf[0]),
+                        max(lhs_sbuf[1], rhs_sbuf[1]),
+                    ]
                 index_name = device_fn.new_var("_nki_flat_index", dce=True)
-                device_fn._nki_sbuf_shapes[index_name] = [1, p_count]
+                device_fn._nki_sbuf_shapes[index_name] = _out_shape
                 device_fn._nki_sbuf_dtypes[index_name] = "nl.int32"
+                _shape_str = ", ".join(str(d) for d in _out_shape)
                 state.codegen.add_statement(
                     statement_from_string(
-                        f"{index_name} = nl.ndarray([1, {p_count}], nl.int32, buffer=nl.sbuf)"
+                        f"{index_name} = nl.ndarray([{_shape_str}], nl.int32, buffer=nl.sbuf)"
                     )
                 )
                 state.codegen.add_statement(

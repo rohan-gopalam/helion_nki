@@ -199,6 +199,38 @@ class TestNKILoadCodegenRuntime(unittest.TestCase):
         self.assertTrue(torch.allclose(result, expected),
                         f"Strided gather wrong:\n{result}\nvs\n{expected}")
 
+    def test_3d_indirect_gather_codegen(self):
+        """Jagged-style 3D load via _combine_leading_dims indirect case.
+
+        When sub0 produces __AP_ROW_GATHER__ and sub1 is a scalar,
+        _combine_leading_dims Case 1 builds flat_idx = gather*H + head.
+        Verifies generated code contains _3d_flat_idx.
+        """
+
+        @helion.kernel(config=helion.Config(block_sizes=[128]))
+        def kernel(
+            x: torch.Tensor,
+            seq_offsets: torch.Tensor,
+        ) -> torch.Tensor:
+            num_batches = seq_offsets.size(0) - 1
+            L = x.size(0)
+            nheads = x.size(1)
+            out = torch.empty_like(x)
+            for tile_b, tile_h, tile_q in hl.tile(
+                [num_batches, nheads, L], block_size=[1, 1, None]
+            ):
+                starts = seq_offsets[tile_b.begin]
+                i_h = tile_h.id
+                out[tile_q.index + starts, i_h, :] = x[tile_q.index + starts, i_h, :]
+            return out
+
+        L, H, D = 100, 2, 16
+        x = torch.zeros(L, H, D, device=DEVICE)
+        offsets = torch.zeros(5, device=DEVICE, dtype=torch.int32)
+        src = _get_nki_source(kernel, (x, offsets))
+        self.assertIn(".ap(", src)
+        self.assertIn("_3d_flat_idx", src)
+
     def test_2d_contiguous_correctness(self):
         """Plain 2D copy is exact."""
 

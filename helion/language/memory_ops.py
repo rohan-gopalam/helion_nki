@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -1754,6 +1755,236 @@ def _classify_load_dim(
         return (f"0:{size_str}", False, None, False)
 
 
+def _combine_leading_dims(
+    slice_parts: list[str],
+    is_scalar_dim: list[bool],
+    tensor: "torch.Tensor",
+    state: "CodegenState",
+    env: "CompileEnvironment",
+    device_fn,
+    output_shape: list[int],
+    partition_dim: int,
+    free_dims: list[int],
+    hbm_dim_size_strs: list[str],
+    partition_offset_var: "str | None",
+    _resolve_dim: Callable,
+    _tensor_dim_size_str: Callable,
+) -> "tuple[list[str], list[bool], int, list[int], list[int], list[str], str | None]":
+    """Combine leading dimensions into a single flat partition slice.
+
+    For 3D+ tensors that have been reshaped to 2D at kernel entry ([B,M,K] to
+    [B*M, K]), this function combines the leading slice_parts into one
+    flattened partition slice and squeezes output_shape to 2D.
+
+    Returns updated (slice_parts, is_scalar_dim, partition_dim, free_dims,
+                     output_shape, hbm_dim_size_strs, partition_offset_var)
+    """
+    from .._compiler.ast_extension import statement_from_string
+
+    # Combine all leading slice_parts (except the last) into one flat slice.
+    # Each leading slice is "offset:offset+block_size".  For the flattened
+    # tensor the row index is: batch_off * dim1_size + dim1_off (+ ...).
+    # Extract (offset, block_size) pairs from leading slice_parts.
+    leading_offsets: list[str] = []
+    leading_block_sizes: list[int] = []
+    original_dim_sizes: list[int] = []
+    for dim_i in range(tensor.dim() - 1):
+        sp = slice_parts[dim_i]
+        if ":" in sp:
+            off_str, end_str = sp.split(":")
+            off_str = off_str.strip()
+            leading_offsets.append(off_str)
+            # Try to extract numeric block size
+            # end_str is like "offset_0+128" or "expr_a + expr_b+128"
+            # Use rfind to handle compound expressions: "a + b+128" -> last '+' before 128
+            plus_idx = end_str.rfind("+")
+            if plus_idx >= 0:
+                bs_str = end_str[plus_idx + 1:].strip()
+                try:
+                    leading_block_sizes.append(int(bs_str))
+                except ValueError:
+                    leading_block_sizes.append(1)
+            else:
+                # No "+": format is "0:size" -- block_size is the end value
+                end_str = end_str.strip()
+                try:
+                    end_val = int(end_str)
+                    start_val = int(off_str) if off_str.strip().isdigit() else 0
+                    leading_block_sizes.append(end_val - start_val)
+                except (ValueError, TypeError):
+                    leading_block_sizes.append(1)
+        else:
+            # Scalar index (block_size=1)
+            leading_offsets.append(sp.strip())
+            leading_block_sizes.append(1)
+        original_dim_sizes.append(
+            int(tensor.size(dim_i)) if isinstance(tensor.size(dim_i), int)
+            else _resolve_dim(tensor.size(dim_i))
+        )
+
+    # Build flat offset: off0 * size1 * size2 * ... + off1 * size2 * ... + offN
+    # and flat block_size: product of all leading block sizes
+    flat_offset_parts: list[str] = []
+    for j, off in enumerate(leading_offsets):
+        multiplier_parts = [str(original_dim_sizes[k]) for k in range(j + 1, len(original_dim_sizes))]
+        if multiplier_parts:
+            multiplier = " * ".join(multiplier_parts)
+            # Parenthesize compound offset expressions to ensure correct precedence.
+            # e.g. "offset_2 + mul_chunk" * 2 must become "(offset_2 + mul_chunk) * 2"
+            # not "offset_2 + mul_chunk * 2" (wrong due to operator precedence).
+            off_expr = f"({off})" if ("+" in off or "-" in off) else off
+            flat_offset_parts.append(f"{off_expr} * {multiplier}")
+        else:
+            flat_offset_parts.append(off)
+    flat_offset = " + ".join(flat_offset_parts)
+    flat_block_size = 1
+    for bs in leading_block_sizes:
+        flat_block_size *= bs
+
+    # Strided-gather detection for loads:
+    # If a tile dimension (block_size > 1) is followed by scalar dimension(s)
+    # (block_size == 1), the flat row indices form an arithmetic sequence with
+    # stride = product of dimensions after the tile.  Emit an ap() gather
+    # instead of a consecutive DMA.
+    # Example: w[seqlen_tile=32, head_scalar=1, :] on [S, H, D]:
+    #   flat rows needed: tile_off, tile_off+H, tile_off+2H, ...
+    #   NOT: tile_off, tile_off+1, tile_off+2, ...
+    _tile_dim_idx_ld = None
+    for _di, _bs in enumerate(leading_block_sizes):
+        if _bs > 1:
+            if _tile_dim_idx_ld is None:
+                _tile_dim_idx_ld = _di
+            else:
+                _tile_dim_idx_ld = None  # multiple tiled dims -- not simple stride
+                break
+    _use_strided_gather = (
+        _tile_dim_idx_ld is not None
+        and _tile_dim_idx_ld < len(leading_block_sizes) - 1
+        and all(leading_block_sizes[_di] == 1
+                for _di in range(_tile_dim_idx_ld + 1, len(leading_block_sizes)))
+        and not any(p.startswith(("__DYN_AP__", "__AP_ROW_GATHER__"))
+                    for p in slice_parts)
+    )
+    if _use_strided_gather:
+        _tile_bs_ld = leading_block_sizes[_tile_dim_idx_ld]
+        _tile_off_ld = leading_offsets[_tile_dim_idx_ld]
+        # stride = product of dim sizes after the tile dim
+        _stride_ld = 1
+        for _di in range(_tile_dim_idx_ld + 1, len(original_dim_sizes)):
+            _stride_ld *= original_dim_sizes[_di]
+        if _stride_ld > 1:
+            # scalar offset = sum of (leading_offsets[di] * prod_of_later_dims)
+            # for dims AFTER the tile dim
+            _scalar_parts_ld: list[str] = []
+            for _di in range(_tile_dim_idx_ld + 1, len(leading_offsets)):
+                _m = [str(original_dim_sizes[_k])
+                      for _k in range(_di + 1, len(original_dim_sizes))]
+                _off_e = leading_offsets[_di]
+                if _m:
+                    _off_p = f"({_off_e})" if ("+" in _off_e or "-" in _off_e) else _off_e
+                    _scalar_parts_ld.append(f"{_off_p} * {' * '.join(_m)}")
+                else:
+                    _scalar_parts_ld.append(_off_e)
+            # prefix offset = sum of (leading_offsets[di] * prod) for dims BEFORE tile
+            _prefix_parts_ld: list[str] = []
+            for _di in range(0, _tile_dim_idx_ld):
+                _m = [str(original_dim_sizes[_k])
+                      for _k in range(_di + 1, len(original_dim_sizes))]
+                _off_e = leading_offsets[_di]
+                if _m:
+                    _off_p = f"({_off_e})" if ("+" in _off_e or "-" in _off_e) else _off_e
+                    _prefix_parts_ld.append(f"{_off_p} * {' * '.join(_m)}")
+                else:
+                    _prefix_parts_ld.append(_off_e)
+            _scalar_off_ld = " + ".join(_scalar_parts_ld) if _scalar_parts_ld else "0"
+            _prefix_off_ld = " + ".join(_prefix_parts_ld) if _prefix_parts_ld else None
+
+            _iota_ld = device_fn.new_var("_sg_iota", dce=True)
+            device_fn._nki_sbuf_shapes[_iota_ld] = [1, _tile_bs_ld]
+            device_fn._nki_sbuf_dtypes[_iota_ld] = "nl.int32"
+            state.codegen.add_statement(statement_from_string(
+                f"{_iota_ld} = nl.ndarray([1, {_tile_bs_ld}], nl.int32, buffer=nl.sbuf)"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"nisa.iota(dst={_iota_ld}, pattern=[[1, {_tile_bs_ld}]], "
+                f"offset={_tile_off_ld}, channel_multiplier=0)"
+            ))
+            _scaled_ld = device_fn.new_var("_sg_scaled", dce=True)
+            device_fn._nki_sbuf_shapes[_scaled_ld] = [1, _tile_bs_ld]
+            device_fn._nki_sbuf_dtypes[_scaled_ld] = "nl.int32"
+            state.codegen.add_statement(statement_from_string(
+                f"{_scaled_ld} = nl.ndarray([1, {_tile_bs_ld}], nl.int32, buffer=nl.sbuf)"
+            ))
+            state.codegen.add_statement(statement_from_string(
+                f"nisa.tensor_scalar(dst={_scaled_ld}, data={_iota_ld}, "
+                f"op0=nl.multiply, operand0={_stride_ld}, op1=None)"
+            ))
+            _row_ld = device_fn.new_var("_sg_row", dce=True)
+            device_fn._nki_sbuf_shapes[_row_ld] = [1, _tile_bs_ld]
+            device_fn._nki_sbuf_dtypes[_row_ld] = "nl.int32"
+            state.codegen.add_statement(statement_from_string(
+                f"{_row_ld} = nl.ndarray([1, {_tile_bs_ld}], nl.int32, buffer=nl.sbuf)"
+            ))
+            if _scalar_off_ld == "0":
+                state.codegen.add_statement(statement_from_string(
+                    f"nisa.tensor_copy(dst={_row_ld}, src={_scaled_ld})"
+                ))
+            else:
+                state.codegen.add_statement(statement_from_string(
+                    f"nisa.tensor_scalar(dst={_row_ld}, data={_scaled_ld}, "
+                    f"op0=nl.add, operand0={_scalar_off_ld}, op1=None)"
+                ))
+            if _prefix_off_ld is not None:
+                state.codegen.add_statement(statement_from_string(
+                    f"nisa.tensor_scalar(dst={_row_ld}, data={_row_ld}, "
+                    f"op0=nl.add, operand0={_prefix_off_ld}, op1=None)"
+                ))
+            _vec_ld = _nki_as_uint32_p1_vector(state, _row_ld, _tile_bs_ld)
+            if _vec_ld is not None:
+                _flat_hbm_ld = 1
+                for _ds in original_dim_sizes:
+                    _flat_hbm_ld *= _ds
+                _d_int_ld = _resolve_dim(tensor.size(tensor.dim() - 1))
+                slice_parts = [f"__AP_ROW_GATHER__{_vec_ld}__", f"0:{_d_int_ld}"]
+                is_scalar_dim = [False, False]
+                partition_dim = _tile_bs_ld
+                free_dims = [_d_int_ld]
+                output_shape = [partition_dim] + free_dims
+                hbm_dim_size_strs = [str(_flat_hbm_ld), str(_d_int_ld)]
+                partition_offset_var = None
+                flat_hbm_partition = _flat_hbm_ld
+                _use_strided_gather = False  # signal: skip the flat_slice below
+                # override the flat_offset logic
+                flat_offset = "(0)"
+                flat_block_size = _tile_bs_ld
+
+    if _use_strided_gather is False and slice_parts[0].startswith("__AP_ROW_GATHER__"):
+        # Strided gather path succeeded -- don't emit the consecutive slice
+        pass
+    else:
+        # Replace leading slice_parts with one combined slice
+        flat_slice = f"({flat_offset}):({flat_offset}) + {flat_block_size}"
+        slice_parts = [flat_slice] + [slice_parts[-1]]
+        # Fix partition_offset_var to point to the flat offset expression
+        partition_offset_var = f"({flat_offset})"
+        # Squeeze output_shape to 2D
+        partition_dim = flat_block_size
+        free_dims = [_resolve_dim(output_shape[-1])]
+        output_shape = [partition_dim] + free_dims
+
+    if not (slice_parts[0].startswith("__AP_ROW_GATHER__")):
+        flat_hbm_partition = 1
+        for dim_size in original_dim_sizes:
+            flat_hbm_partition *= dim_size
+        hbm_dim_size_strs = [
+            str(flat_hbm_partition),
+            _tensor_dim_size_str(tensor.dim() - 1),
+        ]
+
+    return (slice_parts, is_scalar_dim, partition_dim, free_dims,
+            output_shape, hbm_dim_size_strs, partition_offset_var)
+
+
 @_decorators.codegen(load, "nki")
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import create
@@ -3497,26 +3728,50 @@ def _(state: CodegenState) -> ast.AST:
         )
         return expr_from_string(sbuf_name)
 
-    # 3D+ tensors: reshaped to 2D at kernel entry ([B,M,K] → [B*M, K]).
-    # Combine the leading slice_parts into one flattened partition slice
-    # and squeeze output_shape to 2D.
-    if tensor.dim() > 2 and len(slice_parts) > 2:
-        # Combine all leading slice_parts (except the last) into one flat slice.
-        # Each leading slice is "offset:offset+block_size".  For the flattened
-        # tensor the row index is: batch_off * dim1_size + dim1_off (+ ...).
-        # Extract (offset, block_size) pairs from leading slice_parts.
+    def _combine_leading_dims(
+        slice_parts: list[str],
+        is_scalar_dim: list[bool],
+        tensor: "torch.Tensor",
+        partition_dim: int,
+        free_dims: list[int],
+        output_shape: list[int],
+        hbm_dim_size_strs: list[str],
+        partition_offset_var: "str | None",
+    ) -> "tuple[list[str], list[bool], int, list[int], list[int], list[str], str | None]":
+        """Combine leading slice_parts into a single flat partition slice for ND tensors.
+
+        Handles three cases:
+        1. Indirect leading dim (e.g. __AP_ROW_GATHER__) followed by scalar dim(s):
+           Multiplies the gather vector by H and adds the scalar to get a flat index.
+           This subsumes the old 3D early-exit block.
+        2. Tile dim followed by scalar dim(s) (strided gather):
+           Emits iota * stride + scalar_offset via ap().
+        3. All contiguous dims:
+           Computes flat_offset = sum(offset_i * prod_later_dims), plain DMA.
+
+        Returns updated (slice_parts, is_scalar_dim, partition_dim, free_dims,
+                         output_shape, hbm_dim_size_strs, partition_offset_var).
+        """
+        if not (tensor.dim() > 2 and len(slice_parts) > 2):
+            return slice_parts, is_scalar_dim, partition_dim, free_dims, output_shape, hbm_dim_size_strs, partition_offset_var
+
+        # Extract (offset, block_size) pairs from leading slice_parts
         leading_offsets: list[str] = []
         leading_block_sizes: list[int] = []
         original_dim_sizes: list[int] = []
         for dim_i in range(tensor.dim() - 1):
             sp = slice_parts[dim_i]
-            if ":" in sp:
-                off_str, end_str = sp.split(":")
+            if sp.startswith("__AP_ROW_GATHER__"):
+                # Indirect gather dim — extract count from vector shape
+                vec_var_inner = sp[len("__AP_ROW_GATHER__"):].rstrip("_")
+                vec_shape_inner = device_fn._nki_sbuf_shapes.get(vec_var_inner)
+                count_inner = int(vec_shape_inner[0]) if vec_shape_inner else partition_dim
+                leading_offsets.append(sp)  # sentinel as "offset"
+                leading_block_sizes.append(count_inner)
+            elif ":" in sp:
+                off_str, end_str = sp.split(":", 1)
                 off_str = off_str.strip()
                 leading_offsets.append(off_str)
-                # Try to extract numeric block size
-                # end_str is like "offset_0+128" or "expr_a + expr_b+128"
-                # Use rfind to handle compound expressions: "a + b+128" → last '+' before 128
                 plus_idx = end_str.rfind("+")
                 if plus_idx >= 0:
                     bs_str = end_str[plus_idx + 1:].strip()
@@ -3525,7 +3780,6 @@ def _(state: CodegenState) -> ast.AST:
                     except ValueError:
                         leading_block_sizes.append(1)
                 else:
-                    # No "+": format is "0:size" — block_size is the end value
                     end_str = end_str.strip()
                     try:
                         end_val = int(end_str)
@@ -3534,7 +3788,6 @@ def _(state: CodegenState) -> ast.AST:
                     except (ValueError, TypeError):
                         leading_block_sizes.append(1)
             else:
-                # Scalar index (block_size=1)
                 leading_offsets.append(sp.strip())
                 leading_block_sizes.append(1)
             original_dim_sizes.append(
@@ -3542,40 +3795,74 @@ def _(state: CodegenState) -> ast.AST:
                 else _resolve_dim(tensor.size(dim_i))
             )
 
-        # Build flat offset: off0 * size1 * size2 * ... + off1 * size2 * ... + offN
-        # and flat block_size: product of all leading block sizes
-        flat_offset_parts: list[str] = []
-        for j, off in enumerate(leading_offsets):
-            multiplier_parts = [str(original_dim_sizes[k]) for k in range(j + 1, len(original_dim_sizes))]
-            if multiplier_parts:
-                multiplier = " * ".join(multiplier_parts)
-                # Parenthesize compound offset expressions to ensure correct precedence.
-                # e.g. "offset_2 + mul_chunk" * 2 must become "(offset_2 + mul_chunk) * 2"
-                # not "offset_2 + mul_chunk * 2" (wrong due to operator precedence).
-                off_expr = f"({off})" if ("+" in off or "-" in off) else off
-                flat_offset_parts.append(f"{off_expr} * {multiplier}")
-            else:
-                flat_offset_parts.append(off)
-        flat_offset = " + ".join(flat_offset_parts)
-        flat_block_size = 1
-        for bs in leading_block_sizes:
-            flat_block_size *= bs
+        from .._compiler.ast_extension import statement_from_string as _sfs_cld
 
-        # Strided-gather detection for loads:
-        # If a tile dimension (block_size > 1) is followed by scalar dimension(s)
-        # (block_size == 1), the flat row indices form an arithmetic sequence with
-        # stride = product of dimensions after the tile.  Emit an ap() gather
-        # instead of a consecutive DMA.
-        # Example: w[seqlen_tile=32, head_scalar=1, :] on [S, H, D]:
-        #   flat rows needed: tile_off, tile_off+H, tile_off+2H, ...
-        #   NOT: tile_off, tile_off+1, tile_off+2, ...
+        # ── Case 1: indirect leading dim (old 3D early-exit) ──────────────────
+        # dim 0 is __AP_ROW_GATHER__, dim 1..N-1 are scalar/const, dim N is free.
+        # Compute flat index = gather_vec * H * ... + scalar_offset.
+        _has_indirect = (
+            leading_offsets
+            and leading_offsets[0].startswith("__AP_ROW_GATHER__")
+            and all(bs == 1 for bs in leading_block_sizes[1:])
+        )
+        if _has_indirect:
+            vec_var_0 = leading_offsets[0][len("__AP_ROW_GATHER__"):].rstrip("_")
+            p_count_0 = leading_block_sizes[0]
+            # stride = product of dim sizes for dims 1..N-2 (all scalar dims)
+            h_product = 1
+            for _k in range(1, len(original_dim_sizes)):
+                h_product *= original_dim_sizes[_k]
+            d_int_0 = _resolve_dim(tensor.size(tensor.dim() - 1))
+            # scalar offset from all scalar dims (weighted by later dim sizes)
+            scalar_parts_0: list[str] = []
+            for _di in range(1, len(leading_offsets)):
+                _m = [str(original_dim_sizes[_k])
+                      for _k in range(_di + 1, len(original_dim_sizes))]
+                _off_e = leading_offsets[_di]
+                if _m:
+                    _off_p = f"({_off_e})" if ("+" in _off_e or "-" in _off_e) else _off_e
+                    scalar_parts_0.append(f"{_off_p} * {' * '.join(_m)}")
+                else:
+                    scalar_parts_0.append(_off_e)
+            scalar_off_0 = " + ".join(scalar_parts_0) if scalar_parts_0 else None
+
+            flat_var_0 = device_fn.new_var("_3d_flat_idx", dce=True)
+            device_fn._nki_sbuf_shapes[flat_var_0] = [p_count_0, 1]
+            device_fn._nki_sbuf_dtypes[flat_var_0] = "nl.uint32"
+            state.codegen.add_statement(_sfs_cld(
+                f"{flat_var_0} = nl.ndarray([{p_count_0}, 1], nl.uint32, buffer=nl.sbuf)"
+            ))
+            state.codegen.add_statement(_sfs_cld(
+                f"nisa.tensor_copy(dst={flat_var_0}, src={vec_var_0})"
+            ))
+            if h_product != 1:
+                state.codegen.add_statement(_sfs_cld(
+                    f"nisa.tensor_scalar(dst={flat_var_0}, data={flat_var_0}, "
+                    f"op0=nl.multiply, operand0={h_product}, op1=None)"
+                ))
+            if scalar_off_0 is not None:
+                state.codegen.add_statement(_sfs_cld(
+                    f"nisa.tensor_scalar(dst={flat_var_0}, data={flat_var_0}, "
+                    f"op0=nl.add, operand0={scalar_off_0}, op1=None)"
+                ))
+            total_rows_0 = int(tensor.numel()) // d_int_0
+            slice_parts = [f"__AP_ROW_GATHER__{flat_var_0}__", f"0:{d_int_0}"]
+            is_scalar_dim = [False, False]
+            partition_dim = p_count_0
+            free_dims = [d_int_0]
+            output_shape = [partition_dim] + free_dims
+            hbm_dim_size_strs = [str(total_rows_0), str(d_int_0)]
+            partition_offset_var = None
+            return slice_parts, is_scalar_dim, partition_dim, free_dims, output_shape, hbm_dim_size_strs, partition_offset_var
+
+        # ── Case 2: strided gather ─────────────────────────────────────────────
         _tile_dim_idx_ld = None
         for _di, _bs in enumerate(leading_block_sizes):
             if _bs > 1:
                 if _tile_dim_idx_ld is None:
                     _tile_dim_idx_ld = _di
                 else:
-                    _tile_dim_idx_ld = None  # multiple tiled dims — not simple stride
+                    _tile_dim_idx_ld = None
                     break
         _use_strided_gather = (
             _tile_dim_idx_ld is not None
@@ -3588,14 +3875,10 @@ def _(state: CodegenState) -> ast.AST:
         if _use_strided_gather:
             _tile_bs_ld = leading_block_sizes[_tile_dim_idx_ld]
             _tile_off_ld = leading_offsets[_tile_dim_idx_ld]
-            # stride = product of dim sizes after the tile dim
             _stride_ld = 1
             for _di in range(_tile_dim_idx_ld + 1, len(original_dim_sizes)):
                 _stride_ld *= original_dim_sizes[_di]
             if _stride_ld > 1:
-                from .._compiler.ast_extension import statement_from_string as _sfs_ld
-                # scalar offset = sum of (leading_offsets[di] * prod_of_later_dims)
-                # for dims AFTER the tile dim
                 _scalar_parts_ld: list[str] = []
                 for _di in range(_tile_dim_idx_ld + 1, len(leading_offsets)):
                     _m = [str(original_dim_sizes[_k])
@@ -3606,7 +3889,6 @@ def _(state: CodegenState) -> ast.AST:
                         _scalar_parts_ld.append(f"{_off_p} * {' * '.join(_m)}")
                     else:
                         _scalar_parts_ld.append(_off_e)
-                # prefix offset = sum of (leading_offsets[di] * prod) for dims BEFORE tile
                 _prefix_parts_ld: list[str] = []
                 for _di in range(0, _tile_dim_idx_ld):
                     _m = [str(original_dim_sizes[_k])
@@ -3623,40 +3905,40 @@ def _(state: CodegenState) -> ast.AST:
                 _iota_ld = device_fn.new_var("_sg_iota", dce=True)
                 device_fn._nki_sbuf_shapes[_iota_ld] = [1, _tile_bs_ld]
                 device_fn._nki_sbuf_dtypes[_iota_ld] = "nl.int32"
-                state.codegen.add_statement(_sfs_ld(
+                state.codegen.add_statement(_sfs_cld(
                     f"{_iota_ld} = nl.ndarray([1, {_tile_bs_ld}], nl.int32, buffer=nl.sbuf)"
                 ))
-                state.codegen.add_statement(_sfs_ld(
+                state.codegen.add_statement(_sfs_cld(
                     f"nisa.iota(dst={_iota_ld}, pattern=[[1, {_tile_bs_ld}]], "
                     f"offset={_tile_off_ld}, channel_multiplier=0)"
                 ))
                 _scaled_ld = device_fn.new_var("_sg_scaled", dce=True)
                 device_fn._nki_sbuf_shapes[_scaled_ld] = [1, _tile_bs_ld]
                 device_fn._nki_sbuf_dtypes[_scaled_ld] = "nl.int32"
-                state.codegen.add_statement(_sfs_ld(
+                state.codegen.add_statement(_sfs_cld(
                     f"{_scaled_ld} = nl.ndarray([1, {_tile_bs_ld}], nl.int32, buffer=nl.sbuf)"
                 ))
-                state.codegen.add_statement(_sfs_ld(
+                state.codegen.add_statement(_sfs_cld(
                     f"nisa.tensor_scalar(dst={_scaled_ld}, data={_iota_ld}, "
                     f"op0=nl.multiply, operand0={_stride_ld}, op1=None)"
                 ))
                 _row_ld = device_fn.new_var("_sg_row", dce=True)
                 device_fn._nki_sbuf_shapes[_row_ld] = [1, _tile_bs_ld]
                 device_fn._nki_sbuf_dtypes[_row_ld] = "nl.int32"
-                state.codegen.add_statement(_sfs_ld(
+                state.codegen.add_statement(_sfs_cld(
                     f"{_row_ld} = nl.ndarray([1, {_tile_bs_ld}], nl.int32, buffer=nl.sbuf)"
                 ))
                 if _scalar_off_ld == "0":
-                    state.codegen.add_statement(_sfs_ld(
+                    state.codegen.add_statement(_sfs_cld(
                         f"nisa.tensor_copy(dst={_row_ld}, src={_scaled_ld})"
                     ))
                 else:
-                    state.codegen.add_statement(_sfs_ld(
+                    state.codegen.add_statement(_sfs_cld(
                         f"nisa.tensor_scalar(dst={_row_ld}, data={_scaled_ld}, "
                         f"op0=nl.add, operand0={_scalar_off_ld}, op1=None)"
                     ))
                 if _prefix_off_ld is not None:
-                    state.codegen.add_statement(_sfs_ld(
+                    state.codegen.add_statement(_sfs_cld(
                         f"nisa.tensor_scalar(dst={_row_ld}, data={_row_ld}, "
                         f"op0=nl.add, operand0={_prefix_off_ld}, op1=None)"
                     ))
@@ -3673,35 +3955,59 @@ def _(state: CodegenState) -> ast.AST:
                     output_shape = [partition_dim] + free_dims
                     hbm_dim_size_strs = [str(_flat_hbm_ld), str(_d_int_ld)]
                     partition_offset_var = None
-                    flat_hbm_partition = _flat_hbm_ld
-                    _use_strided_gather = False  # signal: skip the flat_slice below
-                    # override the flat_offset logic
-                    flat_offset = "(0)"
-                    flat_block_size = _tile_bs_ld
+                    return slice_parts, is_scalar_dim, partition_dim, free_dims, output_shape, hbm_dim_size_strs, partition_offset_var
 
-        if _use_strided_gather is False and slice_parts[0].startswith("__AP_ROW_GATHER__"):
-            # Strided gather path succeeded — don't emit the consecutive slice
-            pass
-        else:
-            # Replace leading slice_parts with one combined slice
-            flat_slice = f"({flat_offset}):({flat_offset}) + {flat_block_size}"
-            slice_parts = [flat_slice] + [slice_parts[-1]]
-            # Fix partition_offset_var to point to the flat offset expression
-            partition_offset_var = f"({flat_offset})"
-            # Squeeze output_shape to 2D
-            partition_dim = flat_block_size
-            free_dims = [_resolve_dim(output_shape[-1])]
-            output_shape = [partition_dim] + free_dims
+        # ── Case 3: all contiguous — plain flat DMA ────────────────────────────
+        flat_offset_parts: list[str] = []
+        for j, off in enumerate(leading_offsets):
+            multiplier_parts = [str(original_dim_sizes[k]) for k in range(j + 1, len(original_dim_sizes))]
+            if multiplier_parts:
+                multiplier = " * ".join(multiplier_parts)
+                off_expr = f"({off})" if ("+" in off or "-" in off) else off
+                flat_offset_parts.append(f"{off_expr} * {multiplier}")
+            else:
+                flat_offset_parts.append(off)
+        flat_offset = " + ".join(flat_offset_parts)
+        flat_block_size = 1
+        for bs in leading_block_sizes:
+            flat_block_size *= bs
 
-        if not (slice_parts[0].startswith("__AP_ROW_GATHER__")):
-            flat_hbm_partition = 1
-            for dim_size in original_dim_sizes:
-                flat_hbm_partition *= dim_size
-            hbm_dim_size_strs = [
-                str(flat_hbm_partition),
-                _tensor_dim_size_str(tensor.dim() - 1),
-            ]
+        flat_slice = f"({flat_offset}):({flat_offset}) + {flat_block_size}"
+        slice_parts = [flat_slice] + [slice_parts[-1]]
+        partition_offset_var = f"({flat_offset})"
+        partition_dim = flat_block_size
+        free_dims = [_resolve_dim(output_shape[-1])]
+        output_shape = [partition_dim] + free_dims
+        flat_hbm_partition = 1
+        for dim_size in original_dim_sizes:
+            flat_hbm_partition *= dim_size
+        hbm_dim_size_strs = [
+            str(flat_hbm_partition),
+            _tensor_dim_size_str(tensor.dim() - 1),
+        ]
+        return slice_parts, is_scalar_dim, partition_dim, free_dims, output_shape, hbm_dim_size_strs, partition_offset_var
 
+    # 3D+ tensors: reshaped to 2D at kernel entry ([B,M,K] → [B*M, K]).
+    # Combine the leading slice_parts into one flattened partition slice
+    # and squeeze output_shape to 2D.
+    (
+        slice_parts,
+        is_scalar_dim,
+        partition_dim,
+        free_dims,
+        output_shape,
+        hbm_dim_size_strs,
+        partition_offset_var,
+    ) = _combine_leading_dims(
+        slice_parts=slice_parts,
+        is_scalar_dim=is_scalar_dim,
+        tensor=tensor,
+        partition_dim=partition_dim,
+        free_dims=free_dims,
+        output_shape=output_shape,
+        hbm_dim_size_strs=hbm_dim_size_strs,
+        partition_offset_var=partition_offset_var,
+    )
     def _build_hbm_src(name_str: str, parts: list[str]) -> str:
         """Build an HBM src expression, converting __DYN_AP__counter__size
         sentinels to .ap(pattern=..., scalar_offset=counter, indirect_dim=N)

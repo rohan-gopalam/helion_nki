@@ -532,18 +532,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
-                # After all nested content is emitted, remove this loop's
-                # block_ids from _nki_dyn_loops.  This ensures sequential
-                # sibling jagged tiles (e.g. the three tile_k passes in
-                # jagged_layer_norm) don't see each other as "active" and
-                # incorrectly trigger the _is_outer_jagged path.  Nested
-                # tiles (e.g. jagged_mean's tile_k inside tile_m) are fully
-                # processed during the yield above, so they correctly see
-                # the outer tile's _nki_dyn_loops entry while running.
-                _dyn_loops_ga = getattr(self.device_function, "_nki_dyn_loops", None)
-                if _dyn_loops_ga is not None:
-                    for _bid_ga in device_loop.block_ids:
-                        _dyn_loops_ga.pop(_bid_ga, None)
+                # DISABLED: this cleanup was causing jagged_layer_norm variance
+                # pass to take an unmasked codegen path.  The _is_outer_jagged
+                # detection in tile_strategy.py already uses active_device_loops
+                # (not _nki_dyn_loops) for nesting detection, so this cleanup
+                # is not needed for sequential-sibling differentiation.
+                # TODO: investigate whether this can be re-enabled safely.
+                # _dyn_loops_ga = getattr(self.device_function, "_nki_dyn_loops", None)
+                # if _dyn_loops_ga is not None:
+                #     for _bid_ga in device_loop.block_ids:
+                #         _dyn_loops_ga.pop(_bid_ga, None)
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)

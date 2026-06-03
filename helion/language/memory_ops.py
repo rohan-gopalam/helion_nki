@@ -3173,6 +3173,34 @@ def _(state: CodegenState) -> ast.AST:
                     # Check if this is self-op (e.g. mul tile * tile for squaring).
                     # Also handles Helion trace of x*x as mul(x, None) (single-arg form).
                     if _arg0 is _arg1 or (_arg1 is None and _nki_op == "nl.multiply"):
+                        # Before squaring, re-apply the row predicate mask to zero out
+                        # OOB positions.  A prior subtract chain op (e.g. x - mean) turns
+                        # OOB zeros into -mean; squaring them gives mean^2 which inflates
+                        # the accumulated variance.  Re-masking ensures OOB^2 = 0.
+                        # Only apply when pred_name and _cur_tile have matching shapes.
+                        _cur_sq_shape = device_fn._nki_sbuf_shapes.get(_cur_tile)
+                        _pred_sq_shape = device_fn._nki_sbuf_shapes.get(pred_name) if pred_name else None
+                        if (
+                            pred_name is not None
+                            and _cur_sq_shape is not None
+                            and _pred_sq_shape is not None
+                            and list(_cur_sq_shape) == list(_pred_sq_shape)
+                        ):
+                            _sq_remasked = device_fn.new_var("_nki_sq_remasked", dce=True)
+                            device_fn._nki_sbuf_shapes[_sq_remasked] = list(_cur_sq_shape)
+                            device_fn._nki_sbuf_dtypes[_sq_remasked] = dtype_str
+                            body.append(statement_from_string(
+                                f"{_sq_remasked} = nl.ndarray([{_cur_sq_shape[0]}, {_cur_sq_shape[1]}], "
+                                f"{dtype_str}, buffer=nl.sbuf)"
+                            ))
+                            body.append(statement_from_string(
+                                f"nisa.memset({_sq_remasked}, value=0)"
+                            ))
+                            body.append(statement_from_string(
+                                f"nisa.tensor_copy_predicated(dst={_sq_remasked}, "
+                                f"src={_cur_tile}, predicate={pred_name})"
+                            ))
+                            _cur_tile = _sq_remasked
                         body.append(
                             statement_from_string(
                                 f"nisa.tensor_tensor(dst={_cur_tile}, data1={_cur_tile}, "

@@ -2355,6 +2355,106 @@ def _(state: CodegenState) -> ast.AST:
                     "oob_mode=nisa.oob_mode.skip)"
                 )
             )
+
+            # When inside a jagged tile loop, oob_mode=skip only skips
+            # physically-OOB addresses.  Logically-invalid k-positions
+            # (k >= seqlen) still have valid HBM addresses (other rows' data)
+            # and get incorrect values from the DMA.  Apply the jagged auto-
+            # mask via predicated copy to zero out invalid k-positions.
+            # For float buffers we use -inf fill so that:
+            #   max(-inf, x) = x  (correct for amax reduction)
+            #   exp(-inf)    = 0  (correct for exp-sum reduction)
+            _active_lps_fg = getattr(state.codegen, "active_device_loops", {})
+            from .._compiler.compile_environment import CompileEnvironment as _CE_fg
+            _env_fg = _CE_fg.current()
+            _fg_jagged_mask: str | None = None
+            _fg_mask_shape: list[int] | None = None
+            for _bid_fg in sorted(_active_lps_fg.keys(), reverse=True):
+                if not _env_fg.is_jagged_tile(_bid_fg):
+                    continue
+                _bid_loops_fg = _active_lps_fg.get(_bid_fg, [])
+                _strat_fg = _bid_loops_fg[-1].strategy if _bid_loops_fg else None
+                if _strat_fg is None or not hasattr(_strat_fg, "mask_var"):
+                    continue
+                try:
+                    _mv_fg = _strat_fg.mask_var(_bid_fg)
+                except Exception:
+                    continue
+                if _mv_fg is None:
+                    continue
+                _ms_fg = _nki_lookup_sbuf_shape_dtype(state, _mv_fg)[0]
+                if _ms_fg is not None and len(_ms_fg) == 2 and _ms_fg[1] == p_count:
+                    # mask shape is [tile_b, k_count] where k_count == p_count
+                    _fg_jagged_mask = _mv_fg
+                    _fg_mask_shape = _ms_fg
+                    break
+
+            if _fg_jagged_mask is not None and dtype_str in ("nl.float32", "nl.float16", "nl.bfloat16"):
+                _tb_size = _fg_mask_shape[0]  # tile_b dimension of mask
+                _k_size = _fg_mask_shape[1]   # k_count = p_count
+                # Transpose mask [tb, k] → [k, tb] then broadcast to [k, f_count]=[p_count, f_count]
+                _fg_mcast = device_fn.new_var("_fg_mask_cast", dce=True)
+                _fg_mtr = device_fn.new_var("_fg_mask_tr", dce=True)
+                _fg_mcol = device_fn.new_var("_fg_mask_col", dce=True)
+                _fg_mbcast = device_fn.new_var("_fg_mask_bcast", dce=True)
+                _fg_mpred = device_fn.new_var("_fg_mask_pred", dce=True)
+                _fg_masked = device_fn.new_var("_fg_masked_load", dce=True)
+                _fg_mtr_dtype = "nl.float32"
+                device_fn._nki_sbuf_shapes[_fg_mcast] = [_tb_size, _k_size]
+                device_fn._nki_sbuf_dtypes[_fg_mcast] = _fg_mtr_dtype
+                device_fn._nki_sbuf_shapes[_fg_mtr] = [_k_size, _tb_size]
+                device_fn._nki_sbuf_dtypes[_fg_mtr] = _fg_mtr_dtype
+                device_fn._nki_sbuf_shapes[_fg_mcol] = [_k_size, 1]
+                device_fn._nki_sbuf_dtypes[_fg_mcol] = "nl.int32"
+                device_fn._nki_sbuf_shapes[_fg_mbcast] = [p_count, f_count]
+                device_fn._nki_sbuf_dtypes[_fg_mbcast] = "nl.int32"
+                device_fn._nki_sbuf_shapes[_fg_mpred] = [p_count, f_count]
+                device_fn._nki_sbuf_dtypes[_fg_mpred] = "nl.uint32"
+                device_fn._nki_sbuf_shapes[_fg_masked] = [p_count, f_count]
+                device_fn._nki_sbuf_dtypes[_fg_masked] = dtype_str
+                # Emit mask broadcast: [tb, k] → cast → transpose psum → [k, 1] → broadcast [k, f]
+                state.codegen.add_statement(statement_from_string(
+                    f"{_fg_mcast} = nl.ndarray([{_tb_size}, {_k_size}], {_fg_mtr_dtype}, buffer=nl.sbuf)"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"nisa.activation(dst={_fg_mcast}, op=nl.copy, data={_fg_jagged_mask})"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"{_fg_mtr} = nl.ndarray([{_k_size}, {_tb_size}], {_fg_mtr_dtype}, buffer=nl.psum)"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"nisa.nc_transpose(dst={_fg_mtr}, data={_fg_mcast})"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"{_fg_mcol} = nl.ndarray([{_k_size}, 1], nl.int32, buffer=nl.sbuf)"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"nisa.tensor_scalar(dst={_fg_mcol}, data={_fg_mtr}, op0=nl.add, operand0=0.0)"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"{_fg_mbcast} = nl.broadcast_to({_fg_mcol}, shape=({p_count}, {f_count}))"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"{_fg_mpred} = nl.ndarray([{p_count}, {f_count}], nl.uint32, buffer=nl.sbuf)"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"nisa.tensor_copy(dst={_fg_mpred}, src={_fg_mbcast})"
+                ))
+                # Apply predicated copy: invalid k-positions get -inf fill
+                state.codegen.add_statement(statement_from_string(
+                    f"{_fg_masked} = nl.ndarray([{p_count}, {f_count}], {dtype_str}, buffer=nl.sbuf)"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"nisa.memset({_fg_masked}, value=float('-inf'))"
+                ))
+                state.codegen.add_statement(statement_from_string(
+                    f"nisa.tensor_copy_predicated(dst={_fg_masked}, src={sbuf_name}, predicate={_fg_mpred})"
+                ))
+                # Return the masked buffer instead of the raw gather
+                return expr_from_string(
+                    _emit_flat_masked(_fg_masked, [p_count, f_count])
+                )
+
             return expr_from_string(
                 _emit_flat_masked(sbuf_name, [p_count, f_count])
             )

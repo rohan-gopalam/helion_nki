@@ -6,6 +6,11 @@ This example demonstrates how to implement an addition operation between a jagge
 and a dense tensor using Helion.
 """
 
+# NOTE: This example is ported from the upstream pytorch-labs/helion repository.
+# Do NOT modify the kernel logic — it must remain identical to the upstream version
+# so that NKI backend changes can be validated against the canonical implementation.
+
+
 # %%
 # Imports
 # -------
@@ -71,10 +76,8 @@ def jagged_dense_add_2d(
         ends = x_offsets[tile0.index + 1]
         nnz = ends - starts
         max_nnz = nnz.amax()
-        for tile1 in hl.tile(out.size(1)):
-            out[tile0, tile1] = y[tile0, tile1]
         # Note, the dynamic loop bounds aren't strictly necessary for this example, since
-        # the output is dense, and we prefill it from y above. However,
+        # the output is dense, and we iterate over the rest in the next loop. However,
         # it is useful to illustrate how more complex jagged+jagged ops can be handled.
         for tile1 in hl.tile(0, max_nnz):
             x_slice = hl.load(
@@ -83,6 +86,9 @@ def jagged_dense_add_2d(
                 extra_mask=tile1.index[None, :] < nnz[:, None],
             )
             out[tile0, tile1] = y[tile0, tile1] + x_slice
+        for tile1 in hl.tile(max_nnz, out.size(1)):
+            # fill in any leftover columns with y
+            out[tile0, tile1] = y[tile0, tile1]
     return out
 
 

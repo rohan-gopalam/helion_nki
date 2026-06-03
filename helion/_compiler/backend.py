@@ -2394,7 +2394,7 @@ class NKIOpOverrides:
                         f"{_cast_mu} = nl.ndarray([{_shape_mu}], nl.float32, buffer=nl.sbuf)"
                     ))
                     state.add_statement(statement_from_string(
-                        f"nisa.tensor_copy(dst={_cast_mu}, src={_operand_for_emit_mu})"
+                        f"nisa.activation(dst={_cast_mu}, op=nl.copy, data={_operand_for_emit_mu})"
                     ))
                     _operand_for_emit_mu = _cast_mu
 
@@ -2535,7 +2535,7 @@ class NKIOpOverrides:
                 f"{cast_operand} = nl.ndarray([{operand_shape_str}], nl.float32, buffer=nl.sbuf)"
             ))
             state.add_statement(statement_from_string(
-                f"nisa.tensor_copy(dst={cast_operand}, src={operand_for_emit})"
+                f"nisa.activation(dst={cast_operand}, op=nl.copy, data={operand_for_emit})"
             ))
             operand_for_emit = cast_operand
         elif _is_bitwise_op and operand_shape is not None:

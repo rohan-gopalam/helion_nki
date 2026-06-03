@@ -2674,7 +2674,12 @@ def _(state: CodegenState) -> ast.AST:
                 _active_loops = getattr(state.codegen, "active_device_loops", {})
                 if _tile_dispatch is not None:
                     _strategies = list(getattr(_tile_dispatch, "block_id_to_strategy", {}).values())
-                    for _bid in list(_active_loops.keys()):
+                    # Iterate in descending block_id order so we pick the
+                    # innermost active jagged tile's mask (highest block_id =
+                    # latest allocated = innermost loop).  This prevents an
+                    # outer jagged tile's mask from being used as the row
+                    # predicate for a gather that lives inside the inner loop.
+                    for _bid in sorted(_active_loops.keys(), reverse=True):
                         _bid_loops = _active_loops.get(_bid, [])
                         _cur_strat = _bid_loops[-1].strategy if _bid_loops else None
                         if _cur_strat is not None and hasattr(_cur_strat, "mask_var"):

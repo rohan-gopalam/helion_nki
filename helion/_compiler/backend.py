@@ -4102,6 +4102,51 @@ class NKIOpOverrides:
             )
         pred_var = mask_cast_var
 
+        # If there are outer jagged tile masks in scope (jagged tiles converted
+        # to affine_range to avoid nested dynamic_range), AND them into the
+        # predicate so that positions beyond each row's jagged bound are zeroed.
+        # Outer jagged tiles are those in jagged_tile_parent_ids but NOT in
+        # _nki_dyn_loops (they were lowered as affine_range).
+        from .compile_environment import CompileEnvironment as _CE_where
+        _env_where = _CE_where.current()
+        _dyn_loops_where = getattr(state.device_function, "_nki_dyn_loops", {})
+        _active_loops_where = getattr(state.codegen, "active_device_loops", {})
+        _tile_dispatch_where = getattr(state, "tile_strategy", None)
+        if _tile_dispatch_where is not None and env.backend.name == "nki":
+            for _bid_w in sorted(_active_loops_where.keys()):
+                if not _env_where.is_jagged_tile(_bid_w):
+                    continue
+                if _bid_w in _dyn_loops_where:
+                    continue  # dynamic_range jagged tile; not an outer affine one
+                _bid_loops_w = _active_loops_where.get(_bid_w, [])
+                _strat_w = _bid_loops_w[-1].strategy if _bid_loops_w else None
+                if _strat_w is None or not hasattr(_strat_w, "mask_var"):
+                    continue
+                try:
+                    _outer_mask_w = _strat_w.mask_var(_bid_w)
+                except Exception:
+                    continue
+                if _outer_mask_w is None:
+                    continue
+                _outer_shape_w = state.device_function._nki_sbuf_shapes.get(_outer_mask_w)
+                if _outer_shape_w is None or list(_outer_shape_w) != list(out_shape):
+                    continue
+                # AND this outer mask into pred_var
+                _outer_u32_w = state.device_function.new_var("_nki_outer_jag_pred", dce=True)
+                state.device_function._nki_sbuf_shapes[_outer_u32_w] = list(out_shape)
+                state.device_function._nki_sbuf_dtypes[_outer_u32_w] = "nl.uint32"
+                state.add_statement(statement_from_string(
+                    f"{_outer_u32_w} = nl.ndarray([{out_shape[0]}, {out_shape[1]}], "
+                    f"nl.uint32, buffer=nl.sbuf)"
+                ))
+                state.add_statement(statement_from_string(
+                    f"nisa.tensor_copy(dst={_outer_u32_w}, src={_outer_mask_w})"
+                ))
+                state.add_statement(statement_from_string(
+                    f"nisa.tensor_tensor(dst={pred_var}, data1={pred_var}, "
+                    f"data2={_outer_u32_w}, op=nl.bitwise_and)"
+                ))
+
         # Now predicated-copy the "true" branch into dst wherever mask is set.
         a_is_scalar, a_val = _try_as_scalar(a_str)
 

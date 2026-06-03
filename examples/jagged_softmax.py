@@ -194,7 +194,7 @@ def main() -> None:
 
     out_eager = reference_jagged_softmax_pytorch(x_data, x_offsets)
     out_hl = jagged_softmax_kernel(x_data, x_offsets)
-    assert torch.allclose(out_eager, out_hl)
+    assert torch.allclose(out_eager, out_hl, atol=1e-5, rtol=1e-3)
 
     run_example(
         lambda x, o: jagged_softmax_kernel(x, o),

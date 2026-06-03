@@ -2805,13 +2805,9 @@ def _(state: CodegenState) -> ast.AST:
                 if row_mask_shape != [p_count, k_count]:
                     return None
 
-                # When the mask was a combined AND (row_mask & feature_mask), NKI's binary
-                # codegen emits tensor_tensor(dst=row_mask_buf, ..., op=bitwise_and) — i.e.
-                # in-place — so row_mask_buf now holds the combined result, not the pure
-                # k-only mask we need. Re-emit the k < nnz comparison fresh into a new var.
-                # No extra action needed — the and_() fix in backend.py now writes
-                # combined_mask to a fresh variable so row_mask_name stays as the
-                # pure k-only mask (k < nnz).
+                # The row_mask comparison (k < seqlens) is correctly emitted by the
+                # backend.py _nki_compare fix when needed (re-emits fresh iota before
+                # the comparison if k_index was mutated by flat-index arithmetic).
 
             if feature_mask_name is not None and _lookup_shape(feature_mask_name) != [
                 p_count,

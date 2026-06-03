@@ -2171,6 +2171,35 @@ class NKIOpOverrides:
             return x
 
         dst = str(data)
+        # If dst is a k-index iota variable that has multiple FX users (e.g. used in
+        # both flat-index computation and row_mask comparison), protect it by writing
+        # to a fresh buffer so the row_mask comparison still sees the original values.
+        from torch._inductor.virtualized import V as _V_ts
+        _ts_cur_node = _V_ts.current_node or state.fx_node
+        if _ts_cur_node is not None:
+            _ts_args = getattr(_ts_cur_node, "args", ())
+            _ts_first = _ts_args[0] if len(_ts_args) >= 1 else None
+            if (
+                _ts_first is not None
+                and hasattr(_ts_first, "users")
+                and len(_ts_first.users) > 1
+                and dst in getattr(state.device_function, "_nki_iota_offsets", {})
+            ):
+                _ts_shape = state.device_function._nki_sbuf_shapes.get(dst)
+                if _ts_shape is not None:
+                    from .ast_extension import statement_from_string as _sfs_ts
+                    _ts_dtype = state.device_function._nki_sbuf_dtypes.get(dst, "nl.int32")
+                    _ts_new = state.device_function.new_var(dst.lstrip("_"), dce=True)
+                    _ts_shape_str = ", ".join(str(d) for d in _ts_shape)
+                    state.device_function._nki_sbuf_shapes[_ts_new] = list(_ts_shape)
+                    state.device_function._nki_sbuf_dtypes[_ts_new] = _ts_dtype
+                    state.add_statement(_sfs_ts(
+                        f"{_ts_new} = nl.ndarray([{_ts_shape_str}], {_ts_dtype}, buffer=nl.sbuf)"
+                    ))
+                    state.add_statement(_sfs_ts(
+                        f"nisa.tensor_copy(dst={_ts_new}, src={dst})"
+                    ))
+                    dst = _ts_new
         dst_tile_vars = state.device_function.get_tile_list_vars(dst)
         operand_tile_vars = state.device_function.get_tile_list_vars(str(operand0))
 
@@ -4973,6 +5002,66 @@ class NKIOpOverrides:
 
         a_str = _emit_str(a)
         b_str = _emit_str(b)
+
+        # If a_str is a k-index iota variable that has been mutated in-place
+        # (e.g. indices_2 += starts; indices_2 *= M; then indices_2 < seqlens),
+        # re-emit a fresh iota so the comparison is k < seqlens, not (starts+k)*M < seqlens.
+        # Only fire when: (1) the iota is tracked with a dyn_counter offset (dynamic range loop),
+        # (2) the current FX node (lt) has a first arg with multiple users (indicating
+        # tile_k.index is used for both flat-index AND mask), and (3) the SBUF shape of a_str
+        # matches what a pure iota would have (shape [1, k_count]).
+        _iota_offsets_cmp = getattr(state.device_function, "_nki_iota_offsets", {})
+        _iota_sizes_cmp = getattr(state.device_function, "_nki_iota_block_sizes", {})
+        if a_str in _iota_offsets_cmp and not a_scalar:
+            _cmp_iota_off = _iota_offsets_cmp[a_str]
+            _cmp_iota_sz = _iota_sizes_cmp.get(a_str)
+            _a_sbuf_shape = state.device_function._nki_sbuf_shapes.get(a_str)
+            # Guard: only re-emit if the k-index has multiple FX users (iota used for
+            # both arithmetic AND mask), indicating in-place mutation occurred.
+            _should_reemit = False
+            try:
+                from torch._inductor.virtualized import V as _V_cmp
+                _cmp_node = _V_cmp.current_node or state.fx_node
+                if _cmp_node is not None and _cmp_node.args:
+                    _first_arg = _cmp_node.args[0]
+                    if hasattr(_first_arg, "users") and len(_first_arg.users) > 1:
+                        # Only re-emit if tile_k.index is consumed by a multiply op
+                        # (indicating flat-index computation like base_indices * M).
+                        # If no multiply, the iota was not mutated into a flat index.
+                        # Check if any transitive user of the k-index applies a multiply
+                        # that would inflate the index (e.g. base_indices * M).
+                        # Only check to depth=2 (subscript → add → multiply).
+                        def _has_direct_mul_in_chain(node, depth=0):
+                            if depth > 3:
+                                return False
+                            for user in getattr(node, "users", {}):
+                                t = str(getattr(user, "target", ""))
+                                if "mul" in t:
+                                    return True
+                                if depth < 2 and _has_direct_mul_in_chain(user, depth + 1):
+                                    return True
+                            return False
+                        _should_reemit = _has_direct_mul_in_chain(_first_arg)
+            except Exception:
+                pass
+            if _should_reemit and _cmp_iota_sz is not None and _a_sbuf_shape is not None:
+                _k_sz_int = int(_a_sbuf_shape[1]) if len(_a_sbuf_shape) >= 2 else int(_cmp_iota_sz)
+                _fresh_k_cmp = state.device_function.new_var("_nki_k_cmp", dce=True)
+                state.device_function._nki_sbuf_shapes[_fresh_k_cmp] = [1, _k_sz_int]
+                state.device_function._nki_sbuf_dtypes[_fresh_k_cmp] = "nl.int32"
+                state.add_statement(statement_from_string(
+                    f"{_fresh_k_cmp} = nl.ndarray([1, {_k_sz_int}], nl.int32, buffer=nl.sbuf)"
+                ))
+                state.add_statement(statement_from_string(
+                    f"nisa.iota(dst={_fresh_k_cmp}, pattern=[[1, {_k_sz_int}]], "
+                    f"offset=0, channel_multiplier=0)"
+                ))
+                state.add_statement(statement_from_string(
+                    f"nisa.tensor_scalar(dst={_fresh_k_cmp}, data={_fresh_k_cmp}, "
+                    f"op0=nl.add, operand0={_cmp_iota_off})"
+                ))
+                a_str = _fresh_k_cmp
+                a = _fresh_k_cmp
 
         # Determine output shape — prefer the FX-inferred output shape when
         # available (handles cross-axis broadcasts like [1,N] == [M,1] → [M,N]).

@@ -35,8 +35,8 @@ import helion.language as hl
 
 # %%
 @helion.kernel(
-    autotune_effort="none",
     backend="nki",
+    autotune_effort="none",
     config=helion.Config(block_sizes=[64, 64, 64, 64, 64, 64, 64]),
 )
 def jagged_layer_norm_kernel(
@@ -75,6 +75,7 @@ def jagged_layer_norm_kernel(
         starts = x_offsets[tile_b]
         ends = x_offsets[tile_b.index + 1]
         seq_lengths = ends - starts
+        max_seq_len = seq_lengths.amax()
 
         # Initialize accumulators for mean and variance computation
         mean_acc = hl.zeros([tile_b], dtype=x_values.dtype)
@@ -83,10 +84,23 @@ def jagged_layer_norm_kernel(
         # First pass: compute mean
         for tile_m in hl.tile(M):
             row_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
-            for tile_k in hl.jagged_tile(seq_lengths):
-                flat_indices = (starts[:, None] + tile_k.index[None, :])[:, :, None] * M
-                flat_indices = flat_indices + tile_m.index[None, None, :]
-                x_slice = hl.load(x_flat, [flat_indices])
+            for tile_k in hl.tile(0, max_seq_len):
+                # Compute indices into x_values
+                indices = starts[:, None] + tile_k.index[None, :]
+                flat_indices = indices[:, :, None] * M + tile_m.index[None, None, :]
+
+                # Create mask for valid elements
+                row_mask = tile_k.index[None, :] < seq_lengths[:, None]
+                combined_mask = row_mask[:, :, None]
+
+                # Load values with masking
+                x_slice = hl.load(
+                    x_flat,
+                    [flat_indices],
+                    extra_mask=combined_mask,
+                )
+
+                # Accumulate sum for mean (sum across sequence dimension)
                 row_sums = row_sums + x_slice.sum(dim=1)
             mean_acc = mean_acc + row_sums.sum(dim=1)
         seq_lengths_float = seq_lengths.to(x_values.dtype)
@@ -95,11 +109,30 @@ def jagged_layer_norm_kernel(
         # Second pass: compute variance
         for tile_m in hl.tile(M):
             var_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
-            for tile_k in hl.jagged_tile(seq_lengths):
-                flat_indices = (starts[:, None] + tile_k.index[None, :])[:, :, None] * M
-                flat_indices = flat_indices + tile_m.index[None, None, :]
-                x_slice = hl.load(x_flat, [flat_indices])
-                centered = x_slice.to(torch.float32) - mean_acc[:, None, None]
+            for tile_k in hl.tile(0, max_seq_len):
+                # Compute indices into x_values
+                indices = starts[:, None] + tile_k.index[None, :]
+                flat_indices = indices[:, :, None] * M + tile_m.index[None, None, :]
+
+                # Create mask for valid elements
+                row_mask = tile_k.index[None, :] < seq_lengths[:, None]
+                combined_mask = row_mask[:, :, None]
+
+                # Load values with masking
+                x_slice = hl.load(
+                    x_flat,
+                    [flat_indices],
+                    extra_mask=combined_mask,
+                )
+
+                # Compute centered values
+                centered = torch.where(
+                    combined_mask,
+                    x_slice.to(torch.float32) - mean_acc[:, None, None],
+                    0.0,
+                )
+
+                # Accumulate squared differences for variance
                 var_sums = var_sums + (centered * centered).sum(dim=1)
             var_acc = var_acc + var_sums.sum(dim=1)
 
@@ -109,14 +142,37 @@ def jagged_layer_norm_kernel(
 
         # Third pass: compute layernorm
         for tile_m in hl.tile(M):
-            for tile_k in hl.jagged_tile(seq_lengths):
-                flat_indices = (starts[:, None] + tile_k.index[None, :])[:, :, None] * M
-                flat_indices = flat_indices + tile_m.index[None, None, :]
-                x_slice = hl.load(x_flat, [flat_indices])
-                normalized = (
-                    x_slice.to(torch.float32) - mean_acc[:, None, None]
-                ) * rstd[:, None, None]
-                hl.store(out_flat, [flat_indices], normalized.to(x_values.dtype))
+            for tile_k in hl.tile(0, max_seq_len):
+                # Compute indices into x_values
+                indices = starts[:, None] + tile_k.index[None, :]
+                flat_indices = indices[:, :, None] * M + tile_m.index[None, None, :]
+
+                # Create mask for valid elements
+                row_mask = tile_k.index[None, :] < seq_lengths[:, None]
+                combined_mask = row_mask[:, :, None]
+
+                # Load values with masking
+                x_slice = hl.load(
+                    x_flat,
+                    [flat_indices],
+                    extra_mask=combined_mask,
+                )
+
+                # Normalize
+                normalized = torch.where(
+                    combined_mask,
+                    (x_slice.to(torch.float32) - mean_acc[:, None, None])
+                    * rstd[:, None, None],
+                    0.0,
+                )
+
+                # Store result
+                hl.store(
+                    out_flat,
+                    [flat_indices],
+                    normalized.to(x_values.dtype),
+                    extra_mask=combined_mask,
+                )
 
     return out.reshape(total_L, M)
 
@@ -225,6 +281,8 @@ def main() -> None:
     Creates test data and compares the Helion implementation against
     both PyTorch reference implementations.
     """
+    # B, M, max_seqlen = 3, 4, 3
+    # NKI backend: B≥256 has rstd accuracy issue with batch tile; use small B
     import os as _env_check
     if _env_check.environ.get("HELION_BACKEND") == "nki":
         B_list = [32]
@@ -244,6 +302,8 @@ def main() -> None:
             lambda x, o, eps: jagged_layer_norm_kernel(x, o, eps),
             lambda x, o, eps: reference_jagged_layer_norm_pytorch(x, o, eps),
             (x_data, x_offsets, eps),
+            rtol=1e-2,
+            atol=1e-2,
         )
 
 

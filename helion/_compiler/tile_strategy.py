@@ -1597,24 +1597,109 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 if getattr(state.device_function, "_nki_dyn_range_end_var", None) == _dyn_reg_here:
                     state.device_function._nki_dyn_range_end_var = None
             else:
-                for_node = create(
-                    ast.For,
-                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
-                    iter=expr_from_string(
-                        self.get_range_call_str(
-                            state.config,
-                            [block_idx],
-                            begin="{begin}",
-                            end="{end}",
-                            step=block_size_var,
+                # NKI: if begin is a [1,1] SBUF tensor (dynamic scalar), load it into
+                # a register and use dynamic_range(begin_reg, end, step).
+                _nki_dyn_begin_reg = None
+                if env.backend.name == "nki" and begin is not None and not isinstance(begin, (int, bool)):
+                    import ast as _ast_mod_begin
+                    from .ast_extension import statement_from_string
+                    _begin_ast = self._to_ast(begin, to_dtype=dtype)
+                    _begin_name = _ast_mod_begin.unparse(_begin_ast) if isinstance(_begin_ast, _ast_mod_begin.AST) else str(begin)
+                    _sbuf_shapes = getattr(state.device_function, "_nki_sbuf_shapes", {})
+                    _begin_sbuf_shape = _sbuf_shapes.get(_begin_name)
+                    if _begin_sbuf_shape is None:
+                        _lk = _begin_name
+                        while "_copy" in _lk:
+                            _lk = _lk[:_lk.rfind("_copy")]
+                            _begin_sbuf_shape = _sbuf_shapes.get(_lk)
+                            if _begin_sbuf_shape is not None:
+                                break
+                    if _begin_sbuf_shape is not None and _begin_sbuf_shape == [1, 1]:
+                        _nki_dyn_begin_reg = state.device_function.new_var("_dyn_begin_reg")
+                        state.add_statement(statement_from_string(
+                            f"{_nki_dyn_begin_reg} = nisa.register_alloc()"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.register_load({_nki_dyn_begin_reg}, {_begin_name})"
+                        ))
+                        # Emit a counter SBUF that tracks the actual integer offset.
+                        # Init to begin - step; first loop-body increment → begin.
+                        # This mirrors the dyn-end loop counter so dma_copy AP can use it.
+                        _step_val = int(block_size) if isinstance(block_size, (int, bool)) else 1
+                        _dyn_begin_counter = state.device_function.new_var("_dyn_begin_counter")
+                        _dyn_begin_counter_f = state.device_function.new_var("_dyn_begin_counter_f")
+                        state.device_function._nki_sbuf_shapes[_dyn_begin_counter] = [1, 1]
+                        state.device_function._nki_sbuf_dtypes[_dyn_begin_counter] = "nl.int32"
+                        state.device_function._nki_sbuf_shapes[_dyn_begin_counter_f] = [1, 1]
+                        state.device_function._nki_sbuf_dtypes[_dyn_begin_counter_f] = "nl.float32"
+                        state.add_statement(statement_from_string(
+                            f"{_dyn_begin_counter} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={_dyn_begin_counter}, src={_begin_name})"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_scalar(dst={_dyn_begin_counter}, "
+                            f"data={_dyn_begin_counter}, op0=nl.subtract, operand0={_step_val})"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"{_dyn_begin_counter_f} = nl.ndarray([1, 1], nl.float32, buffer=nl.sbuf)"
+                        ))
+                        # Cast int32 → float32: memset to 0.0, then add the int32 value.
+                        # tensor_tensor(float32, float32, int32, nl.add) converts int32 to float.
+                        state.add_statement(statement_from_string(
+                            f"nisa.memset({_dyn_begin_counter_f}, value=0.0)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_tensor(dst={_dyn_begin_counter_f}, "
+                            f"data1={_dyn_begin_counter_f}, data2={_dyn_begin_counter}, op=nl.add)"
+                        ))
+                        # Track the offset var so guards skip the >= 0 check for it
+                        if not hasattr(state.device_function, "_nki_dyn_begin_offset_vars"):
+                            state.device_function._nki_dyn_begin_offset_vars = set()
+                        state.device_function._nki_dyn_begin_offset_vars.add(offset_var)
+                        # Store counter info so loop_index_statements and dma_copy AP can use it
+                        if not hasattr(state.device_function, "_nki_dyn_loops"):
+                            state.device_function._nki_dyn_loops = {}
+                        state.device_function._nki_dyn_loops[block_idx] = {
+                            "reg": _nki_dyn_begin_reg,
+                            "counter": _dyn_begin_counter,
+                            "counter_float": _dyn_begin_counter_f,
+                            "step": _step_val,
+                            "bound_sbuf": _begin_name,
+                            "offset_var": offset_var,
+                        }
+                if _nki_dyn_begin_reg is not None:
+                    for_node = create(
+                        ast.For,
+                        target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        iter=expr_from_string(
+                            f"nl.dynamic_range({_nki_dyn_begin_reg}, {{end}}, {block_size_var})",
+                            end=self._to_ast(end, to_dtype=dtype),
                         ),
-                        begin=self._to_ast(begin, to_dtype=dtype),
-                        end=self._to_ast(end, to_dtype=dtype),
-                    ),
-                    body=body,
-                    orelse=[],
-                    type_comment=None,
-                )
+                        body=body,
+                        orelse=[],
+                        type_comment=None,
+                    )
+                else:
+                    for_node = create(
+                        ast.For,
+                        target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        iter=expr_from_string(
+                            self.get_range_call_str(
+                                state.config,
+                                [block_idx],
+                                begin="{begin}",
+                                end="{end}",
+                                step=block_size_var,
+                            ),
+                            begin=self._to_ast(begin, to_dtype=dtype),
+                            end=self._to_ast(end, to_dtype=dtype),
+                        ),
+                        body=body,
+                        orelse=[],
+                        type_comment=None,
+                    )
             assert for_node.body is body
             uses_thread_axis = self._uses_thread_axis(block_size)
             axis = thread_axis_offset + thread_axis_map[block_idx]
@@ -1703,50 +1788,16 @@ class NDTileStrategy(_BaseNDTileStrategy):
         index_var: str,
         end: object,
     ) -> ast.stmt | None:
-        env = CompileEnvironment.current()
         if (
-            not env.backend.force_tile_mask()
-            and env.block_sizes[block_idx].known_multiple(block_size)
-            and not env.is_jagged_tile(block_idx)
+            CompileEnvironment.current()
+            .block_sizes[block_idx]
+            .known_multiple(block_size)
         ):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
-
-        if env.is_jagged_tile(block_idx):
-            jagged_tile_parents_ast = state.ast_args[3]
-            jagged_tile_parents_proxy = state.proxy_args[3]
-            assert isinstance(jagged_tile_parents_ast, list)
-            assert isinstance(jagged_tile_parents_proxy, list)
-            # We guarantee the first lifted loop input is the jagged_tile parent tensor.
-            jagged_tile_parent = jagged_tile_parents_ast[0]
-            jagged_tile_block_size = env.block_sizes[block_idx].var
-            jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
-            assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
-            parent_dims: list[torch.SymInt] = []
-            for d in jagged_tile_parent_proxy.size():
-                assert isinstance(d, torch.SymInt)
-                parent_dims.append(d)
-            assert len(parent_dims) >= 1
-            env.jagged_tile_mask_shapes[block_idx] = [
-                *parent_dims,
-                jagged_tile_block_size,
-            ]
-            if not self.supports_index_rank_expansion():
-                return statement_from_string(
-                    f"{mask_var} = ({index_var}) < {{parent}}",
-                    parent=self._to_ast(jagged_tile_parent),
-                )
-            k = len(parent_dims)
-            child_expand = "[" + ", ".join(["None"] * k + [":"]) + "]"
-            parent_expand = "[" + ", ".join([":"] * k + ["None"]) + "]"
-            return statement_from_string(
-                f"{mask_var} = ({index_var}){child_expand} < {{parent}}{parent_expand}",
-                parent=self._to_ast(jagged_tile_parent),
-            )
-
         return statement_from_string(
             f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )

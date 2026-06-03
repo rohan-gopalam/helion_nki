@@ -1,21 +1,28 @@
 # Jagged Tile NKI Backend Debug State
 
 **Branch**: `nki-load-codegen-refactor`  
-**Last updated**: 2026-06-03
+**Last updated**: 2026-06-03 (updated after jagged_softmax fix)
 
 ---
 
-## Test Results (current working tree, seed=42)
+## Commits This Session
+- `d23b1cc3` — Fixed `jagged_mean` (nested dynamic_range, mask selection, where-predicate)
+- `3a4b3427` — Fixed `jagged_layer_norm` sequential passes (sequential_range → dynamic_range)
+- `06b2f9e8` — Fixed `jagged_softmax` (flat-gather-2d mask application)
+
+---
+
+## Test Results (current HEAD, seed=42)
 
 | Example | Size | Status | max_diff | Notes |
 |---|---|---|---|---|
 | `jagged_sum` | rows=32, maxcols=16 | ✅ PASS | 9.5e-7 | Small size passes |
-| `jagged_sum` | rows=128, maxcols=64 | ❌ FAIL | ~164 | Fails at large size |
-| `jagged_mean` | rows=32, M=128 | ✅ PASS | 2.1e-5 | Fixed this session |
-| `jagged_layer_norm` | B=32, M=32 | ❌ FAIL | 0.46 | Down from 2.29, pre-existing baseline is also 0.46 |
-| `jagged_softmax` | rows=32, M=32 | ❌ FAIL | ~1.0 | Mask not applied to max/exp reductions |
+| `jagged_sum` | rows=128, maxcols=64 | ❌ FAIL | ~164 | SBUF recycling after ~32 dynamic_range iterations |
+| `jagged_mean` | rows=32, M=128 | ✅ PASS | 2.1e-5 | Fixed |
+| `jagged_layer_norm` | B=32, M=32 | ❌ FAIL | 0.46 | Down from 2.29; residual 0.46 is pre-existing baseline |
+| `jagged_softmax` | rows=32, M=32 | ✅ PASS | 2.3e-6 | Fixed |
 | `jagged_dense_add` | rows=128, cols=128 | ✅ PASS | 0 | Small size passes |
-| `jagged_dense_add` | rows=256, cols=5000 | ❌ FAIL | 4.33 | Fails at large size — 39-iter dynamic_range bug |
+| `jagged_dense_add` | rows=256, cols=5000 | ❌ FAIL | 4.33 | Same SBUF recycling bug as jagged_sum large |
 
 ---
 
@@ -67,13 +74,10 @@ After `add_device_loop`'s `yield` returns, removes the current loop's block_ids 
 - **Remaining 0.46**: This is the pre-existing baseline failure (exists in the commit before this session). The output values are close but off — likely a floating-point accumulation error from the three-pass mean/var/normalize structure. Not caused by the dynamic_range fix.
 - **Status**: The dynamic_range fix is correct. The 0.46 residual needs separate investigation.
 
-### `jagged_softmax` — max_diff ~1.0
+### `jagged_softmax` — FIXED (commit `06b2f9e8`)
 
-- **Root cause**: The first pass (compute max/L for online softmax) uses `dynamic_range` correctly now, but `mask_2` (the jagged validity mask: `tile_k_index < seqlens`) is **generated but never applied** to the gathered data before the max-reduction and exp-sum. OOB positions in the gather get 0.0 (from `oob_mode=skip`), which:
-  - Corrupts `block_max`: if valid x values are negative, `max(x, 0.0)` picks 0 instead of `max(x)`
-  - Inflates `block_L`: `exp(0 - block_max)` adds spurious probability mass for invalid k positions
-- **Manual fix confirmed**: Applying `mask_2` to replace OOB positions with `-inf` before max-reduce, and zero them after exp, gives correct results (max_diff → 2.3e-6).
-- **Compiler fix needed**: In `_try_emit_flat_gather_sum_dim1` or the NKI load path, when a gather is inside a jagged tile loop and uses `oob_mode=skip`, apply the jagged mask to set OOB positions to the reduction's identity element (`-inf` for max, `0` for add) rather than leaving them as 0.
+- **Root cause**: `oob_mode=skip` only skips physically-OOB addresses. Logically-invalid k-positions (k >= seqlen) compute valid physical addresses (pointing into other rows' data) and get incorrect values from the DMA. These corrupt the max-reduce and exp-sum in the online softmax first pass.
+- **Fix**: In `_try_emit_flat_gather_2d` (`memory_ops.py`), after the DMA gather, look up the jagged auto-mask from `active_device_loops`, transpose+broadcast it from `[1, k_count]` to `[p_count, f_count]`, and apply via `tensor_copy_predicated` with `-inf` fill. OOB positions then have `-inf`, which is correct for both max-reduce (`max(-inf, x) = x`) and exp-sum (`exp(-inf) = 0`).
 
 ### `jagged_dense_add` — size-dependent failure (rows=256, cols=5000)
 
@@ -128,7 +132,8 @@ except: pass
 
 ## Next Steps (priority order)
 
-1. **Remove debug prints from tile_strategy.py** (the `HELION_DEBUG_DYNRANGE` blocks), commit the fix.
-2. **`jagged_softmax`**: In the NKI load/reduce path, apply the jagged mask to OOB positions before partition-reduce (max) and exp-sum. The mask `mask_2` is available in the generated kernel but unused in the reduce path.
-3. **`jagged_sum` / `jagged_dense_add` size threshold**: Understand why neuronx-cc recycles SBUF at 33+ iterations. Try wrapping the counter SBUF in a way that prevents recycling (e.g., mark it as "live across iterations" if such NKI annotation exists).
-4. **`jagged_layer_norm` residual 0.46**: Investigate whether this is a precision issue in the three-pass mean/var accumulation or something structural.
+1. **`jagged_sum` / `jagged_dense_add` size threshold** (SBUF recycling at >32 iterations): Understand why neuronx-cc recycles `_dyn_counter` SBUF after ~32 `dynamic_range` iterations. The counter resets to 0, causing DMA writes to wrong column offsets. Possible approaches:
+   - Store the counter in `nl.shared_hbm` and reload each iteration (prevents SBUF recycling)
+   - Use a NKI register (persistent, not subject to SBUF recycling) for the counter
+   - Restructure the loop to avoid the large iteration count (e.g., split into chunks of ≤32)
+2. **`jagged_layer_norm` residual 0.46**: The 0.46 max_diff is the pre-existing baseline. The three-pass structure (mean, variance, normalize) accumulates floating-point errors. Investigate whether the three sequential `tile_k` passes can be computed in a single pass or if precision can be improved.

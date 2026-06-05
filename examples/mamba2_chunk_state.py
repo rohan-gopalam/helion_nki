@@ -29,13 +29,21 @@ import helion.language as hl
     autotune_effort="none",
     config=helion.Config(block_sizes=[128, 128, 128]),
 )
-def _helion_mamba2_chunk_state_impl(
+def helion_mamba2_chunk_state_kernel(
     B: torch.Tensor, x: torch.Tensor, dt: torch.Tensor, dA_cumsum: torch.Tensor
 ) -> torch.Tensor:
-    """Internal kernel — x is pre-transposed to (batch, nheads, seqlen, headdim)."""
+    """
+    Argument:
+        B: (batch, seqlen, ngroups, dstate)
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, nheads, nchunks, chunk_size)
+        dA_cumsum: (batch, nheads, nchunks, chunk_size)
+    Return:
+        states: (batch, nchunks, nheads, headdim, dstate)
+    """
 
     batch, seqlen, ngroups, dstate = B.shape
-    _, nheads, seqlen, headdim = x.shape
+    batch, seqlen, nheads, headdim = x.shape
     batch, nheads, nchunks, chunk_size = dt.shape
     batch, nheads, nchunks, chunk_size = dA_cumsum.shape
 
@@ -46,7 +54,7 @@ def _helion_mamba2_chunk_state_impl(
     block_k = hl.register_block_size(chunk_size)
 
     assert B.shape == (batch, seqlen, ngroups, dstate)
-    assert x.shape == (batch, nheads, seqlen, headdim)
+    assert x.shape == (batch, seqlen, nheads, headdim)
     assert dt.shape == (batch, nheads, nchunks, chunk_size)
     assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
 
@@ -69,8 +77,8 @@ def _helion_mamba2_chunk_state_impl(
         for tile_k in hl.tile(chunk_size, block_size=block_k):
             x_local = x[
                 tile_b.begin,
-                tile_h.begin,
                 tile_k.index + tile_c.begin * chunk_size,
+                tile_h.begin,
                 tile_m,
             ]
             dA_cumsum_local = dA_cumsum[
@@ -89,23 +97,6 @@ def _helion_mamba2_chunk_state_impl(
         out[tile_b.begin, tile_c.begin, tile_h.begin, tile_m, tile_n] = acc_o.to(dtype)
 
     return out
-
-
-def helion_mamba2_chunk_state_kernel(
-    B: torch.Tensor, x: torch.Tensor, dt: torch.Tensor, dA_cumsum: torch.Tensor
-) -> torch.Tensor:
-    """
-    Argument:
-        B: (batch, seqlen, ngroups, dstate)
-        x: (batch, seqlen, nheads, headdim)
-        dt: (batch, nheads, nchunks, chunk_size)
-        dA_cumsum: (batch, nheads, nchunks, chunk_size)
-    Return:
-        states: (batch, nchunks, nheads, headdim, dstate)
-    """
-    # Transpose x to [batch, nheads, seqlen, headdim] for contiguous per-head DMA access.
-    x_t = x.permute(0, 2, 1, 3).contiguous()
-    return _helion_mamba2_chunk_state_impl(B, x_t, dt, dA_cumsum)
 
 
 # %%

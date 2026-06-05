@@ -5155,16 +5155,123 @@ def _(state: CodegenState) -> None:
         for bs in leading_block_sizes_s:
             flat_block_size_s *= bs
 
-        flat_slice = f"({flat_offset_s}) : ({flat_offset_s}) + {flat_block_size_s}"
-        slice_parts = [flat_slice] + [slice_parts[-1]]
-        partition_offset_var = f"({flat_offset_s})"
-        flat_hbm_partition_s = 1
-        for dim_size in original_dim_sizes_s:
-            flat_hbm_partition_s *= dim_size
-        hbm_dim_size_strs_s = [
-            str(flat_hbm_partition_s),
-            _store_tensor_dim_size_str(tensor.dim() - 1),
-        ]
+        # Strided-scatter detection (mirrors strided-gather in load codegen):
+        # one tiled dim followed by scalar dim(s) → rows are non-contiguous.
+        _tile_dim_idx_st = None
+        for _di, _bs in enumerate(leading_block_sizes_s):
+            if _bs > 1:
+                if _tile_dim_idx_st is None:
+                    _tile_dim_idx_st = _di
+                else:
+                    _tile_dim_idx_st = None
+                    break
+        _use_strided_scatter = (
+            _tile_dim_idx_st is not None
+            and _tile_dim_idx_st < len(leading_block_sizes_s) - 1
+            and all(leading_block_sizes_s[_di] == 1
+                    for _di in range(_tile_dim_idx_st + 1, len(leading_block_sizes_s)))
+            and not any(p.startswith(("__DYN_AP__", "__AP_ROW_GATHER__"))
+                        for p in slice_parts)
+        )
+        if _use_strided_scatter:
+            _tile_bs_st = leading_block_sizes_s[_tile_dim_idx_st]
+            _tile_off_st = leading_offsets_s[_tile_dim_idx_st]
+            _stride_st = 1
+            for _di in range(_tile_dim_idx_st + 1, len(original_dim_sizes_s)):
+                _stride_st *= original_dim_sizes_s[_di]
+            if _stride_st > 1:
+                _scalar_parts_st: list[str] = []
+                for _di in range(_tile_dim_idx_st + 1, len(leading_offsets_s)):
+                    _m = [str(original_dim_sizes_s[_k])
+                          for _k in range(_di + 1, len(original_dim_sizes_s))]
+                    _off_e = leading_offsets_s[_di]
+                    if _m:
+                        _off_p = f"({_off_e})" if ("+" in _off_e or "-" in _off_e) else _off_e
+                        _scalar_parts_st.append(f"{_off_p} * {' * '.join(_m)}")
+                    else:
+                        _scalar_parts_st.append(_off_e)
+                _prefix_parts_st: list[str] = []
+                for _di in range(0, _tile_dim_idx_st):
+                    _m = [str(original_dim_sizes_s[_k])
+                          for _k in range(_di + 1, len(original_dim_sizes_s))]
+                    _off_e = leading_offsets_s[_di]
+                    if _m:
+                        _off_p = f"({_off_e})" if ("+" in _off_e or "-" in _off_e) else _off_e
+                        _prefix_parts_st.append(f"{_off_p} * {' * '.join(_m)}")
+                    else:
+                        _prefix_parts_st.append(_off_e)
+                _scalar_off_st = " + ".join(_scalar_parts_st) if _scalar_parts_st else "0"
+                _prefix_off_st = " + ".join(_prefix_parts_st) if _prefix_parts_st else None
+
+                from .._compiler.ast_extension import statement_from_string as _sfs_ss
+                _iota_st = device_fn.new_var("_ss_iota", dce=True)
+                device_fn._nki_sbuf_shapes[_iota_st] = [1, _tile_bs_st]
+                device_fn._nki_sbuf_dtypes[_iota_st] = "nl.int32"
+                state.codegen.add_statement(_sfs_ss(
+                    f"{_iota_st} = nl.ndarray([1, {_tile_bs_st}], nl.int32, buffer=nl.sbuf)"
+                ))
+                state.codegen.add_statement(_sfs_ss(
+                    f"nisa.iota(dst={_iota_st}, pattern=[[1, {_tile_bs_st}]], "
+                    f"offset={_tile_off_st}, channel_multiplier=0)"
+                ))
+                _scaled_st = device_fn.new_var("_ss_scaled", dce=True)
+                device_fn._nki_sbuf_shapes[_scaled_st] = [1, _tile_bs_st]
+                device_fn._nki_sbuf_dtypes[_scaled_st] = "nl.int32"
+                state.codegen.add_statement(_sfs_ss(
+                    f"{_scaled_st} = nl.ndarray([1, {_tile_bs_st}], nl.int32, buffer=nl.sbuf)"
+                ))
+                state.codegen.add_statement(_sfs_ss(
+                    f"nisa.tensor_scalar(dst={_scaled_st}, data={_iota_st}, "
+                    f"op0=nl.multiply, operand0={_stride_st}, op1=None)"
+                ))
+                _row_st = device_fn.new_var("_ss_row", dce=True)
+                device_fn._nki_sbuf_shapes[_row_st] = [1, _tile_bs_st]
+                device_fn._nki_sbuf_dtypes[_row_st] = "nl.int32"
+                state.codegen.add_statement(_sfs_ss(
+                    f"{_row_st} = nl.ndarray([1, {_tile_bs_st}], nl.int32, buffer=nl.sbuf)"
+                ))
+                if _scalar_off_st == "0":
+                    state.codegen.add_statement(_sfs_ss(
+                        f"nisa.tensor_copy(dst={_row_st}, src={_scaled_st})"
+                    ))
+                else:
+                    state.codegen.add_statement(_sfs_ss(
+                        f"nisa.tensor_scalar(dst={_row_st}, data={_scaled_st}, "
+                        f"op0=nl.add, operand0={_scalar_off_st}, op1=None)"
+                    ))
+                if _prefix_off_st is not None:
+                    state.codegen.add_statement(_sfs_ss(
+                        f"nisa.tensor_scalar(dst={_row_st}, data={_row_st}, "
+                        f"op0=nl.add, operand0={_prefix_off_st}, op1=None)"
+                    ))
+                _vec_st = _nki_as_uint32_p1_vector(state, _row_st, _tile_bs_st)
+                if _vec_st is not None:
+                    _flat_hbm_st = 1
+                    for _ds in original_dim_sizes_s:
+                        _flat_hbm_st *= _ds
+                    _d_int_st = _resolve_dim_store(tensor.size(tensor.dim() - 1))
+                    slice_parts = [f"__AP_ROW_GATHER__{_vec_st}__", f"0:{_d_int_st}"]
+                    is_scalar_dim_s = [False, False]
+                    flat_block_size_s = _tile_bs_st
+                    hbm_dim_size_strs_s = [str(_flat_hbm_st), str(_d_int_st)]
+                    partition_offset_var = None
+                    _use_strided_scatter = False  # signal: skip flat slice below
+
+        if _use_strided_scatter is False and slice_parts[0].startswith("__AP_ROW_GATHER__"):
+            pass  # strided scatter succeeded — skip flat slice
+        else:
+            flat_slice = f"({flat_offset_s}) : ({flat_offset_s}) + {flat_block_size_s}"
+            slice_parts = [flat_slice] + [slice_parts[-1]]
+            partition_offset_var = f"({flat_offset_s})"
+
+        if not slice_parts[0].startswith("__AP_ROW_GATHER__"):
+            flat_hbm_partition_s = 1
+            for dim_size in original_dim_sizes_s:
+                flat_hbm_partition_s *= dim_size
+            hbm_dim_size_strs_s = [
+                str(flat_hbm_partition_s),
+                _store_tensor_dim_size_str(tensor.dim() - 1),
+            ]
 
     value_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
     tile_vars = device_fn.get_tile_list_vars(value_name)

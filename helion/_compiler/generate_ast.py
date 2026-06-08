@@ -118,6 +118,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # the same arange share one lane loop.
         self.cute_synthetic_arange_lane_exprs: dict[tuple[object, ...], str] = {}
         self.next_else_block: list[ast.AST] | None = None
+        # Track var=const for NKI tensor_scalar (avoids tensor_tensor when one op is scalar)
+        self._var_to_constant: dict[str, int | float | bool] = {}
+        self._nki_sbuf_constant_values: dict[str, int | float | bool] = {}
+        self._nki_sbuf_alloc_depth: dict[str, int] = {}
+        self.fx_node_to_ast: dict[object, ast.AST | tuple[ast.AST, ...]] = {}
         self.store_transform = store_transform
         self.load_transform = load_transform
         self._statement_owner_fx_node: Node | None = None
@@ -148,9 +153,254 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return loops[-1].strategy.mask_var(block_idx)
         return None
 
+    def _lower_nki_mod_assign(
+        self, target: str, value: ast.BinOp
+    ) -> list[ast.AST] | None:
+        try:
+            env = CompileEnvironment.current()
+        except Exception:
+            return None
+        if env.backend.codegen_name != "nki":
+            return None
+
+        lhs = ast.unparse(value.left)
+        rhs = ast.unparse(value.right)
+        lhs_shape = self.device_function._nki_sbuf_shapes.get(lhs)
+        if lhs_shape is None:
+            lookup = lhs
+            while "_copy" in lookup:
+                lookup = lookup[: lookup.rfind("_copy")]
+                lhs_shape = self.device_function._nki_sbuf_shapes.get(lookup)
+                if lhs_shape is not None:
+                    lhs = lookup
+                    break
+        if lhs_shape is None:
+            block_size = self.device_function._nki_iota_block_sizes.get(lhs)
+            if block_size is not None:
+                try:
+                    lhs_shape = [1, int(block_size)]
+                except ValueError:
+                    lhs_shape = None
+        if lhs_shape is None:
+            for block_id, loops in self.active_device_loops.items():
+                if not loops:
+                    continue
+                strategy = loops[-1].strategy
+                if strategy.index_var(block_id) != lhs:
+                    continue
+                try:
+                    block_size = env.block_sizes[block_id].from_config_assert(
+                        self.device_function.config
+                    )
+                    lhs_shape = [1, int(block_size)]
+                except Exception:
+                    lhs_shape = None
+                break
+        if lhs_shape is None or len(lhs_shape) < 2:
+            return None
+
+        rhs_value: int | float | None = None
+        rhs_value = self._constant_value_from_ast(value.right)
+        if rhs_value == 0:
+            return None
+
+        tmp = self.device_function.new_var("_nki_mod_div_f32", dce=True)
+        q = self.device_function.new_var("_nki_mod_div_i32", dce=True)
+        prod = self.device_function.new_var("_nki_mod_prod", dce=True)
+        self.device_function._nki_sbuf_shapes[tmp] = list(lhs_shape)
+        self.device_function._nki_sbuf_shapes[q] = list(lhs_shape)
+        self.device_function._nki_sbuf_shapes[prod] = list(lhs_shape)
+        self.device_function._nki_sbuf_shapes[target] = list(lhs_shape)
+        self.device_function._nki_sbuf_dtypes[tmp] = "nl.float32"
+        self.device_function._nki_sbuf_dtypes[q] = "nl.int32"
+        self.device_function._nki_sbuf_dtypes[prod] = "nl.int32"
+        self.device_function._nki_sbuf_dtypes[target] = "nl.int32"
+
+        shape = ", ".join(str(dim) for dim in lhs_shape)
+        if rhs_value is not None:
+            inv: object = 1.0 / float(rhs_value)
+            rhs_operand: object = (
+                int(rhs_value) if float(rhs_value).is_integer() else rhs_value
+            )
+        else:
+            inv = f"1.0 / ({rhs})"
+            rhs_operand = rhs
+
+        return [
+            statement_from_string(
+                f"{tmp} = nl.ndarray([{shape}], nl.float32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_scalar(dst={tmp}, data={lhs}, "
+                f"op0=nl.multiply, operand0={inv})"
+            ),
+            statement_from_string(
+                f"{prod} = nl.ndarray([{shape}], nl.int32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(f"{q} = nl.floor({tmp}, dtype=nl.int32)"),
+            statement_from_string(
+                f"nisa.tensor_scalar(dst={prod}, data={q}, "
+                f"op0=nl.multiply, operand0={rhs_operand})"
+            ),
+            statement_from_string(
+                f"{target} = nl.ndarray([{shape}], nl.int32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={target}, data1={lhs}, data2={prod}, "
+                f"op=nl.subtract)"
+            ),
+        ]
+
     def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
         return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
+
+    def _record_nki_sbuf_allocation(self, stmt: ast.Assign) -> None:
+        if (
+            len(stmt.targets) != 1
+            or not isinstance(stmt.targets[0], ast.Name)
+            or not isinstance(stmt.value, ast.Call)
+            or not isinstance(stmt.value.func, ast.Attribute)
+            or not isinstance(stmt.value.func.value, ast.Name)
+            or stmt.value.func.value.id != "nl"
+            or stmt.value.func.attr != "ndarray"
+        ):
+            return
+        if not any(
+            keyword.arg == "buffer"
+            and isinstance(keyword.value, ast.Attribute)
+            and isinstance(keyword.value.value, ast.Name)
+            and keyword.value.value.id == "nl"
+            and keyword.value.attr == "sbuf"
+            for keyword in stmt.value.keywords
+        ):
+            return
+        self._nki_sbuf_alloc_depth[stmt.targets[0].id] = len(self.statements_stack)
+        self._nki_sbuf_constant_values.pop(stmt.targets[0].id, None)
+
+    def _constant_value_from_ast(
+        self, expr: ast.AST
+    ) -> int | float | bool | None:
+        if isinstance(expr, ast.Constant) and isinstance(
+            expr.value, (int, float, bool)
+        ):
+            return expr.value
+        if (
+            isinstance(expr, ast.UnaryOp)
+            and isinstance(expr.operand, ast.Constant)
+            and isinstance(expr.operand.value, (int, float))
+        ):
+            if isinstance(expr.op, ast.USub):
+                return -expr.operand.value
+            if isinstance(expr.op, ast.UAdd):
+                return expr.operand.value
+        if isinstance(expr, ast.Name):
+            const = self.get_var_constant_value(expr.id)
+            if isinstance(const, (int, float, bool)):
+                return const
+            return self._nki_sbuf_constant_values.get(expr.id)
+        if isinstance(expr, ast.BinOp):
+            left = self._constant_value_from_ast(expr.left)
+            right = self._constant_value_from_ast(expr.right)
+            if not isinstance(left, (int, float, bool)) or not isinstance(
+                right, (int, float, bool)
+            ):
+                return None
+            if isinstance(expr.op, ast.Add):
+                return left + right
+            if isinstance(expr.op, ast.Sub):
+                return left - right
+            if isinstance(expr.op, ast.Mult):
+                return left * right
+            if isinstance(expr.op, ast.Div) and right != 0:
+                return left / right
+            if isinstance(expr.op, ast.FloorDiv) and right != 0:
+                return left // right
+            if isinstance(expr.op, ast.Mod) and right != 0:
+                return left % right
+        return None
+
+    def _record_nki_sbuf_write(self, stmt: ast.AST) -> None:
+        call: ast.Call | None = None
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        elif isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        if call is None:
+            return
+
+        written_names: list[str] = []
+        for keyword in call.keywords:
+            if keyword.arg == "dst" and isinstance(keyword.value, ast.Name):
+                written_names.append(keyword.value.id)
+        if (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "nisa"
+            and call.func.attr == "memset"
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+        ):
+            written_names.append(call.args[0].id)
+
+        for name in written_names:
+            self._nki_sbuf_constant_values.pop(name, None)
+
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "nisa"
+            and call.func.attr == "memset"
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+        ):
+            return
+
+        value_expr = next(
+            (keyword.value for keyword in call.keywords if keyword.arg == "value"),
+            None,
+        )
+        if value_expr is None:
+            return
+        value = self._constant_value_from_ast(value_expr)
+        if isinstance(value, (int, float, bool)):
+            self._nki_sbuf_constant_values[call.args[0].id] = value
+
+    def _lower_nki_sbuf_reassign(
+        self, target: str, source: str
+    ) -> list[ast.AST] | None:
+        if not self.on_device:
+            return None
+        try:
+            env = CompileEnvironment.current()
+        except Exception:
+            return None
+        if env.backend.codegen_name != "nki":
+            return None
+        if target == source or not target.startswith("_nki") or "_copy" in target:
+            return None
+
+        target_depth = self._nki_sbuf_alloc_depth.get(target)
+        if target_depth is None or target_depth > len(self.statements_stack):
+            return None
+
+        sbuf_shapes = self.device_function._nki_sbuf_shapes
+        target_shape = sbuf_shapes.get(target)
+        source_shape = sbuf_shapes.get(source)
+        if target_shape is None or source_shape is None or target_shape != source_shape:
+            return None
+
+        sbuf_dtypes = self.device_function._nki_sbuf_dtypes
+        target_dtype = sbuf_dtypes.get(target)
+        source_dtype = sbuf_dtypes.get(source)
+        if (
+            target_dtype is not None
+            and source_dtype is not None
+            and target_dtype != source_dtype
+        ):
+            return None
+
+        return [statement_from_string(f"nisa.tensor_copy(dst={target}, src={source})")]
 
     def _compute_inter_loop_barriers(self) -> None:
         """Walk every codegen graph; for each pair of consecutive sibling
@@ -244,9 +494,71 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
+        # Track var=const for NKI tensor_scalar scalar operand resolution
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.BinOp)
+            and isinstance(stmt.value.op, ast.Mod)
+            and (lowered := self._lower_nki_mod_assign(stmt.targets[0].id, stmt.value))
+            is not None
+        ):
+            self.statements_stack[-1].extend(lowered)
+            return
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Name)
+            and (
+                lowered := self._lower_nki_sbuf_reassign(
+                    stmt.targets[0].id, stmt.value.id
+                )
+            )
+            is not None
+        ):
+            self.statements_stack[-1].extend(lowered)
+            return
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            const_value = self._constant_value_from_ast(stmt.value)
+            if isinstance(const_value, (int, float, bool)):
+                self._var_to_constant[stmt.targets[0].id] = const_value
+            elif (
+                isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Name)
+                and stmt.value.func.id == "float"
+                and len(stmt.value.args) == 1
+                and isinstance(stmt.value.args[0], ast.Constant)
+                and isinstance(stmt.value.args[0].value, str)
+            ):
+                self._var_to_constant[stmt.targets[0].id] = float(
+                    stmt.value.args[0].value
+                )
+            self._record_nki_sbuf_allocation(stmt)
+        self._record_nki_sbuf_write(stmt)
         self.statements_stack[-1].append(stmt)
         self._record_statement_thread_references([stmt])
         self._record_tcgen05_owned_statement(stmt)
+
+    def get_var_constant_value(self, var_name: str) -> int | float | bool | None:
+        """Return constant value if var was assigned a literal, else None."""
+        return self._var_to_constant.get(
+            var_name, self._nki_sbuf_constant_values.get(var_name)
+        )
+
+    def record_fx_node_ast(self, node: object, value: object) -> None:
+        if isinstance(value, ast.AST):
+            self.fx_node_to_ast[node] = value
+        elif isinstance(value, tuple) and all(isinstance(v, ast.AST) for v in value):
+            self.fx_node_to_ast[node] = value
+
+    def ast_for_fx_node(self, node: object) -> ast.AST | tuple[ast.AST, ...] | None:
+        return self.fx_node_to_ast.get(node)
 
     def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
         owner_node = self._statement_owner_fx_node
@@ -283,6 +595,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if isinstance(expr, ast.Name):
             return expr
         assert isinstance(expr, ExtendedAST), expr
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mod):
+            try:
+                env = CompileEnvironment.current()
+                if env.backend.codegen_name == "nki":
+                    from .nki_backend import NKIOpOverrides
+
+                    lhs = ast.unparse(expr.left)
+                    rhs = ast.unparse(expr.right)
+                    lowered = NKIOpOverrides.mod(lhs, rhs)
+                    if lowered != f"{lhs} % {rhs}" and lowered.isidentifier():
+                        return create(ast.Name, id=lowered, ctx=ast.Load())
+            except Exception:
+                pass
         with expr:
             varname = self.tmpvar(dce=dce, prefix=prefix)
             self.add_statement(
@@ -879,8 +1204,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             assert node._root_id is not None
             # Loop dependency checks were already run during lowering; phase checker kept for symmetry/debug.
             self._phase_checker(node._root_id)
+            env = CompileEnvironment.current()
+            is_nki = env.backend.name == "nki"
 
-            if len(self.host_function.device_ir.root_ids) == 1:
+            if len(self.host_function.device_ir.root_ids) == 1 or is_nki:
                 body = self.device_function.body
             else:
                 assert len(self.host_function.device_ir.root_ids) > 1
@@ -957,26 +1284,40 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         codegen_fn(state)
                     root = root_graph_info.graph
                     grid_state = self.current_grid_state
-                    if isinstance(grid_state, DeviceGridState):
-                        # Codegen the body first so synthetic free-``hl.arange``
-                        # lane loops registered *during* body lowering (CuTe
-                        # over-budget chunking) are visible to the wrap below.
-                        wrapped_body: list[ast.AST] = []
-                        with self.set_statements(wrapped_body):
-                            codegen_call_with_graph(self, root, [])
-                        if grid_state.has_lane_loops():
-                            self.statements_stack[-1].extend(grid_state.outer_prefix)
-                            if self.device_function.cute_state.consume_root_lane_loop_suppression():
-                                self.statements_stack[-1].extend(wrapped_body)
-                            else:
+                    if env.backend.name == "nki":
+                        env.backend.validate_nki_tensor_shapes(root)
+                        # Run FX-graph fusion passes after validation: annotate
+                        # nodes with metadata that downstream codegen consumes
+                        # (e.g. matmul→activation PSUM reuse). Passes are read-only
+                        # on graph structure; they only set node.meta entries.
+                        from .nki_fusion import annotate_fx_graph
+
+                        annotate_fx_graph(root)
+                    with env.set_codegen_state(state):
+                        if isinstance(grid_state, DeviceGridState):
+                            # Codegen the body first so synthetic free-``hl.arange``
+                            # lane loops registered *during* body lowering (CuTe
+                            # over-budget chunking) are visible to the wrap below.
+                            wrapped_body: list[ast.AST] = []
+                            with self.set_statements(wrapped_body):
+                                codegen_call_with_graph(self, root, [])
+                            if grid_state.has_lane_loops():
                                 self.statements_stack[-1].extend(
-                                    grid_state.wrap_body(wrapped_body)
+                                    grid_state.outer_prefix
                                 )
-                            self.statements_stack[-1].extend(grid_state.outer_suffix)
+                                if self.device_function.cute_state.consume_root_lane_loop_suppression():
+                                    self.statements_stack[-1].extend(wrapped_body)
+                                else:
+                                    self.statements_stack[-1].extend(
+                                        grid_state.wrap_body(wrapped_body)
+                                    )
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
+                            else:
+                                self.statements_stack[-1].extend(wrapped_body)
                         else:
-                            self.statements_stack[-1].extend(wrapped_body)
-                    else:
-                        codegen_call_with_graph(self, root, [])
+                            codegen_call_with_graph(self, root, [])
                 finally:
                     self.current_root_graph_info = previous_root_graph_info
 
@@ -991,7 +1332,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
                 # If we are in a multi top level loop, for all loops except for the last one
                 # emit ifthenelse blocks
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                if (
+                    not is_nki
+                    and node._root_id < len(self.host_function.device_ir.root_ids) - 1
+                ):
                     block = (
                         self.device_function.body
                         if self.next_else_block is None
@@ -1066,7 +1410,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
-                return self.device_function.codegen_function_call()
+                call_stmt = self.device_function.codegen_function_call()
+                post_stmts = getattr(
+                    self.device_function, "_nki_post_call_stmts", None
+                )
+                if post_stmts:
+                    self.add_statement(call_stmt)
+                    for s in post_stmts:
+                        self.add_statement(s)
+                    return None
+                return call_stmt
             return None
         return self.generic_visit(node)
 

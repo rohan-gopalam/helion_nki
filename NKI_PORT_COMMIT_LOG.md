@@ -313,3 +313,40 @@ upstream's `_output_only_names` when store codegen lands.
 **Verification (gate passed):** module AST-parses; all 8 representative NKI methods present on DeviceFunction;
 `NKIBackend.sympy_printer_expr(x % 8)` → `(x % 8)` (Python modulo via HelionNKIPrinter); `import helion` OK,
 backends include nki.
+
+## P1.10 — generate_ast.py: NKI tracking, methods, pre-codegen passes (~386-line delta)
+
+**File:** `helion/_compiler/generate_ast.py`
+
+**Applied:**
+1. **4 `__init__` attrs** (after `next_else_block`): `_var_to_constant`, `_nki_sbuf_constant_values`,
+   `_nki_sbuf_alloc_depth`, `fx_node_to_ast`.
+2. **`_lower_nki_mod_assign`** (after `mask_var`): lowers `var = a % b` to the NKI
+   tensor_scalar(mul 1/b)→floor→mul→subtract sequence (no Triton remainder helper).
+3. **4 methods after `_phase_checker`**: `_record_nki_sbuf_allocation`, `_constant_value_from_ast`,
+   `_record_nki_sbuf_write`, `_lower_nki_sbuf_reassign`.
+4. **`add_statement`**: NKI mod-assign lowering, SBUF-reassign→tensor_copy lowering, and const/alloc/write
+   tracking — all woven in BEFORE upstream's existing append + `_record_statement_thread_references` /
+   `_record_tcgen05_owned_statement` calls (preserved).
+5. **`get_var_constant_value` + `record_fx_node_ast` + `ast_for_fx_node`** (override the CodegenInterface
+   no-op base from P1.2 with the real dict-backed recording).
+6. **`lift`**: NKI Mod early-lowering via `NKIOpOverrides.mod`. **Import adapted**: reference used
+   `from .backend import NKIOpOverrides`; since P1.6 moved it, this now reads `from .nki_backend import
+   NKIOpOverrides`.
+7. **Device-loop GRID codegen** (re-anchored onto upstream's refactored body-first / cute_state version):
+   added `env`+`is_nki`; `is_nki` forces the single-body-block path; `validate_nki_tensor_shapes(root)` +
+   `annotate_fx_graph(root)` before codegen; wrapped the grid-state codegen branch in
+   `with env.set_codegen_state(state):`; guarded the multi-root if/else emission with `not is_nki`;
+   added the `_nki_post_call_stmts` post-call handling at the `codegen_function_call` return.
+
+**Plan note (the disabled `_nki_dyn_loops` cleanup hunk):** the reference carried a commented-out cleanup
+block in `_add_device_loop`; it was already disabled (dead comment) so not ported.
+
+**Verification (gate passed):**
+- Module AST-parses; all 8 NKI methods present on `GenerateAST`; `NKIOpOverrides` imported from `nki_backend`.
+- **End-to-end smoke** (`/tmp/nki_smoke.py`, a trivial copy kernel, `to_triton_code`): pipeline now runs
+  through env-setup (nki backend selected — "experimental backend" warning fires), tracing, device_ir, and
+  generate_ast, failing exactly at `BackendImplementationMissing: codegen for API function load` — i.e. the
+  next unported step (P1.17 memory_ops). This confirms the generate_ast wiring is correct and the failure is
+  a clean not-yet-implemented at the expected boundary.
+- Regression: `import helion` OK.

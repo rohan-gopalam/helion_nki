@@ -524,3 +524,41 @@ backend.py L4620 — so block_idx would never trigger the NKI guard; cosmetic, s
 **Verification (gate passed):** parses; `import helion` OK; **end-to-end smoke now runs the full NKI tile
 path** (grid + device loop — the prior NKIProgramIDs NameError is fixed) and fails cleanly at the expected
 `codegen for API function load` boundary (P1.17, next step). P1.16 functionally complete.
+
+## P1.17 — memory_ops.py: NKI load/store codegen (THE GIANT; 5739 lines, verbatim)
+
+**File:** `helion/language/memory_ops.py`
+
+**Approach (extract-and-append, like P1.6/P1.14):** The reference delta is **purely additive** (0 removed
+lines). The NKI block is the 6 helpers + `@codegen(load,"nki")` + `@codegen(store,"nki")`, contiguous in the
+reference from L510 to L6248. **Important boundary finding:** L6250+ in the reference is shared
+`@get_masked_value(load)` / `@ref(load)` code that ALREADY exists upstream (count 1 each) — so the extract
+stops at L6248 to avoid double-registration. Extracted L510-6248 (5739 lines) verbatim via sed and appended
+at EOF. Added `from ._nki_dim_access import DynamicAP, IndirectAP` at module top (the only non-lazy import
+the block needs; everything else is lazy-imported inside function bodies).
+
+**Helpers:** `_nki_shifted_tile_subscript`, `_nki_indirect_gather`, `_nki_lookup_sbuf_shape_dtype`,
+`_nki_as_uint32_p1_vector`, `_nki_row_index_gather`, `_nki_subscript_block_id`.
+
+**MILESTONE — first end-to-end NKI codegen on the port.** `to_triton_code` for a copy kernel now produces a
+complete, valid `@nki.jit` kernel:
+```
+@nki.jit
+def _helion_k(x, nki_return_numel):
+    x = x.reshape([1, 256])
+    nki_return_buf = nl.ndarray([1, nki_return_numel], dtype=nl.float32, buffer=nl.shared_hbm)
+    for offset_0 in nl.affine_range(0, 256, 128):
+        indices_0 = nl.ndarray([1, 128], nl.int32, buffer=nl.sbuf)
+        nisa.iota(dst=indices_0, pattern=[[1, 128]], offset=offset_0, channel_multiplier=0)
+        _nki_sbuf_1 = nl.ndarray([1, 128], nl.float32, buffer=nl.sbuf)
+        nisa.memset(_nki_sbuf_1, value=0)
+        if offset_0 >= 0 and offset_0 + 128 <= 256:
+            nisa.dma_copy(dst=_nki_sbuf_1, src=x[0:1, offset_0:offset_0 + 128])
+        nisa.dma_copy(dst=nki_return_buf[0:1, offset_0:offset_0 + 128], src=_nki_sbuf_1)
+    return nki_return_buf
+def k(x, *, _launcher=_default_nki_launcher): ...
+```
+
+**Verification (gate passed):** parses; 6 helpers import; `nki` in `load._codegen` and `store._codegen`;
+**NO Triton/`tl.` leakage**; full kernel has `@nki.jit`, `nl.affine_range`, `nisa.iota`, 2× `nisa.dma_copy`,
+bounds guard, and the host launcher. `import helion` OK.

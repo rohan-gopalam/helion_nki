@@ -152,6 +152,7 @@ def _register_tunable_type(
     # During type propagation, register the tunable parameter and return unbacked symint
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.type_info import NumericType
+    from .._compiler.type_info import SymIntType
 
     env = CompileEnvironment.current()
 
@@ -178,6 +179,8 @@ def _register_tunable_type(
     python_type = type(fragment_val.default())
     if not issubclass(python_type, (int, float, bool)):
         raise exc.TunableTypeNotSupported(python_type)
+    if python_type is int:
+        return SymIntType(origin, env.create_unbacked_symint(fragment_val.default()))
     return NumericType.subtype(python_type).new_unbacked(origin)
 
 

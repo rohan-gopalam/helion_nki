@@ -1921,6 +1921,158 @@ class PersistentReductionState(DeviceLoopOrGridState):
         return wrapped
 
 
+# ---------------------------------------------------------------------------
+# NKI tile-strategy helpers (ported from fix-nki-kernel-compilation).
+# Module-level; inert for non-NKI backends (getattr fallbacks).
+# ---------------------------------------------------------------------------
+def _nki_body_leading_count(
+    state: object, block_ids: list[int], env: object
+) -> int:
+    """How many of this loop's block_sizes contribute to the partition
+    dim of the largest 3D+ allocation in the kernel body.
+
+    Scans the FX graph (via ``state.fx_node``'s enclosing graph) for
+    creation ops (hl.full/hl.zeros and similar) with ndim >= 3 whose
+    leading dim symbols match this loop's block_ids. Returns the max
+    number of leading dims whose symbols are in our block_ids.
+
+    For a pure 2D loop with 2D body allocations only, returns 0.
+    For a 2D loop with a 3D body allocation like [tile_b, tile_m, D]
+    (both block_ids in leading dims), returns 2.
+    """
+    block_id_set = set(block_ids)
+    best = 0
+
+    # Walk EVERY sub-graph in device_ir (including inner loop bodies that
+    # aren't root graphs). Inner for loops (e.g. the tile_v inner loop in
+    # grpo_loss) own their own graphs and contain 3D loads that the outer
+    # root graph doesn't see.
+    try:
+        codegen = getattr(state, "codegen", None)
+        hf = getattr(codegen, "host_function", None) if codegen is not None else None
+        if hf is not None:
+            device_ir = hf.device_ir
+            for graph_info in device_ir.graphs:
+                _best = _count_leading_block_id_matches(graph_info.graph, block_id_set, env)
+                if _best > best:
+                    best = _best
+            return best
+    except Exception:
+        pass
+
+    # Fallback: state.fx_node.graph
+    fx_node = getattr(state, "fx_node", None)
+    if fx_node is not None and hasattr(fx_node, "graph"):
+        return _count_leading_block_id_matches(fx_node.graph, block_id_set, env)
+    return best
+
+
+def _count_leading_block_id_matches(graph, block_id_set, env) -> int:
+    """For each node in ``graph`` whose meta['val'] is a 3D+ tensor, count
+    how many of its leading dims (all but the last) have symbols that
+    are block-size symbols for the loop identified by ``block_id_set``.
+    Return the max count seen.
+    """
+    best = 0
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        if val.ndim < 3:
+            continue
+        # Count how many LEADING dims (all but the last) are themselves
+        # this-loop's block_size symbols.
+        leading_matches = 0
+        for d in val.shape[:-1]:
+            if not isinstance(d, torch.SymInt):
+                break
+            sym_expr = d._sympy_()
+            if not hasattr(sym_expr, "free_symbols"):
+                break
+            matched = False
+            for sym in sym_expr.free_symbols:
+                for bid in block_id_set:
+                    try:
+                        bs_info = env.block_sizes[bid]
+                    except IndexError:
+                        continue
+                    if sym == bs_info.symbol():
+                        matched = True
+                        break
+                if matched:
+                    break
+            if not matched:
+                break
+            leading_matches += 1
+        if leading_matches > best:
+            best = leading_matches
+    return best
+
+
+def _backend_loop_index_statements(
+    backend: object,
+    *,
+    offset_var: str,
+    block_size_var: str,
+    dtype: str,
+    axis: int,
+    index_var: str,
+) -> list[ast.stmt]:
+    """Return the statement(s) that compute ``index_var`` from ``offset_var``.
+
+    Most backends produce a single assignment ``index_var = <expr>``. The NKI
+    backend needs an SBUF ndarray allocation plus a nisa.iota fill (so the
+    index is a per-position vector, not a scalar). Backends with that kind
+    of multi-statement setup implement ``loop_index_statements`` and
+    ``grid_index_statements``; everything else falls back to the single
+    ``{index_var} = {loop_index_expr(...)}`` shape.
+    """
+    fn = getattr(backend, "loop_index_statements", None)
+    if fn is not None:
+        stmts = fn(
+            offset_var=offset_var,
+            block_size_var=block_size_var,
+            dtype=dtype,
+            axis=axis,
+            index_var=index_var,
+        )
+        return [
+            s if isinstance(s, ast.stmt) else statement_from_string(s)
+            for s in stmts
+        ]
+    idx_expr = backend.loop_index_expr(offset_var, block_size_var, dtype, axis=axis)
+    return [statement_from_string(f"{index_var} = {idx_expr}")]
+
+
+def _backend_grid_index_statements(
+    backend: object,
+    *,
+    offset_var: str,
+    block_size_var: str,
+    dtype: str,
+    axis: int,
+    index_var: str,
+) -> list[ast.stmt]:
+    """Parallel to ``_backend_loop_index_statements`` for codegen_grid."""
+    fn = getattr(backend, "grid_index_statements", None)
+    if fn is not None:
+        stmts = fn(
+            offset_var=offset_var,
+            block_size_var=block_size_var,
+            dtype=dtype,
+            axis=axis,
+            index_var=index_var,
+        )
+        return [
+            s if isinstance(s, ast.stmt) else statement_from_string(s)
+            for s in stmts
+        ]
+    idx_expr = backend.grid_index_expr(offset_var, block_size_var, dtype, axis=axis)
+    return [statement_from_string(f"{index_var} = {idx_expr}")]
+
+
 class TileStrategy:
     _fn: weakref.ReferenceType[DeviceFunction]
     block_ids: list[int]
@@ -2262,9 +2414,20 @@ class TileStrategy:
         return block_id_to_info
 
     def _setup_block_size_constexpr(
-        self, state: CodegenState, block_size_var: str, block_size: SymIntLike
+        self,
+        state: CodegenState,
+        block_size_var: str,
+        block_size: SymIntLike,
+        block_idx: int | None = None,
     ) -> None:
-        """Helper to setup constexpr block size variable on host."""
+        """Helper to setup constexpr block size variable on host.
+        For NKI, block sizes are inlined as literals (no kernel params); block_idx required.
+        """
+        env = CompileEnvironment.current()
+        if env.backend.name == "nki" and block_idx is not None:
+            literal = env.block_sizes[block_idx].from_config_assert(state.config)
+            state.device_function.block_size_var_cache[(block_idx,)] = str(int(literal))
+            return
         state.device_function.constexpr_arg_with_host_def(block_size_var, block_size)
 
 

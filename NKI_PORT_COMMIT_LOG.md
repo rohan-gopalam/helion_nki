@@ -462,3 +462,27 @@ upstream; **`'nki' in codegen_impls` confirmed on all 15 lowering objects** (and
 
 **Verification (gate passed):** parses; `'mean'` in get_masked_value; mod/remainder/fmod present;
 `_check_block_broadcast_compatibility` untouched; `import helion` OK; smoke still at expected `load` boundary.
+
+## P1.16 — tile_strategy.py (HARDEST; ~945-line delta, split into sub-commits)
+
+Strategy: upstream's codegen_grid/codegen_device_loop diverged heavily (e.g. codegen_device_loop is 112
+upstream lines vs the reference's 471 NKI-heavy lines, with thread-axis/LoopDimInfo/steps additions). The
+reference's NKI path is a clean EARLY-BRANCH in codegen_grid (`if nki: return self._codegen_grid_nki(...)`),
+so the port adds NKI helper methods + early-branch guards rather than interweaving. codegen_device_loop's NKI
+logic is interwoven in the reference; ported by branching to a dedicated NKI path that leaves upstream's body
+intact.
+
+### P1.16a+b — module-level NKI helpers + _setup_block_size_constexpr block_idx
+
+**Applied:**
+- Inserted 4 module-level helpers verbatim before `class TileStrategy`: `_nki_body_leading_count`,
+  `_count_leading_block_id_matches`, `_backend_loop_index_statements`, `_backend_grid_index_statements`.
+  The `_backend_*` ones use `getattr(backend,"loop_index_statements"/"grid_index_statements",None)` → inert
+  for non-NKI (NKIBackend defines those, from P1.6). Deps `grid_index_expr`/`loop_index_expr` exist on base.
+- `TileStrategy._setup_block_size_constexpr`: added `block_idx: int | None = None` param + the NKI guard
+  (inline block size as a literal in `block_size_var_cache`, no kernel param). Upstream matched the
+  reference's pre-edit form. Existing call sites need no change — they default `block_idx=None` (Triton/cute
+  path); the NKI-specific calls that pass `block_idx=` live inside the NKI methods added in P1.16c-f.
+
+**Verification (gate passed):** parses; `_setup_block_size_constexpr` signature has `block_idx`; `import
+helion` OK; smoke still at expected `load` boundary.

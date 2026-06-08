@@ -787,3 +787,27 @@ byte-identical to ref); matmul still byte-identical (no regression).
 **Remaining (separate, autotuner-related):** `aten.where 'Missing placeholders: y'` in concatenate /
 jagged_mean / jagged_hstu_attn — surfaces only when the new base autotuner explores configs the reference's
 NKIFiniteSearch never did. Tracked as Phase 3 task #2.
+
+## P2.2b — Authoritative hardware baseline (after triage fixes db8ce151)
+
+Full hardware sweep (1940s) then targeted re-sweep of failures at current committed state.
+**Current: 35 PASS of the non-blocked set** (32 from full sweep + fused_nki_ops/jagged_layer_norm/jagged_sum
+recovered by db8ce151). Blocked-as-expected: grpo_loss, mamba2_chunk_scan, mamba2_chunk_state, nvfp4_gemm
+(4 of the documented 5). fused_linear_jsd PASSED (blocked-but-passed — bonus).
+
+**11 still-failing (non-blocked), categorized:**
+- **where bug (fixable):** concatenate, jagged_mean, jagged_hstu_attn — upstream's new `where_lowering`
+  ("common" handler builds {x}/{y} template) is incompatible with NKI's statement-emitting where_expr.
+- **pre-existing (documented in memory as known reference failures):** int4_gemm (bitwise int8 unsupported),
+  gdn_fwd_h (strided 4D indexing), split_k_barrier ("TODO: implement for other devices").
+- **bwd/autograd gradient mismatch:** layer_norm, rms_norm — need to confirm vs reference on hardware
+  (may be pre-existing NKI bwd limitation; fwd codegen is byte-identical).
+- **other (triage needed):** long_sum (shape (1,16384) vs (1,1) compat), low_mem_dropout (RNG __rshift__
+  "both operands host scalars"), psum_reuse_test ("no generated kernel source" — likely harness).
+
+**IMPORTANT methodology note:** the earlier "48/48 codegen-identical" sweep was partly misleading for
+config-less kernels (concatenate etc.) — at commit 5813c8c6 they errored IDENTICALLY on both port and
+reference (ModuleNotFoundError: nki_search, since the reference's autotuner override needs nki_search which
+was never ported), and my harness counted error==error as "identical". Phase 3 (834689a2) removed that
+nki_search dependency, so those kernels now reach real codegen and expose the next layer. The hardware sweep
+is the authoritative signal, not the codegen harness, for config-less kernels.

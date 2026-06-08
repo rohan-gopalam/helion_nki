@@ -838,3 +838,23 @@ vs reference pick different configs):**
 
 Earlier direct-call and route-to-overrides attempts were reverted (they shifted var-numbering / mishandled
 host-scalar operands). The dispatch-skip is the minimal correct fix.
+
+## P2.2c — Triage of remaining failures (in progress)
+
+After the where fix (51f952ee): **~37 pass** of the non-blocked set. Remaining non-blocked failures, with
+triage status:
+
+| Example | Failure | Assessment |
+|---|---|---|
+| int4_gemm | numeric mismatch 96% | **pre-existing** (memory: "bitwise ops on int8 not supported") |
+| gdn_fwd_h | load 'list index out of range' | **pre-existing** (memory: "strided 4D tensor indexing", complex) |
+| jagged_hstu_attn | NKI compile 'add got (object,int)' | **pre-existing-class** (memory: "5D scatter, complex 3D→2D"); where-fix let it progress past the where bug to this deeper issue |
+| psum_reuse_test | "no generated kernel source found" | **HARNESS ARTIFACT** — kernels compile (Compiler status PASS x2); the test searches TORCHINDUCTOR_CACHE_DIR (default /tmp/torchinductor_ubuntu) for the source, but my sweep's cache-dir differs. Not a port bug. |
+| long_sum | neuronx-cc 'shape (1,16384) vs (1,131072)' | deep reduction-loop tiling bug on a long (131072) dim; config'd; likely pre-existing |
+| low_mem_dropout | RNG __rshift__ 'both operands host scalars' | philox RNG codegen; needs reference comparison |
+| layer_norm / rms_norm | BWD gradient mismatch | autograd/bwd; fwd codegen byte-identical; needs reference comparison |
+| split_k_barrier | "TODO: implement for other devices" | example/feature not implemented for NKI; likely pre-existing |
+
+Running reference-helion-on-hardware to confirm pre-existing status. (First reference sweep hit transient
+NRT_FAILURE on all 9 — invalid; device confirmed healthy via port `add` PASS; re-running reference cleanly
+with inter-example settle delay.)

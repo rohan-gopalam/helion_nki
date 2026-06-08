@@ -24,10 +24,12 @@ MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
 class Config(Mapping[str, object]):
     config: dict[str, object]
+    platform_target: str | None
 
     def __init__(
         self,
         *,
+        platform_target: str | None = None,
         # Core properties
         block_sizes: list[int] | None = None,
         num_threads: list[int] | int | None = None,
@@ -95,6 +97,8 @@ class Config(Mapping[str, object]):
                 the N dimension. None = disabled (default), valid values are 2 or 4.
             **kwargs: Additional user-defined configuration parameters.
         """
+        self.platform_target = platform_target
+
         self.config = {}
         core_props = {
             "block_sizes": block_sizes,

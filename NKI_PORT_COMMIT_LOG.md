@@ -222,3 +222,32 @@ unregistered. To be narrowed to `except ImportError` once nki_backend.py is stab
 
 **Known forward dependency (not a failure):** `NKIBackend.function_decorator` calls
 `helion.runtime.settings.get_neuron_target`, which P1.7 adds. Not exercised by the P1.6 gate; resolved at P1.7.
+
+## P1.7 — runtime launcher, settings (get_neuron_target + platform_target), config, output_header
+
+**Files:** `helion/runtime/__init__.py`, `helion/runtime/settings.py`, `helion/runtime/config.py`,
+`helion/_compiler/output_header.py`
+
+**Applied:**
+1. **`runtime/__init__.py`**: added `default_nki_launcher` verbatim from the reference, inserted right after
+   `default_launcher`. Moves tensors to the XLA device, casts int64→int32, auto-bumps LNC to 2 for kernels
+   containing `dynamic_range`, runs `xm.mark_step()`, and supports `HELION_NKI_PROFILE` timing. `torch_xla`
+   is imported INSIDE the function body (plugin constraint preserved). Added `import time` (module scope;
+   `os`/`sys` already upstream).
+2. **`settings.py`**: added `get_neuron_target()` (config → `HELION_NEURON_TARGET` → `neuron-ls` autodetect →
+   explicit RuntimeError) + `import subprocess`; added `platform_target: str | None = None` field to
+   `_Settings` (placed last to avoid dataclass default-ordering issues) and its FIELD_DOCS entry.
+   **Did NOT** touch `BackendLiteral`/`_get_backend` — upstream derives them from `list_backends()` so `nki`
+   already appears (the reference's manual `"nki": "nki"` mapping entry is unnecessary here).
+3. **`config.py`**: added `platform_target: str | None` class attr + `__init__` kwarg + `self.platform_target = …`.
+4. **`output_header.py`**: added `"_default_nki_launcher"` to `disallowed_names`.
+
+**This resolves the P1.6 forward dependency:** `NKIBackend.function_decorator` imports `get_neuron_target`,
+which now exists. (function_decorator can only be fully exercised inside a live CompileEnvironment during a
+real bind, which requires the codegen steps P1.10+; deferred to those gates.)
+
+**Verification (gate passed):** `default_nki_launcher` importable; `Config(platform_target='trn2')` works;
+`get_neuron_target()` resolves via env and via config arg; **`torch_xla` NOT in sys.modules after import**
+(lazy import confirmed); all 4 files AST-parse; `_default_nki_launcher` in output_header disallowed_names.
+
+**Plan deviation:** skipped the `BackendLiteral`/`_get_backend` mapping edits (registry-driven upstream).

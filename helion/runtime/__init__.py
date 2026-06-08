@@ -12,6 +12,7 @@ import json
 import linecache
 import os
 import sys
+import time
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
@@ -191,6 +192,81 @@ def default_launcher(
         if "Cannot make_shape_compatible: incompatible dimensions" in message:
             raise exc.ShapeMismatch("kernel operands", message) from error
         raise
+
+
+def default_nki_launcher(
+    nki_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    """Default launcher for NKI kernels on Trainium/XLA."""
+    from torch.utils._pytree import tree_map
+
+    try:
+        from torch_xla.core import xla_model as xm
+    except Exception as err:  # pragma: no cover
+        raise NotImplementedError(
+            "default_nki_launcher requires torch_xla to execute NKI kernels."
+        ) from err
+
+    first_tensor_device: torch.device | None = None
+    moved_args: list[object] = []
+    xla_device = xm.xla_device()
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            if first_tensor_device is None:
+                first_tensor_device = arg.device
+            # NKI does not support int64 tensors (rejected by
+            # _torch_to_neuron_dtype). Auto-cast to int32 here so kernels
+            # using integer-index tensors (e.g. cross_entropy labels, jagged
+            # offsets) compile without requiring user-side changes. int32 is
+            # wide enough for any realistic tensor dim or vocab index.
+            if arg.dtype == torch.int64:
+                arg = arg.to(torch.int32)
+            moved_args.append(arg.to(xla_device))
+        else:
+            moved_args.append(arg)
+
+    # pyrefly: ignore [operator]
+    import sys
+    _nki_profile = os.environ.get("HELION_NKI_PROFILE", "0") not in ("0", "false", "")
+    if _nki_profile:
+        print("        [Profile] Starting nki_kernel (XLA trace/compile)...", file=sys.stderr)
+    t_nki_start = time.time()
+    # New NKI API: kernel[N] sets LNC (Logical NeuronCore count, 1 or 2), not a
+    # launch grid. Helion always compiles a single NKI program that handles all
+    # tiling internally, so we default to LNC=1. Users can override with
+    # HELION_NKI_LNC=2 on trn2+ machines.
+    lnc = int(os.environ.get("HELION_NKI_LNC", "1"))
+    # Auto-switch to LNC=2 if kernel contains nl.dynamic_range (neuronx-cc
+    # IXGM verifier rejects LNC=1 + dynamic_range in XLA mode).
+    try:
+        import inspect as _inspect
+        _src = _inspect.getsource(nki_kernel)
+        if "dynamic_range" in _src and lnc < 2:
+            lnc = 2
+    except (TypeError, OSError):
+        pass
+    result = nki_kernel[lnc](*moved_args, **kwargs)
+    t_nki_end = time.time()
+    if _nki_profile:
+        print(f"        [Profile] nki_kernel took {t_nki_end - t_nki_start:.2f} seconds.", file=sys.stderr)
+
+    if _nki_profile:
+        print("        [Profile] Starting xm.mark_step() (XLA execution)...", file=sys.stderr)
+    t_mark_start = time.time()
+    xm.mark_step()
+    t_mark_end = time.time()
+    if _nki_profile:
+        print(f"        [Profile] xm.mark_step took {t_mark_end - t_mark_start:.2f} seconds.", file=sys.stderr)
+
+    if first_tensor_device is None:
+        return result
+    return tree_map(
+        lambda x: x.to(first_tensor_device) if isinstance(x, torch.Tensor) else x,
+        result,
+    )
 
 
 def _pallas_make_block_spec(

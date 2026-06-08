@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+import subprocess
 import time
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -67,6 +68,50 @@ def _resolve_warning_name(name: str) -> type[exc.BaseWarning]:
             f"HELION_IGNORE_WARNINGS entry {name!r} does not refer to a helion.exc.BaseWarning subclass"
         )
     return warning_cls
+
+
+def get_neuron_target(config_target: str | None = None) -> str:
+    """
+    Determines the target architecture for Neuron compilation.
+    Priority: 1. Config Object -> 2. Environment Variable -> 3. Auto-detect
+    """
+
+    # 1. Check if the user passed it programmatically via Config
+    if config_target:
+        return config_target
+
+    # 2. Check for a Helion-specific environment override
+    env_target = os.environ.get("HELION_NEURON_TARGET")
+    if env_target:
+        return env_target
+
+    # 3. Attempt hardware auto-detection (best effort)
+    try:
+        # Query the actual driver on the machine
+        output = subprocess.check_output(["neuron-ls"], text=True).lower()
+        # Order matters: check most specific (trn2/trn3) before trn1,
+        # since "trn1" is a substring of some longer names.
+        if "trn3" in output:
+            return "trn3"
+        if "trn2" in output:
+            return "trn2"
+        if "trn1" in output:
+            return "trn1"
+        if "inf2" in output:
+            return "inf2"
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # FileNotFoundError: neuron-ls isn't installed (e.g., CPU head node)
+        # CalledProcessError: driver is in a bad state
+        pass
+
+    # 4. Explicit Failure
+    raise RuntimeError(
+        "Helion failed to auto-detect the AWS Neuron hardware target. "
+        "If you are cross-compiling on a CPU node, you must specify the target manually.\n"
+        "Ways to fix this:\n"
+        "  - Pass it to the config: helion.Config(..., target='trn1')\n"
+        "  - Set the environment variable: export HELION_NEURON_TARGET='trn1'"
+    )
 
 
 def _get_ignore_warnings() -> list[type[exc.BaseWarning]]:
@@ -590,6 +635,7 @@ class _Settings:
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
         )
     )
+    platform_target: str | None = None
 
 
 class Settings(_Settings):
@@ -796,6 +842,7 @@ class Settings(_Settings):
             "Has no effect unless torch_compile_fusion is also True. "
             "Set HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION=1 to enable globally."
         ),
+        "platform_target": "The hardware platform to compile for when using the NKI backend (e.g. 'trn1').",
     }
 
     def __init__(self, **settings: object) -> None:

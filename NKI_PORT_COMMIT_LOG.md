@@ -412,3 +412,27 @@ backends. Added the `statement_from_string` import (was absent). Upstream's `_fu
 reference's pre-edit form exactly, and `_full_codegen_pallas` is a separate variant (no conflict).
 
 **Verification (gate passed):** module AST-parses; `full` imports; `import helion` OK.
+
+## P1.14 — aten_lowering.py: 15 NKI codegen handlers + 2 NKI-only lowering objects
+
+**File:** `helion/_compiler/aten_lowering.py`
+
+**Approach (append-block, not in-place):** The reference delta (1429 lines) is **purely additive** (0 removed
+lines, verified). Since `@<obj>.register_codegen("nki")` decorators register position-independently (the
+target `*_lowering` object just needs to be defined above), I extracted all 15 NKI handler blocks (+ the 2
+new lowering objects) verbatim from the reference via a line-range script and **appended them as one block at
+the end of the file**. This is far less error-prone than placing 15 blocks at scattered anchors, and produces
+identical *registered behavior* (and identical generated NKI kernels — the byte-for-byte goal is about
+generated code, not this file's source layout).
+
+**Handlers ported (15):** full, unsqueeze, squeeze, view (+reshape via double-decorator), permute, stack,
+expand, silu, mm, addmm, bmm, baddbmm, cumsum, iota.
+
+**NKI-only lowering objects created (2):** `silu_lowering`, `cumsum_lowering` (upstream lacked them, verified
+count 0). **PLAN CORRECTION:** `stack_lowering` is NOT NKI-only — upstream already has it (the plan/guide
+said NKI may have added it); only the `register_codegen("nki")` handler is appended for stack.
+
+**Verification (gate passed):** module AST-parses; `silu_lowering`/`cumsum_lowering` exist; all needed
+helpers (`constant_repr`, `map_arg`, `_env_arg`, `statement_from_string`, `passthrough_masked_value`) present
+upstream; **`'nki' in codegen_impls` confirmed on all 15 lowering objects** (and the register_codegen
+`assert backend not in codegen_impls` guarantees no double-registration); `import helion` OK.

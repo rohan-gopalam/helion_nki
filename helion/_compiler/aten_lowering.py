@@ -2691,3 +2691,903 @@ def codegen_topk_cute(ctx: LoweringContext, node: Node) -> object:
     node.meta["cute_topk_lane_expr"] = load.index_exprs[load.sort_index_pos]
     node.meta["cute_topk_k"] = k
     return _emit_cute_rank_sort(ctx, load, input_tensor, descending=largest, k=k)
+
+
+# ============================================================================
+# NKI backend codegen handlers
+#
+# Appended as a block (ported from fix-nki-kernel-compilation). Each handler
+# attaches to its *_lowering object via @<obj>.register_codegen("nki"); decorator
+# registration is position-independent so long as the target object is defined
+# above. silu_lowering and cumsum_lowering are NKI-introduced lowering objects
+# (upstream lacked them); stack_lowering already exists upstream.
+# ============================================================================
+
+@full_lowering.register_codegen("nki")
+def codegen_full_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    env = CompileEnvironment.current()
+    size = map_arg(node.args[0], lambda n: n.meta["val"])
+    dtype = node.kwargs.get("dtype", torch.get_default_dtype())
+    assert isinstance(dtype, torch.dtype)
+    value_ast = map_arg(node.args[1], lambda arg: _env_arg(ctx, arg))
+    if isinstance(value_ast, (int, float, bool)):
+        value_ast = expr_from_string(constant_repr(value_ast))
+    assert isinstance(value_ast, ast.AST), value_ast
+
+    NKI_PARTITION_MAX = 128
+
+    import sympy as _sympy
+
+    state = getattr(env, "_codegen_state", None)
+    _bs_subs: dict[_sympy.Symbol, int] = {}
+    if state is not None:
+        for _bid in range(len(env.block_sizes)):
+            _bs = env.block_sizes[_bid]
+            _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+    def _resolve_dim(s: int | torch.SymInt) -> int:
+        if isinstance(s, int):
+            return s
+        return int(s._sympy_().subs(_bs_subs))
+
+    # Squeeze leading batch dims (size 1) from 3D+ shapes to 2D.
+    # E.g. hl.zeros([1, tile_m, tile_n]) → [tile_m, tile_n] in NKI SBUF.
+    size = list(size)
+    while len(size) > 2 and _resolve_dim(size[0]) == 1:
+        size = size[1:]
+    # Also handle case where leading dims multiply to the partition dim
+    # (e.g. [B_tile, M_tile, N_tile] with B_tile > 1 — combine into flat partition)
+    if len(size) > 2:
+        flat_part = 1
+        for s in size[:-1]:
+            flat_part *= _resolve_dim(s)
+        size = [flat_part, _resolve_dim(size[-1])]
+
+    # 2D accumulator layout normalization: ``hl.full([1, N], ...)`` inside a
+    # tile-loop body is almost always a reduction accumulator (per-row
+    # scalars). When this full is later combined element-wise with a
+    # reduction result (which our codegen stores as [N, 1] SBUF), FX
+    # expects a [1, N] × [N, 1] → [N, N] numpy-broadcast but the kernel's
+    # semantic intent is a per-row [N] vector. Storing the accumulator
+    # as [N, 1] instead aligns with reduction output layout and lets
+    # ``tensor_scalar`` / ``tensor_tensor`` operate element-wise with
+    # matching shapes.
+    #
+    # Heuristic: if this hl.full has size [1, N] with N > 1 AND its FX
+    # users include a binary op (add/sub/max/min/mul/...) whose other
+    # operand is a SymInt-shaped tensor, transpose to [N, 1]. This
+    # correctly catches the common loop-carried accumulator case while
+    # leaving [1, N] broadcast vectors untouched (they typically have
+    # only .to()/reshape users).
+    transpose_to_partition_major = False
+    # NOTE: The transpose_to_partition_major heuristic below is disabled
+    # because it causes shape cascades in attention-style kernels where
+    # [1,N] × [1,N] operations are incorrectly treated as [N,N] broadcasts.
+    # The correct fix requires semantic understanding of accumulator vs.
+    # result shapes which is beyond a simple FX-shape heuristic.
+    if False and len(size) == 2 and _resolve_dim(size[0]) == 1:
+        _n = _resolve_dim(size[1])
+        if _n > 1:
+            _binary_op_names = {
+                "maximum", "minimum", "amax", "amin", "add", "sub", "mul",
+                "div", "log", "exp", "sum", "mean", "maximum.default",
+                "minimum.default", "exp.default", "log.default",
+            }
+            visited = set()
+            stack = list(node.users)
+            while stack and not transpose_to_partition_major:
+                u = stack.pop()
+                if u in visited:
+                    continue
+                visited.add(u)
+                if u.op == "call_function":
+                    t_name = str(getattr(u.target, "__name__", u.target)).lower()
+                    for key in _binary_op_names:
+                        if key in t_name:
+                            # Keep [1, N] row-major when the downstream op
+                            # itself remains [1, N]. Partition-axis NKI
+                            # reductions feed row tiles, and transposing the
+                            # accumulator to [N, 1] turns elementwise updates
+                            # into accidental [N, N] broadcasts.
+                            val = u.meta.get("val")
+                            if isinstance(val, torch.Tensor):
+                                try:
+                                    u_shape = [_resolve_dim(d) for d in val.shape]
+                                except (TypeError, ValueError):
+                                    u_shape = []
+                                if (
+                                    len(u_shape) == 2
+                                    and u_shape[0] == 1
+                                    and u_shape[1] == _n
+                                ):
+                                    break
+                            # Look for a same-[N] other operand or a
+                            # reduction result in the chain. This also
+                            # covers m_i = m_ij pattern where the binary
+                            # pattern appears a couple of hops away.
+                            transpose_to_partition_major = True
+                            break
+                if len(visited) < 32:
+                    stack.extend(u.users)
+
+    if transpose_to_partition_major:
+        size = [size[1], size[0]]  # swap [1, N] → [N, 1]
+
+    partition_dim = _resolve_dim(size[0])
+    free_dims = [_resolve_dim(s) for s in size[1:]]
+    dtype_str = env.backend.dtype_str(dtype)
+    var = ctx.cg.device_function.new_var("_nki_full", dce=True)
+
+    if partition_dim > NKI_PARTITION_MAX and not free_dims:
+        # 1D tensor (e.g. grad_w_acc[DIM]): in NKI semantics this represents a
+        # feature-dimension accumulator. Allocate as [1, DIM] (partition=1, free=DIM)
+        # so that it can be stored to [block_id:block_id+1, 0:DIM] in HBM.
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"{var} = nl.ndarray([1, {partition_dim}], {dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"nisa.memset({var}, value={{val}})", val=value_ast
+            )
+        )
+        # Register shape so cast_ast and other ops know the SBUF shape
+        ctx.cg.device_function._nki_sbuf_shapes[var] = [1, partition_dim]
+        # Mark as a free-dim accumulator (not a partition-split tile list)
+        ctx.cg.device_function._nki_free_dim_tile_lists.add(var)
+    elif partition_dim > NKI_PARTITION_MAX:
+        n_partitions = partition_dim // NKI_PARTITION_MAX
+        assert partition_dim % NKI_PARTITION_MAX == 0, (
+            f"partition dim {partition_dim} must be multiple of {NKI_PARTITION_MAX}"
+        )
+        free_str = ", ".join(str(d) for d in free_dims)
+        tile_vars: list[str] = []
+        for i in range(n_partitions):
+            tile_var = ctx.cg.device_function.new_var(f"{var}_{i}")
+            tile_vars.append(tile_var)
+            ctx.cg.add_statement(
+                statement_from_string(
+                    f"{tile_var} = nl.ndarray([{NKI_PARTITION_MAX}, {free_str}], "
+                    f"{dtype_str}, buffer=nl.sbuf)"
+                )
+            )
+        for tile_var in tile_vars:
+            ctx.cg.add_statement(
+                statement_from_string(
+                    f"nisa.memset({tile_var}, value={{val}})", val=value_ast
+                )
+            )
+        ctx.cg.device_function.register_tile_list(var, tile_vars)
+    else:
+        shape_dims = ctx.cg.device_function.tile_strategy.shape_dims([*size])
+        ndarray_expr = env.backend.full_expr(shape_dims, "0", dtype)
+        ctx.cg.add_statement(statement_from_string(f"{var} = {ndarray_expr}"))
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"nisa.memset({var}, value={{val}})", val=value_ast
+            )
+        )
+        # Register SBUF shape for multi-user detection on copy vars
+        # full_expr may have added a trailing 1 for 1D shapes internally
+        def _resolve_nki_shape_dim(dim: object) -> int:
+            if isinstance(dim, int):
+                return dim
+            if isinstance(dim, torch.SymInt):
+                return int(dim._sympy_().subs(_bs_subs))
+            if isinstance(dim, str):
+                for (
+                    block_id,
+                ), var_name in ctx.cg.device_function.block_size_var_cache.items():
+                    if var_name == dim:
+                        return int(
+                            env.block_sizes[block_id].from_config_assert(
+                                state.config
+                            )
+                        )
+                return int(dim)
+            return int(dim)
+
+        try:
+            resolved = [_resolve_nki_shape_dim(d) for d in shape_dims]
+            if len(resolved) == 1:
+                resolved.append(1)
+            if len(resolved) >= 2:
+                ctx.cg.device_function._nki_sbuf_shapes[var] = resolved
+        except (TypeError, ValueError):
+            pass
+    return expr_from_string(var)
+
+
+@unsqueeze_lowering.register_codegen("nki")
+def codegen_unsqueeze_nki(ctx: LoweringContext, node: Node) -> object:
+    # NKI tensors are already 2D (partition, free) and broadcast automatically.
+    # unsqueeze is a no-op.
+    assert not node.kwargs, "unsqueeze kwargs not supported"
+    tensor = _env_arg(ctx, cast("Node", node.args[0]))
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
+@squeeze_lowering.register_codegen("nki")
+def codegen_squeeze_nki(ctx: LoweringContext, node: Node) -> object:
+    # NKI tensors are already 2D (partition, free); squeeze is a no-op.
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
+@view_lowering.register_codegen("nki")
+@reshape_lowering.register_codegen("nki")
+def codegen_view_nki(ctx: LoweringContext, node: Node) -> object:
+    # NKI SBUF tensors are 2D (partition, free); view/reshape are no-ops.
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
+@permute_lowering.register_codegen("nki")
+def codegen_permute_nki(ctx: LoweringContext, node: Node) -> object:
+    """NKI lowering for aten.permute.
+
+    NKI SBUF tiles are always 2D (partition, free). Helion's NKI backend
+    reshapes higher-rank inputs to 2D at kernel entry (`device_function`
+    preamble). In that 2D view:
+
+    - Identity permutations are no-ops.
+    - A true 2D swap (``dims == [1, 0]``) becomes ``nc_transpose``.
+    - Higher-rank permutations whose logical effect preserves the
+      (partition, free) 2D layout are treated as no-ops — the FX graph
+      uses them for shape bookkeeping only.
+
+    Permutations that actually reorder the partition/free axes in a way
+    that changes the 2D tile contents (other than a plain 2D swap) are
+    not yet supported.
+    """
+    import ast as _ast
+    from .backend import NKIOpOverrides, NKIBackend
+    from .compile_environment import CompileEnvironment
+    from .ast_extension import statement_from_string
+
+    tensor, dims = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, _ast.AST)
+    # pyrefly: ignore [not-iterable]
+    dims = [*dims]
+    assert {*dims} == {*range(len(dims))}, dims
+
+    # Identity
+    if dims == list(range(len(dims))):
+        return tensor
+
+    # 2D swap → nc_transpose. We allocate a PSUM tile (required by
+    # nc_transpose on the Tensor Engine) then copy back to SBUF.
+    if len(dims) == 2 and dims == [1, 0]:
+        from .generate_ast import GenerateAST
+
+        env = CompileEnvironment.current()
+        state = getattr(env, "_codegen_state", None)
+        if state is None or env.backend.name != "nki":
+            # Fall back to no-op; shape bookkeeping only.
+            return tensor
+
+        val = node.meta.get("val")
+        input_val = node.args[0].meta.get("val") if isinstance(node.args[0], Node) else None
+        if not isinstance(val, torch.Tensor) or not isinstance(input_val, torch.Tensor):
+            return tensor
+
+        def _resolve_shape(shape: list) -> list[int]:
+            out: list[int] = []
+            for d in shape:
+                if isinstance(d, int):
+                    out.append(d)
+                elif isinstance(d, torch.SymInt):
+                    out.append(env.size_hint(d))
+                else:
+                    out.append(int(d))
+            return out
+
+        # Squeeze to 2D (NKI SBUF tiles are 2D) AFTER resolving any SymInts.
+        src_shape = NKIOpOverrides._squeeze_shape_2d(_resolve_shape(list(input_val.shape)))
+        dst_shape = NKIOpOverrides._squeeze_shape_2d(_resolve_shape(list(val.shape)))
+        if len(src_shape) != 2 or len(dst_shape) != 2:
+            return tensor
+
+        dtype_str = env.backend.dtype_str(val.dtype)
+
+        # Check if source is a tile-list (multi-tile split from partition > 128 load).
+        src_name = _ast.unparse(tensor)
+
+        # Prefer the registered SBUF shape over the FX val shape, which may
+        # have wrong size hints for dynamic block sizes (e.g. tile_kv with
+        # unbacked SymInt whose hint differs from the configured block_size).
+        registered_src = state.device_function._nki_sbuf_shapes.get(src_name)
+        if registered_src is not None and len(registered_src) == 2:
+            src_shape = list(registered_src)
+            # Infer dst_shape as the transpose
+            dst_shape = [src_shape[1], src_shape[0]]
+
+        src_tile_vars = state.device_function.get_tile_list_vars(src_name)
+        if src_tile_vars is not None:
+            # Use actual per-tile SBUF shapes (not FX val shape, which may
+            # not reflect the clamped block_size).
+            tile0_shape = state.device_function._nki_sbuf_shapes.get(src_tile_vars[0])
+            if tile0_shape is None or len(tile0_shape) != 2:
+                tile0_shape = [128, src_shape[1] if src_shape else 1]
+            n_tiles = len(src_tile_vars)
+            per_tile_partition = tile0_shape[0]
+            per_tile_free = tile0_shape[1]
+            # Full src shape after concat (partition axis): [n_tiles * 128, F]
+            # Transposed: [F, n_tiles * 128]
+            total_partition = n_tiles * per_tile_partition
+            sbuf_var = state.device_function.new_var("_nki_permute_sbuf")
+            state.add_statement(statement_from_string(
+                f"{sbuf_var} = nl.ndarray([{per_tile_free}, {total_partition}], {dtype_str}, buffer=nl.sbuf)"
+            ))
+            for i, tv in enumerate(src_tile_vars):
+                tr_psum = state.device_function.new_var("_nki_permute_psum_t")
+                state.add_statement(statement_from_string(
+                    f"{tr_psum} = nl.ndarray([{per_tile_free}, {per_tile_partition}], {dtype_str}, buffer=nl.psum)"
+                ))
+                state.add_statement(statement_from_string(
+                    f"nisa.nc_transpose(dst={tr_psum}, data={tv})"
+                ))
+                free_start = i * per_tile_partition
+                free_end = (i + 1) * per_tile_partition
+                state.add_statement(statement_from_string(
+                    f"nisa.tensor_copy(dst={sbuf_var}[0:{per_tile_free}, {free_start}:{free_end}], src={tr_psum})"
+                ))
+            state.device_function._nki_sbuf_shapes[sbuf_var] = [per_tile_free, total_partition]
+            state.device_function._nki_sbuf_dtypes[sbuf_var] = dtype_str
+            return expr_from_string(sbuf_var)
+
+        psum_var = state.device_function.new_var("_nki_permute_psum")
+        sbuf_var = state.device_function.new_var("_nki_permute_sbuf")
+
+        # Allocate PSUM with the same dtype as input (nc_transpose requires
+        # dst.dtype == data.dtype).
+        state.add_statement(
+            statement_from_string(
+                f"{psum_var} = nl.ndarray([{dst_shape[0]}, {dst_shape[1]}], {dtype_str}, buffer=nl.psum)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.nc_transpose(dst={psum_var}, data={_ast.unparse(tensor)})"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"{sbuf_var} = nl.ndarray([{dst_shape[0]}, {dst_shape[1]}], {dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={sbuf_var}, src={psum_var})"
+            )
+        )
+        state.device_function._nki_sbuf_shapes[sbuf_var] = dst_shape
+        state.device_function._nki_sbuf_dtypes[sbuf_var] = dtype_str
+        return expr_from_string(sbuf_var)
+
+    # Higher-rank permutations: treat as a no-op on the 2D-squeezed layout
+    # when the permutation preserves the logical partition/free axes. This
+    # covers common Mamba/attention patterns where 3D/4D permutes are used
+    # for shape bookkeeping only and the underlying SBUF tile is unchanged.
+    # If a kernel really needs a partition-axis permute on a higher-rank
+    # tile, it should reshape explicitly — we surface a clear error then.
+    return tensor
+
+
+@stack_lowering.register_codegen("nki")
+def codegen_stack_nki(ctx: LoweringContext, node: Node) -> object:
+    """NKI lowering for aten.stack.
+
+    Stacks N input tensors along a new dimension. Since NKI only supports
+    2D tiles, we interleave the input tiles into a larger 2D tile.
+
+    For dim=0: stack([A, B], dim=0) on [P, F] tiles → [N*P, F]
+      Row i*P+j of output = input_i[j, :]
+    For dim=1: stack([A, B], dim=1) on [P, F] tiles → [P, N*F]
+      or after squeeze: [P*N, F] depending on dimensionality
+    """
+    import ast as _ast
+
+    from .ast_extension import statement_from_string, create, expr_from_string
+    from .compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    state = getattr(env, "_codegen_state", None)
+    if state is None:
+        raise NotImplementedError("NKI stack requires codegen state")
+
+    tensors = node.args[0]
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+    assert isinstance(tensors, (list, tuple))
+    assert isinstance(dim, int)
+
+    tensor_asts = [ctx.env[t] for t in tensors]
+    n = len(tensor_asts)
+    if n == 0:
+        raise ValueError("Cannot stack empty tensor list")
+
+    # Get output shape from FX metadata
+    out_val = node.meta.get("val")
+    if out_val is None or not isinstance(out_val, torch.Tensor):
+        raise NotImplementedError("NKI stack requires output shape metadata")
+
+    from .backend import NKIOpOverrides
+    import sympy as _sp_stack
+    _bs_subs_stack: dict[_sp_stack.Symbol, int] = {}
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        _cfg = _bs.from_config(state.config)
+        if isinstance(_cfg, int):
+            _bs_subs_stack[_bs.symbol()] = _cfg
+
+    def _resolve_stack_dim(d: object) -> int:
+        if isinstance(d, int):
+            return d
+        if isinstance(d, torch.SymInt):
+            try:
+                return int(d._sympy_().subs(_bs_subs_stack))
+            except (TypeError, ValueError):
+                return int(env.size_hint(d))
+        return int(d)
+
+    out_shape_full = [_resolve_stack_dim(d) for d in out_val.shape]
+    out_shape = NKIOpOverrides._squeeze_shape_2d(out_shape_full)
+    if len(out_shape) != 2:
+        raise NotImplementedError(f"NKI stack: output shape {out_shape_full} doesn't squeeze to 2D")
+
+    p_out, f_out = out_shape[0], out_shape[1]
+
+    # Get input shapes
+    first_input = tensors[0]
+    first_val = first_input.meta.get("val") if isinstance(first_input, Node) else None
+    if first_val is None or not isinstance(first_val, torch.Tensor):
+        raise NotImplementedError("NKI stack: input metadata missing")
+    in_shape_full = [_resolve_stack_dim(d) for d in first_val.shape]
+    in_shape = NKIOpOverrides._squeeze_shape_2d(in_shape_full)
+    if len(in_shape) != 2:
+        raise NotImplementedError(f"NKI stack: input shape {in_shape_full} doesn't squeeze to 2D")
+    p_in, f_in = in_shape[0], in_shape[1]
+
+    dtype_str = env.backend.dtype_str(out_val.dtype)
+    device_fn = state.device_function
+
+    # Allocate output buffer
+    result_var = device_fn.new_var("_nki_stack", dce=True)
+    device_fn._nki_sbuf_shapes[result_var] = [p_out, f_out]
+    device_fn._nki_sbuf_dtypes[result_var] = dtype_str
+    state.add_statement(statement_from_string(
+        f"{result_var} = nl.ndarray([{p_out}, {f_out}], {dtype_str}, buffer=nl.sbuf)"
+    ))
+    state.add_statement(statement_from_string(f"nisa.memset({result_var}, value=0)"))
+
+    # Determine whether this stack interleaves (dim inserts between existing dims)
+    # or creates contiguous blocks (dim inserts at the front).
+    # For 2D inputs [P, F]:
+    #   dim=0 → output [n, P, F] → [n*P, F]: block copy (each input = one block)
+    #   dim=1 → output [P, n, F] → [P*n, F]: interleave (elements alternate per row)
+    #   dim=-1 or dim=2 → output [P, F, n] → [P, F*n]: free-dim stack
+    # Normalize dim for the input rank
+    _input_rank = len(in_shape_full)
+    _dim_norm = dim if dim >= 0 else dim + _input_rank + 1
+    _stack_interleave = (_dim_norm > 0 and _dim_norm <= _input_rank - 1)
+
+    # Copy each input tile into the correct position
+    # After squeeze_shape_2d, the output [P_out, F_out] = [n*P_in, F_in] for dim=0
+    # or [P_in, n*F_in] for dim=-1 on the original shape.
+    # Determine the interleave strategy from the shapes:
+    if p_out == n * p_in and f_out == f_in and not _stack_interleave:
+        # Stack along partition dimension: output[i*p_in:(i+1)*p_in, :] = input_i
+        for i, tensor_ast in enumerate(tensor_asts):
+            src_name = _ast.unparse(tensor_ast) if isinstance(tensor_ast, _ast.AST) else str(tensor_ast)
+            start = i * p_in
+            state.add_statement(statement_from_string(
+                f"nisa.tensor_copy(dst={result_var}[{start}:{start + p_in}, 0:{f_out}], src={src_name})"
+            ))
+    elif p_out == p_in and f_out == n * f_in:
+        # Stack along free dimension: output[:, i*f_in:(i+1)*f_in] = input_i
+        for i, tensor_ast in enumerate(tensor_asts):
+            src_name = _ast.unparse(tensor_ast) if isinstance(tensor_ast, _ast.AST) else str(tensor_ast)
+            start = i * f_in
+            state.add_statement(statement_from_string(
+                f"nisa.tensor_copy(dst={result_var}[0:{p_out}, {start}:{start + f_in}], src={src_name})"
+            ))
+    elif p_out == p_in * n and f_out == f_in:
+        # Interleave: output[i + j*n, :] = input_j[i, :] — partition interleave
+        # This happens with dim=1 on [P, F] → [P, n, F] → squeeze [P*n, F]
+        loop_var = device_fn.new_var("_stack_i")
+        body_stmts = []
+        for j, tensor_ast in enumerate(tensor_asts):
+            src_name = _ast.unparse(tensor_ast) if isinstance(tensor_ast, _ast.AST) else str(tensor_ast)
+            body_stmts.append(statement_from_string(
+                f"nisa.tensor_copy(dst={result_var}[{loop_var}*{n}+{j}:{loop_var}*{n}+{j}+1, 0:{f_out}], "
+                f"src={src_name}[{loop_var}:{loop_var}+1, 0:{f_in}])"
+            ))
+        state.add_statement(create(
+            _ast.For,
+            target=create(_ast.Name, id=loop_var, ctx=_ast.Store()),
+            iter=expr_from_string(f"nl.affine_range({p_in})"),
+            body=body_stmts,
+            orelse=[],
+        ))
+    else:
+        raise NotImplementedError(
+            f"NKI stack: unsupported shape combination in={in_shape} out={out_shape} n={n}"
+        )
+
+    return expr_from_string(result_var)
+
+
+@expand_lowering.register_codegen("nki")
+def codegen_expand_nki(ctx: LoweringContext, node: Node) -> object:
+    assert not node.kwargs, "expand kwargs not supported"
+    tensor, _ = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    val = node.meta["val"]
+    assert isinstance(val, torch.Tensor)
+
+    from .backend import NKIOpOverrides
+
+    env = CompileEnvironment.current()
+    state = getattr(env, "_codegen_state", None)
+    if state is None:
+        return tensor
+
+    def _resolve_dim(dim: object) -> int:
+        if isinstance(dim, int):
+            return dim
+        if isinstance(dim, torch.SymInt):
+            if state.config is not None:
+                import sympy as _sympy_expand
+
+                subs: dict[_sympy_expand.Symbol, int] = {}
+                for bs in env.block_sizes:
+                    cfg = bs.from_config(state.config)
+                    if isinstance(cfg, int):
+                        subs[bs.symbol()] = cfg
+                try:
+                    return int(dim._sympy_().subs(subs))
+                except (TypeError, ValueError):
+                    return int(env.size_hint(dim))
+            return int(env.size_hint(dim))
+        return int(dim)
+
+    dst_shape = NKIOpOverrides._squeeze_shape_2d(
+        [_resolve_dim(dim) for dim in val.shape]
+    )
+    if len(dst_shape) != 2:
+        raise exc.BackendUnsupported("nki", f"expand to non-2D SBUF shape {dst_shape}")
+
+    tensor_name = ast.unparse(tensor)
+
+    def _lookup_shape(name: str) -> list[int] | None:
+        shape = state.device_function._nki_sbuf_shapes.get(name)
+        if shape is not None:
+            return list(shape)
+        lookup = name
+        while "_copy" in lookup:
+            lookup = lookup[: lookup.rfind("_copy")]
+            shape = state.device_function._nki_sbuf_shapes.get(lookup)
+            if shape is not None:
+                return list(shape)
+        return None
+
+    src_shape = _lookup_shape(tensor_name)
+    if src_shape is None and isinstance(node.args[0], Node):
+        input_val = node.args[0].meta.get("val")
+        if isinstance(input_val, torch.Tensor):
+            src_shape = NKIOpOverrides._squeeze_shape_2d(
+                [_resolve_dim(dim) for dim in input_val.shape]
+            )
+    if src_shape is None:
+        return tensor
+    if src_shape == dst_shape:
+        return tensor
+    if len(src_shape) != 2:
+        raise exc.BackendUnsupported("nki", f"expand from non-2D SBUF shape {src_shape}")
+
+    src_for_broadcast = tensor_name
+    if (
+        src_shape[0] == 1
+        and src_shape[1] == dst_shape[0]
+        and dst_shape[0] > 1
+        and dst_shape[1] > 1
+    ):
+        dtype_str = env.backend.dtype_str(val.dtype)
+        # nc_transpose requires float input. Cast int/bool to float32 first.
+        _int_dtypes_expand = {"nl.int32", "nl.int16", "nl.int8", "nl.uint32",
+                              "nl.uint16", "nl.uint8", "nl.bool_"}
+        _tr_src = tensor_name
+        _tr_dtype = dtype_str
+        if dtype_str in _int_dtypes_expand:
+            _cast_expand = state.device_function.new_var("_nki_expand_cast", dce=True)
+            state.device_function._nki_sbuf_shapes[_cast_expand] = [1, src_shape[1]]
+            state.device_function._nki_sbuf_dtypes[_cast_expand] = "nl.float32"
+            state.add_statement(statement_from_string(
+                f"{_cast_expand} = nl.ndarray([1, {src_shape[1]}], nl.float32, buffer=nl.sbuf)"
+            ))
+            state.add_statement(statement_from_string(
+                f"nisa.memset({_cast_expand}, value=0)"
+            ))
+            state.add_statement(statement_from_string(
+                f"nisa.tensor_tensor(dst={_cast_expand}, data1={_cast_expand}, data2={tensor_name}, op=nl.add)"
+            ))
+            _tr_src = _cast_expand
+            _tr_dtype = "nl.float32"
+        tr_psum = state.device_function.new_var("_nki_expand_tr_psum", dce=True)
+        tr_sbuf = state.device_function.new_var("_nki_expand_tr_sbuf", dce=True)
+        state.device_function._nki_sbuf_shapes[tr_sbuf] = [dst_shape[0], 1]
+        # When the transpose cast via float32, keep tr_sbuf as float32 to avoid
+        # a float32 psum -> bool_ bitcast (which destroys the data). The where
+        # lowering handles the bool->uint32 cast separately.
+        _tr_sbuf_dtype = _tr_dtype if _tr_dtype != dtype_str else dtype_str
+        state.device_function._nki_sbuf_dtypes[tr_sbuf] = _tr_sbuf_dtype
+        state.add_statement(
+            statement_from_string(
+                f"{tr_psum} = nl.ndarray([{dst_shape[0]}, 1], "
+                f"{_tr_dtype}, buffer=nl.psum)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.nc_transpose(dst={tr_psum}, data={_tr_src})"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"{tr_sbuf} = nl.ndarray([{dst_shape[0]}, 1], "
+                f"{_tr_sbuf_dtype}, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})")
+        )
+        src_for_broadcast = tr_sbuf
+        src_shape = [dst_shape[0], 1]
+
+    if not all(s == d or s == 1 for s, d in zip(src_shape, dst_shape, strict=True)):
+        raise exc.BackendUnsupported(
+            "nki", f"expand from {src_shape} to {dst_shape} is not broadcastable"
+        )
+
+    dtype_str = env.backend.dtype_str(val.dtype)
+    # When we transposed via float32, src_for_broadcast is float32.
+    # Use the actual src dtype for the broadcast output to avoid
+    # float32 → bool_ invalid bitcasts.
+    _out_dtype = state.device_function._nki_sbuf_dtypes.get(
+        src_for_broadcast if isinstance(src_for_broadcast, str) else "", dtype_str
+    )
+    out = state.device_function.new_var("_nki_expand", dce=True)
+    state.device_function._nki_sbuf_shapes[out] = list(dst_shape)
+    state.device_function._nki_sbuf_dtypes[out] = _out_dtype
+    state.add_statement(
+        statement_from_string(
+            f"{out} = nl.broadcast_to({src_for_broadcast}, "
+            f"shape=({dst_shape[0]}, {dst_shape[1]}))"
+        )
+    )
+    return expr_from_string(out)
+
+
+silu_lowering = register_lowering(
+    torch.ops.aten.silu.default,
+    masked_value_fn=passthrough_masked_value,
+)
+
+
+@silu_lowering.register_codegen("nki")
+def codegen_silu_nki(ctx: LoweringContext, node: Node) -> object:
+    """Lower aten.silu directly to the NKI activation override."""
+    assert not node.kwargs, "silu kwargs not supported"
+    x = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(x, ast.AST)
+    x_name = ast.unparse(x)
+    result_name = CompileEnvironment.current().backend.inductor_op_overrides().silu(x_name)
+    return expr_from_string(result_name)
+
+
+@mm_lowering.register_codegen("nki")
+def codegen_mm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, False)
+
+
+@addmm_lowering.register_codegen("nki")
+def codegen_addmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, True)
+
+
+@bmm_lowering.register_codegen("nki")
+def codegen_bmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, False)
+
+
+@baddbmm_lowering.register_codegen("nki")
+def codegen_baddbmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, True)
+
+
+cumsum_lowering = register_lowering(torch.ops.aten.cumsum.default)
+
+
+@cumsum_lowering.register_codegen("nki")
+def codegen_cumsum_nki(ctx: LoweringContext, node: Node) -> object:
+    """NKI lowering for aten.cumsum via nisa.tensor_tensor_scan.
+
+    ``nisa.tensor_tensor_scan(dst, data0, data1, initial, op0, op1)`` computes
+    ``dst[i] = op1(op0(data0[i], prev), data1[i])`` with ``prev`` starting at
+    ``initial``. Setting ``data1 = zeros`` (identity for add), ``op0 = add``,
+    ``op1 = add`` and ``initial = 0`` gives us ``cumsum(data0)``.
+
+    Trn2/Trn3 only. Inputs cast to fp32 internally.
+    """
+    from .ast_extension import statement_from_string
+    from .compile_environment import CompileEnvironment
+
+    tensor, _dim = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    env = CompileEnvironment.current()
+    state = getattr(env, "_codegen_state", None)
+    if state is None:
+        raise exc.BackendUnsupported("nki", "cumsum requires active codegen state")
+
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor):
+        raise exc.BackendUnsupported("nki", "cumsum requires tensor FX meta")
+
+    def _resolve_dim(d: object) -> int:
+        if isinstance(d, int):
+            return d
+        if isinstance(d, torch.SymInt):
+            return env.size_hint(d)
+        return int(d)
+
+    shape = [_resolve_dim(d) for d in val.shape]
+    while len(shape) > 2 and shape[0] == 1:
+        shape = shape[1:]
+    if len(shape) > 2:
+        flat = 1
+        for d in shape[:-1]:
+            flat *= d
+        shape = [flat, shape[-1]]
+    if len(shape) == 1:
+        shape = [1, shape[0]]
+
+    dtype_str = env.backend.dtype_str(val.dtype)
+    tensor_str = ast.unparse(tensor)
+
+    dst_var = state.device_function.new_var("_nki_cumsum_dst", dce=True)
+    zero_var = state.device_function.new_var("_nki_cumsum_zeros", dce=True)
+    # Allocate two buffers: zeros operand and result.
+    state.add_statement(
+        statement_from_string(
+            f"{zero_var} = nl.ndarray([{shape[0]}, {shape[1]}], {dtype_str}, buffer=nl.sbuf)"
+        )
+    )
+    state.add_statement(
+        statement_from_string(f"nisa.memset({zero_var}, value=0)")
+    )
+    state.add_statement(
+        statement_from_string(
+            f"{dst_var} = nl.ndarray([{shape[0]}, {shape[1]}], {dtype_str}, buffer=nl.sbuf)"
+        )
+    )
+    state.add_statement(
+        statement_from_string(
+            f"nisa.tensor_tensor_scan(dst={dst_var}, data0={tensor_str}, "
+            f"data1={zero_var}, initial=0.0, op0=nl.add, op1=nl.add)"
+        )
+    )
+    state.device_function._nki_sbuf_shapes[dst_var] = list(shape)
+    state.device_function._nki_sbuf_dtypes[dst_var] = dtype_str
+    return expr_from_string(dst_var)
+
+
+@iota_lowering.register_codegen("nki")
+def codegen_iota_nki(ctx: LoweringContext, node: Node) -> object:
+    """NKI lowering for torch.ops.prims.iota.default.
+
+    Emits nisa.iota to generate an affine integer sequence into SBUF.
+    The SBUF tile is 2D (1, length); callers that expect a 1D view get it
+    implicitly since view/reshape on NKI are no-ops.
+
+    When start/step are symbolic expressions they are emitted as runtime
+    values (``nisa.iota`` accepts a runtime int32 for offset). Only the
+    LENGTH is required to be a compile-time int for the tile shape.
+    """
+    from .ast_extension import statement_from_string
+    from .compile_environment import CompileEnvironment
+
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    dtype = node.kwargs.get("dtype") or CompileEnvironment.current().index_dtype
+    assert isinstance(dtype, torch.dtype)
+    (length_arg,) = node.args
+
+    env = CompileEnvironment.current()
+    state = getattr(env, "_codegen_state", None)
+    if state is None:
+        raise exc.BackendUnsupported("nki", "iota requires active codegen state")
+
+    # Resolve the (possibly symbolic) length to a concrete int for the
+    # tile shape. NKI requires compile-time tile sizes, matching the rest
+    # of the backend.
+    def _to_concrete_int(x: object) -> int:
+        if isinstance(x, int):
+            return x
+        if isinstance(x, torch.SymInt):
+            return env.size_hint(x)
+        if isinstance(x, torch.fx.Node):
+            # FX node representing a symbolic value; look up its SymInt
+            # via ``meta["val"]`` and size_hint that.
+            val = x.meta.get("val")
+            if isinstance(val, int):
+                return val
+            if isinstance(val, torch.SymInt):
+                return env.size_hint(val)
+            if hasattr(val, "_sympy_"):
+                try:
+                    return int(val._sympy_())
+                except Exception:
+                    return env.size_hint(val)
+        if hasattr(x, "_sympy_"):
+            try:
+                return int(x._sympy_())
+            except Exception:
+                pass
+        try:
+            return int(x)
+        except Exception:
+            return env.size_hint(x)  # last resort; likely to assert
+
+    length = _to_concrete_int(length_arg)
+
+    # Pad static non-power-of-2 lengths to next power of 2 to match the
+    # Triton behaviour — this keeps downstream slicing consistent.
+    if isinstance(length, int) and length != next_power_of_2(length):
+        length = next_power_of_2(length)
+
+    # For start/step, prefer a compile-time int when possible. Otherwise
+    # emit the expression (symbolic start is fine for nisa.iota's
+    # runtime-int32 offset parameter).
+    def _emit_as_operand(x: object) -> str:
+        if isinstance(x, int):
+            return str(x)
+        if isinstance(x, torch.SymInt):
+            return str(env.size_hint(x))
+        if isinstance(x, torch.fx.Node):
+            # FX node — use its environment lookup. Fall back to a
+            # reasonable default if ctx.env lookup fails.
+            mapped = ctx.env.get(x)
+            if mapped is not None:
+                if isinstance(mapped, ast.AST):
+                    return ast.unparse(mapped)
+                return str(mapped)
+            return str(x)
+        try:
+            return str(int(x))
+        except Exception:
+            return str(env.size_hint(x))
+
+    start_op = _emit_as_operand(start)
+    step_op = _emit_as_operand(step)
+
+    # Generate [1, length] SBUF tile via nisa.iota.
+    dtype_str = env.backend.dtype_str(dtype)
+    dst_var = state.device_function.new_var("_nki_iota_dst")
+    state.add_statement(
+        statement_from_string(
+            f"{dst_var} = nl.ndarray([1, {length}], {dtype_str}, buffer=nl.sbuf)"
+        )
+    )
+    state.add_statement(
+        statement_from_string(
+            f"nisa.iota(dst={dst_var}, pattern=[[{step_op}, {length}]], "
+            f"offset={start_op}, channel_multiplier=0)"
+        )
+    )
+    state.device_function._nki_sbuf_shapes[dst_var] = [1, length]
+    state.device_function._nki_sbuf_dtypes[dst_var] = dtype_str
+    return expr_from_string(dst_var)

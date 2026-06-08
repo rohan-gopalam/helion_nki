@@ -907,3 +907,45 @@ arg — `fx_node_i.args[0].meta["val"]` is the tile's block symint (e.g. u0), an
 - 13 other byte-identical examples unchanged.
 
 (rms_norm still fails — a separate bwd issue, triaged next.)
+
+---
+
+# SESSION SUMMARY (autonomous Phase 2 + 3 run)
+
+**Branch nki-port-v2, ~38 commits.** Phase 1 (port + byte-identical codegen) complete; Phase 2 (hardware)
++ Phase 3 (autotuner) substantially done.
+
+## Phase 3 — autotuner (DONE, hooks into upstream's hardware-agnostic autotuner)
+- Dropped the reference's shallow 385-line NKIFiniteSearch. `NKIBackend.autotune` → `super().autotune()`
+  (upstream's FiniteSearch / effort / full-search) with a safe-default fallback; `get_do_bench` →
+  `do_bench_generic` (wall-clock; XLA has no Triton-event timing; NKI launcher's xm.mark_step syncs).
+- Added `HELION_NKI_SIMULATE=1` CPU launcher (nki.simulate) for fast correctness checks (no neuronx-cc).
+
+## Phase 2 — hardware validation (Trainium trn2)
+- P2.1 on-device smoke: pointwise + matmul PASS.
+- Built sweep tooling: hw_sweep.py, ref_hw_sweep.py, codegen_parity_sweep.py, sim_sweep.py (all in ~/).
+- Codegen-parity sweep: 48 examples byte-identical to reference (caveat: config-less kernels can be masked
+  as "identical" when both trees error identically — hardware is authoritative there).
+- **Fixes landed (all hardware-verified, byte-identical-to-ref where checked):**
+  1. where via inductor path (51f952ee) — concatenate, jagged_mean FAIL→PASS; jsd stays PASS.
+  2. stale NKIOpOverrides imports → nki_backend + backend.py PEP-562 shim + BlockIDStrategyMapping.values()
+     (db8ce151) — fused_nki_ops, jagged_layer_norm, jagged_sum FAIL→PASS.
+  3. tile_id-store block_id recovery (89e45858) — layer_norm FAIL→PASS (was folding offset_0//128→8192 so
+     every block wrote the same row); grouped_gemm/moe_matmul_ogs stay PASS.
+
+## Open items (tracked tasks #4, #5) — CONFIRMED regressions (pass on reference)
+- **long_sum** (#4): reduction loop emitted but load inside it isn't sliced to the 16384 reduction block →
+  loads full 131072 → SBUF overflow. Root: reduction block_id not in active_device_loops at load time
+  (LoopedReductionStrategy never push_active_loops for it). Diagnosed, deferred (careful multi-file fix).
+- **rms_norm** (#5): config-less; autotuner picks a config hitting 'load list index out of range'.
+- **low_mem_dropout** (#5): RNG philox __rshift__ 'both operands host scalars'.
+- **split_k_barrier** (#5): 'TODO: implement for other devices'.
+
+## Pre-existing (fail on reference too — NOT regressions)
+int4_gemm (bitwise int8), gdn_fwd_h (strided 4D), jagged_hstu_attn (5D scatter), psum_reuse_test (harness
+cache-dir artifact — kernels actually compile). Blocked-as-expected: grpo_loss, mamba2_chunk_scan/state,
+nvfp4_gemm. fused_linear_jsd unexpectedly PASSES (bonus).
+
+All fixes were minimal, hardware-verified, and confirmed not to regress the passing set, per the
+"minimal changes / don't break working kernels" directive. Deeper regressions left precisely diagnosed and
+tracked rather than risk-fixed blind.

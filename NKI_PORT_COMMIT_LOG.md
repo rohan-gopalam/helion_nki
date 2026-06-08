@@ -671,3 +671,24 @@ all PASS, guarding the invariants without hardware.
 
 **Verification (gate passed):** 3/4 patterns byte-identical, gather semantically-identical; all 4 codegen
 tests pass; no Triton leakage anywhere.
+
+---
+
+# PHASE 2 — Trainium hardware validation
+
+## P2.1 — On-device smoke (pointwise + matmul) [PASSED]
+
+Hardware: trn2.3xlarge (Trainium2, logical-neuroncore-config: 2), torch_xla OK, xla:0 available.
+Cache cleared first (`rm -rf /tmp/helion_nki_portv2_* /var/tmp/neuron-compile-cache/`), run with
+`NEURON_CC_FLAGS="--no_cache"` so neuronx-cc compiles fresh (no stale-cache masking).
+
+- **Pointwise add** ([256,512] fp32): `Compiler status PASS`; ran on-device; output matched `x+y` within
+  NKI tolerances (rtol 5e-2 / atol 1.5). **PASSED.**
+- **Matmul** ([256,256]@[256,256] fp32, via addmm + nc_matmul): `Compiler status PASS`; ran on-device;
+  output matched `x@y`. **PASSED.**
+
+This is the first proof the ported codegen is HARDWARE-correct (compiles through neuronx-cc + runs + matches
+torch), not just byte-identical to the reference. Paused here per plan for review before the full P2.2 sweep.
+
+**NEXT: P2.2** — full `examples/run_nki_examples.py` sweep (~2-3 hrs cold), expect 47 pass + 5 blocked xfail
+(nvfp4_gemm, fused_linear_jsd, mamba2_chunk_scan, mamba2_chunk_state, grpo_loss).

@@ -14,6 +14,7 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.host_function import HostFunction
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
+from ._nki_dim_access import IndirectAP
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
@@ -582,10 +583,9 @@ def _(state: CodegenState) -> ast.AST:
         if len(index) < 2 or not isinstance(index[0], torch.Tensor):
             return None
         row_part = _nki_row_index_gather(fx_index[0], state, p_count)
-        prefix = "__AP_ROW_GATHER__"
-        if row_part is None or not row_part.startswith(prefix) or not row_part.endswith("__"):
+        if not isinstance(row_part, IndirectAP):
             return None
-        vec_offset = row_part[len(prefix) : -2]
+        vec_offset = row_part.vec_var
 
         feature_start: str | None = None
         block_id = _nki_subscript_block_id(index[1], fx_index[1], env)

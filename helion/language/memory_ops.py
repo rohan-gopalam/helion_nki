@@ -11,6 +11,7 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.indexing_strategy import SubscriptIndexing
 from . import _decorators
+from ._nki_dim_access import DynamicAP, IndirectAP
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
@@ -942,7 +943,7 @@ def _nki_indirect_gather(
         ))
         vec_offset_var = combined_var
     # Emit an .ap() expression inline as the slice_part
-    return f"__AP_VEC_OFFSET__{vec_offset_var}__{pattern}__"
+    return IndirectAP(vec_var=vec_offset_var, p_count=P, pattern=pattern)
 
 
 def _nki_lookup_sbuf_shape_dtype(
@@ -1170,7 +1171,7 @@ def _nki_row_index_gather(
                     state, row_index, p_count
                 )
                 if vec_offset_var is not None:
-                    return f"__AP_ROW_GATHER__{vec_offset_var}__"
+                    return IndirectAP(vec_var=vec_offset_var, p_count=p_count, pattern=None)
 
         lhs_is_mul = _target_contains(lhs_node, "mul.Tensor")
         rhs_is_mul = _target_contains(rhs_node, "mul.Tensor")
@@ -1277,7 +1278,7 @@ def _nki_row_index_gather(
                         state, row_index, p_count
                     )
                     if vec_offset_var is not None:
-                        return f"__AP_ROW_GATHER__{vec_offset_var}__"
+                        return IndirectAP(vec_var=vec_offset_var, p_count=p_count, pattern=None)
 
     index_ast = state.codegen.ast_for_fx_node(fx_node)
     if not isinstance(index_ast, ast.AST):
@@ -1296,7 +1297,7 @@ def _nki_row_index_gather(
     vec_offset_var = _nki_as_uint32_p1_vector(state, index_name, p_count)
     if vec_offset_var is None:
         return None
-    return f"__AP_ROW_GATHER__{vec_offset_var}__"
+    return IndirectAP(vec_var=vec_offset_var, p_count=p_count, pattern=None)
 
 
 def _nki_subscript_block_id(
@@ -1673,9 +1674,8 @@ def _(state: CodegenState) -> ast.AST:
             # Get the 2D row-gather sentinel for the vector index (tile.index + starts)
             _row_gather_3d = _nki_row_index_gather(fx0, state, partition_dim)
             if _row_gather_3d is not None and head_expr is not None:
-                sentinel_prefix = "__AP_ROW_GATHER__"
-                if _row_gather_3d.startswith(sentinel_prefix):
-                    vec_var = _row_gather_3d[len(sentinel_prefix):].rstrip("_")
+                if isinstance(_row_gather_3d, IndirectAP):
+                    vec_var = _row_gather_3d.vec_var
                     # flat_var = vec_var * H + head
                     flat_var = device_fn.new_var("_3d_flat_idx", dce=True)
                     device_fn._nki_sbuf_shapes[flat_var] = [partition_dim, 1]
@@ -1694,8 +1694,8 @@ def _(state: CodegenState) -> ast.AST:
                     state.codegen.add_statement(_sfs3d(
                         f"nisa.tensor_scalar(dst={flat_var}, data={flat_var}, op0=nl.add, operand0={head_expr}, op1=None)"
                     ))
-                    # Now emit the 2D gather: [__AP_ROW_GATHER__flat_var__, 0:D]
-                    slice_parts = [f"__AP_ROW_GATHER__{flat_var}__", f"0:{d_int}"]
+                    # Now emit the 2D gather: [IndirectAP(flat_var), 0:D]
+                    slice_parts = [IndirectAP(vec_var=flat_var, p_count=partition_dim, pattern=None), f"0:{d_int}"]
                     is_scalar_dim = [False, False]
                     # Override partition_dim, free_dims, and hbm_dim_size_strs to
                     # match the 2D reshaped tensor [L*H, D] — this controls the
@@ -1871,16 +1871,19 @@ def _(state: CodegenState) -> ast.AST:
                     )
                     if _row_gather_dyn is not None:
                         if tdi == 0:
-                            partition_offset_var = (
-                                _row_gather_dyn.split(":", 1)[0].strip()
-                                if ":" in _row_gather_dyn
-                                else _row_gather_dyn
-                            )
+                            if isinstance(_row_gather_dyn, IndirectAP):
+                                partition_offset_var = None
+                            else:
+                                partition_offset_var = (
+                                    _row_gather_dyn.split(":", 1)[0].strip()
+                                    if ":" in _row_gather_dyn
+                                    else _row_gather_dyn
+                                )
                         slice_parts.append(_row_gather_dyn)
                         is_scalar_dim.append(False)
                         continue
                 _counter = _dyn_counter_raw
-                slice_parts.append(f"__DYN_AP__{_counter}__{int(block_size)}")
+                slice_parts.append(DynamicAP(counter=_counter, block_size=int(block_size)))
                 is_scalar_dim.append(False)
                 continue
             elif (
@@ -1895,7 +1898,10 @@ def _(state: CodegenState) -> ast.AST:
                 row_gather = _nki_row_index_gather(fx_node_tdi_check, state, partition_dim)
                 if row_gather is not None:
                     if tdi == 0:
-                        partition_offset_var = row_gather.split(":", 1)[0].strip() if ":" in row_gather else row_gather
+                        if isinstance(row_gather, IndirectAP):
+                            partition_offset_var = None
+                        else:
+                            partition_offset_var = row_gather.split(":", 1)[0].strip() if ":" in row_gather else row_gather
                     slice_parts.append(row_gather)
                     is_scalar_dim.append(False)
                     continue
@@ -2071,7 +2077,7 @@ def _(state: CodegenState) -> ast.AST:
                             for _bid_c, _dyn_info_c in _dyn_loops.items():
                                 _counter_c = _dyn_info_c.get("counter_float") or _dyn_info_c.get("counter")
                                 if _counter_c:
-                                    slice_parts.append(f"__DYN_AP__{_counter_c}__{_slice_len}")
+                                    slice_parts.append(DynamicAP(counter=_counter_c, block_size=_slice_len))
                                     is_scalar_dim.append(False)
                                     break
                             else:
@@ -3856,7 +3862,7 @@ def _(state: CodegenState) -> ast.AST:
             and _tile_dim_idx_ld < len(leading_block_sizes) - 1
             and all(leading_block_sizes[_di] == 1
                     for _di in range(_tile_dim_idx_ld + 1, len(leading_block_sizes)))
-            and not any(p.startswith(("__DYN_AP__", "__AP_ROW_GATHER__"))
+            and not any(isinstance(p, (IndirectAP, DynamicAP))
                         for p in slice_parts)
         )
         if _use_strided_gather:
@@ -3936,7 +3942,7 @@ def _(state: CodegenState) -> ast.AST:
                     for _ds in original_dim_sizes:
                         _flat_hbm_ld *= _ds
                     _d_int_ld = _resolve_dim(tensor.size(tensor.dim() - 1))
-                    slice_parts = [f"__AP_ROW_GATHER__{_vec_ld}__", f"0:{_d_int_ld}"]
+                    slice_parts = [IndirectAP(vec_var=_vec_ld, p_count=_tile_bs_ld, pattern=None), f"0:{_d_int_ld}"]
                     is_scalar_dim = [False, False]
                     partition_dim = _tile_bs_ld
                     free_dims = [_d_int_ld]
@@ -3945,7 +3951,7 @@ def _(state: CodegenState) -> ast.AST:
                     partition_offset_var = None
                     _use_strided_gather = False  # signal: flat_slice path below skipped
 
-        if _use_strided_gather is False and slice_parts[0].startswith("__AP_ROW_GATHER__"):
+        if _use_strided_gather is False and isinstance(slice_parts[0], IndirectAP):
             # Strided gather succeeded — skip the consecutive flat slice
             pass
         else:
@@ -3961,7 +3967,7 @@ def _(state: CodegenState) -> ast.AST:
             free_dims = [_resolve_dim(output_shape[-1])]
             output_shape = [partition_dim] + free_dims
 
-        if not slice_parts[0].startswith("__AP_ROW_GATHER__"):
+        if not isinstance(slice_parts[0], IndirectAP):
             flat_hbm_partition = 1
             for dim_size in original_dim_sizes:
                 flat_hbm_partition *= dim_size
@@ -3977,14 +3983,9 @@ def _(state: CodegenState) -> ast.AST:
         Also handles __AP_VEC_OFFSET__var__pattern__ for indirect gather.
         """
         for _p in parts:
-            if _p.startswith("__AP_ROW_GATHER__"):
-                vec_offset = _p[len("__AP_ROW_GATHER__") :].rstrip("_")
-                vec_shape = device_fn._nki_sbuf_shapes.get(vec_offset)
-                if vec_shape is None or len(vec_shape) < 1:
-                    raise NotImplementedError(
-                        f"Unknown row-gather vector offset shape for {vec_offset}"
-                    )
-                p_count = int(vec_shape[0])
+            if isinstance(_p, IndirectAP) and _p.pattern is None:
+                vec_offset = _p.vec_var
+                p_count = _p.p_count
                 # Use hbm_dim_size_strs rather than tensor.shape so the 3D
                 # early-exit path (which sets hbm_dim_size_strs to [L*H, D])
                 # works correctly even though the original tensor is 3D.
@@ -4057,22 +4058,9 @@ def _(state: CodegenState) -> ast.AST:
 
         # Handle vector_offset gather first
         for _p in parts:
-            if _p.startswith("__AP_VEC_OFFSET__"):
-                _rest = _p[len("__AP_VEC_OFFSET__"):]
-                # Format: var__pattern__
-                parts_split = _rest.rsplit("__", 2)
-                # Actually encoding: var__PATTERN__ — only 2 __ separators
-                # but pattern may contain __ too. Use a safer split.
-                # Split at first __ only (var)
-                _vp = _rest.split("__", 1)
-                if len(_vp) == 2:
-                    var_name, rest2 = _vp
-                    # rest2 ends with "__", strip
-                    pattern_str = rest2.rstrip("_")
-                else:
-                    continue
-                return f"{name_str}.ap(pattern={pattern_str}, vector_offset={var_name}, indirect_dim=0)"
-        has_dyn = any(p.startswith("__DYN_AP__") for p in parts)
+            if isinstance(_p, IndirectAP) and _p.pattern is not None:
+                return f"{name_str}.ap(pattern={_p.pattern}, vector_offset={_p.vec_var}, indirect_dim=0)"
+        has_dyn = any(isinstance(p, DynamicAP) for p in parts)
         if not has_dyn:
             return f"{name_str}[{', '.join(parts)}]"
         # Compute strides and pattern for .ap(). Use tensor.shape to get
@@ -4085,16 +4073,11 @@ def _(state: CodegenState) -> ast.AST:
         dyn_counter = None
         dyn_size = 0
         for i, p in enumerate(parts):
-            if p.startswith("__DYN_AP__"):
+            if isinstance(p, DynamicAP):
                 assert dyn_dim_idx is None, "multiple dynamic dims not yet supported"
                 dyn_dim_idx = i
-                # Format: __DYN_AP__counter__size
-                _, counter_name, size_str = p.split("__", 2)[1:] + [""]
-                # Actually format: f"__DYN_AP__{_counter}__{int(block_size)}"
-                _rest = p[len("__DYN_AP__"):]
-                counter_name, size_str = _rest.rsplit("__", 1)
-                dyn_counter = counter_name
-                dyn_size = int(size_str)
+                dyn_counter = p.counter
+                dyn_size = p.block_size
         # For .ap() we need the pattern as [[stride_for_each_axis, count_for_each_axis], ...]
         # Tensor shape dims beyond the slice are unused, but we need strides for
         # multi-dim source. Assume 2D source [P, F]:
@@ -4229,7 +4212,7 @@ def _(state: CodegenState) -> ast.AST:
         for dim_idx, part in enumerate(parts):
             if dim_idx >= len(hbm_dim_size_strs):
                 break
-            if part.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__", "__AP_ROW_GATHER__")):
+            if isinstance(part, (IndirectAP, DynamicAP)):
                 continue
             if ":" not in part:
                 continue
@@ -4311,9 +4294,9 @@ def _(state: CodegenState) -> ast.AST:
     def _slice_info(part: str, dim_idx: int) -> tuple[str, str, int, str] | None:
         import re as _re_si
 
-        if dim_idx >= len(hbm_dim_size_strs) or ":" not in part:
+        if isinstance(part, (IndirectAP, DynamicAP)):
             return None
-        if part.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__", "__AP_ROW_GATHER__")):
+        if dim_idx >= len(hbm_dim_size_strs) or ":" not in part:
             return None
         start, end = part.split(":", 1)
         start = start.strip()
@@ -4467,7 +4450,7 @@ def _(state: CodegenState) -> ast.AST:
             # partial load that only reads the valid elements.
             if hbm_base is not None and parts is not None and len(parts) >= 1:
                 _part0 = parts[0]
-                if ":" in _part0 and not _part0.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__")):
+                if isinstance(_part0, str) and ":" in _part0:
                     _p0_start, _p0_end = _part0.split(":", 1)
                     _p0_start = _p0_start.strip()
                     # Strip exactly one outer paren pair if balanced, e.g. "(expr)" → "expr"
@@ -4599,7 +4582,7 @@ def _(state: CodegenState) -> ast.AST:
         if tensor.dim() == 1:
             # Source tensor reshaped to [1, N] at kernel entry.
             orig_slice = slice_parts[0] if slice_parts else f"0:{partition_dim}"
-            if orig_slice.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__")):
+            if isinstance(orig_slice, (IndirectAP, DynamicAP)):
                 # fall through to ap builder with a 2-part slice
                 hbm_src_1d = _build_hbm_src(name, ["0:1", orig_slice])
             else:
@@ -4645,7 +4628,10 @@ def _(state: CodegenState) -> ast.AST:
                 part_slice_parts[0] = (
                     f"{i}*{NKI_PARTITION_MAX} : {i + 1}*{NKI_PARTITION_MAX}"
                 )
-            part_slice_str = ", ".join(part_slice_parts)
+            part_slice_str = ", ".join(
+                p if isinstance(p, str) else "__SENTINEL__"
+                for p in part_slice_parts
+            )
             part_hbm_src = f"{name}[{part_slice_str}]"
             _emit_dma_copy(
                 tile_var,
@@ -4688,7 +4674,7 @@ def _(state: CodegenState) -> ast.AST:
         )
         # Handle dynamic loop subscripts via .ap()
         _has_dyn_2d = any(
-            p.startswith(("__DYN_AP__", "__AP_VEC_OFFSET__", "__AP_ROW_GATHER__"))
+            isinstance(p, (IndirectAP, DynamicAP))
             for p in slice_parts
         )
         if _has_dyn_2d:
@@ -4706,7 +4692,7 @@ def _(state: CodegenState) -> ast.AST:
                     _ctr = _dl_info["counter"]
                     _ctr_f = _dl_info.get("counter_float", "")
                     if not any(
-                        p.startswith("__DYN_AP__") and (_ctr in p or _ctr_f in p)
+                        isinstance(p, DynamicAP) and (p.counter == _ctr or p.counter == _ctr_f)
                         for p in slice_parts
                     ):
                         continue
@@ -5001,7 +4987,7 @@ def _(state: CodegenState) -> None:
                         is_scalar_dim_s.append(False)
                         tensor_dim_idx += 1
                         continue
-                slice_parts.append(f"__DYN_AP__{_counter_st}__{int(block_size)}")
+                slice_parts.append(DynamicAP(counter=_counter_st, block_size=int(block_size)))
             elif _shifted_s is not None:
                 # Use the shifted slice (includes both the static offset and the tile offset)
                 slice_parts.append(_shifted_s)
@@ -5094,9 +5080,8 @@ def _(state: CodegenState) -> None:
                             _p_count_s = val_shape[0]
                         _row_scatter_3d = _nki_row_index_gather(fx_node_i, state, _p_count_s)
                         if _row_scatter_3d is not None and _head_expr_s is not None:
-                            sentinel_prefix = "__AP_ROW_GATHER__"
-                            if _row_scatter_3d.startswith(sentinel_prefix):
-                                _vec_var_s = _row_scatter_3d[len(sentinel_prefix):].rstrip("_")
+                            if isinstance(_row_scatter_3d, IndirectAP):
+                                _vec_var_s = _row_scatter_3d.vec_var
                                 _flat_var_s = device_fn.new_var("_3d_flat_idx_store", dce=True)
                                 device_fn._nki_sbuf_shapes[_flat_var_s] = [_p_count_s, 1]
                                 device_fn._nki_sbuf_dtypes[_flat_var_s] = "nl.uint32"
@@ -5113,7 +5098,7 @@ def _(state: CodegenState) -> None:
                                 state.codegen.add_statement(statement_from_string(
                                     f"nisa.tensor_scalar(dst={_flat_var_s}, data={_flat_var_s}, op0=nl.add, operand0={_head_expr_s}, op1=None)"
                                 ))
-                                slice_parts = [f"__AP_ROW_GATHER__{_flat_var_s}__", f"0:{d_int}"]
+                                slice_parts = [IndirectAP(vec_var=_flat_var_s, p_count=_p_count_s, pattern=None), f"0:{d_int}"]
                                 is_scalar_dim_s = [False, False]
                                 total_rows_s = int(tensor.numel()) // d_int
                                 hbm_dim_size_strs_s = [str(total_rows_s), str(d_int)]
@@ -5166,7 +5151,7 @@ def _(state: CodegenState) -> None:
         leading_block_sizes_s: list[int] = []
         for dim_i in range(tensor.dim() - 1):
             sp = slice_parts[dim_i]
-            if ":" in sp:
+            if isinstance(sp, str) and ":" in sp:
                 off_str, end_str = sp.split(":", 1)
                 off_str = off_str.strip()
                 leading_offsets_s.append(off_str)
@@ -5224,7 +5209,7 @@ def _(state: CodegenState) -> None:
             and _tile_dim_idx_st < len(leading_block_sizes_s) - 1
             and all(leading_block_sizes_s[_di] == 1
                     for _di in range(_tile_dim_idx_st + 1, len(leading_block_sizes_s)))
-            and not any(p.startswith(("__DYN_AP__", "__AP_ROW_GATHER__"))
+            and not any(isinstance(p, (IndirectAP, DynamicAP))
                         for p in slice_parts)
         )
         if _use_strided_scatter:
@@ -5304,21 +5289,21 @@ def _(state: CodegenState) -> None:
                     for _ds in original_dim_sizes_s:
                         _flat_hbm_st *= _ds
                     _d_int_st = _resolve_dim_store(tensor.size(tensor.dim() - 1))
-                    slice_parts = [f"__AP_ROW_GATHER__{_vec_st}__", f"0:{_d_int_st}"]
+                    slice_parts = [IndirectAP(vec_var=_vec_st, p_count=_tile_bs_st, pattern=None), f"0:{_d_int_st}"]
                     is_scalar_dim_s = [False, False]
                     flat_block_size_s = _tile_bs_st
                     hbm_dim_size_strs_s = [str(_flat_hbm_st), str(_d_int_st)]
                     partition_offset_var = None
                     _use_strided_scatter = False  # signal: skip flat slice below
 
-        if _use_strided_scatter is False and slice_parts[0].startswith("__AP_ROW_GATHER__"):
+        if _use_strided_scatter is False and isinstance(slice_parts[0], IndirectAP):
             pass  # strided scatter succeeded — skip flat slice
         else:
             flat_slice = f"({flat_offset_s}) : ({flat_offset_s}) + {flat_block_size_s}"
             slice_parts = [flat_slice] + [slice_parts[-1]]
             partition_offset_var = f"({flat_offset_s})"
 
-        if not slice_parts[0].startswith("__AP_ROW_GATHER__"):
+        if not isinstance(slice_parts[0], IndirectAP):
             flat_hbm_partition_s = 1
             for dim_size in original_dim_sizes_s:
                 flat_hbm_partition_s *= dim_size
@@ -5502,7 +5487,10 @@ def _(state: CodegenState) -> None:
                 part_slice_parts[0] = (
                     f"{i}*{NKI_PARTITION_MAX} : {i + 1}*{NKI_PARTITION_MAX}"
                 )
-            part_slice_str = ", ".join(part_slice_parts)
+            part_slice_str = ", ".join(
+                p if isinstance(p, str) else "__SENTINEL__"
+                for p in part_slice_parts
+            )
             state.codegen.add_statement(
                 statement_from_string(
                     f"nisa.dma_copy(dst={name}[{part_slice_str}], src={tile_var})"
@@ -5531,7 +5519,10 @@ def _(state: CodegenState) -> None:
                                 )
                                 break
 
-        slice_str = ", ".join(adjusted_slice_parts)
+        slice_str = ", ".join(
+            p if isinstance(p, str) else "__SENTINEL__"
+            for p in adjusted_slice_parts
+        )
         name = ret_buf_name if use_nki_return else device_fn.tensor_arg(tensor).name
 
         def _try_emit_flat_index_store() -> bool:
@@ -5848,9 +5839,9 @@ def _(state: CodegenState) -> None:
         def _store_slice_info(
             part: str, dim_idx: int
         ) -> tuple[str, str, int, str] | None:
-            if dim_idx >= len(hbm_dim_size_strs_s) or ":" not in part:
+            if isinstance(part, (IndirectAP, DynamicAP)):
                 return None
-            if part.startswith(("__DYN_AP__", "__AP_ROW_GATHER__")):
+            if dim_idx >= len(hbm_dim_size_strs_s) or ":" not in part:
                 return None
             start, end = part.split(":", 1)
             start = start.strip()
@@ -6031,14 +6022,11 @@ def _(state: CodegenState) -> None:
             )
         else:
             # If slice contains dynamic sentinels, rewrite to .ap()
-            _has_dyn_store = "__DYN_AP__" in slice_str
-            _has_row_store = "__AP_ROW_GATHER__" in slice_str
+            _has_dyn_store = any(isinstance(p, DynamicAP) for p in slice_parts)
+            _has_row_store = any(isinstance(p, IndirectAP) for p in slice_parts)
             if _has_row_store:
-                _dst_parts = [p.strip() for p in slice_str.split(",")]
-                _row_part = next(
-                    p for p in _dst_parts if p.startswith("__AP_ROW_GATHER__")
-                )
-                _vec_offset = _row_part[len("__AP_ROW_GATHER__") :].rstrip("_")
+                _row_part = next(p for p in slice_parts if isinstance(p, IndirectAP))
+                _vec_offset = _row_part.vec_var
                 _vec_shape = device_fn._nki_sbuf_shapes.get(_vec_offset)
                 if _vec_shape is None or len(_vec_shape) < 1:
                     raise NotImplementedError(
@@ -6059,7 +6047,8 @@ def _(state: CodegenState) -> None:
                         _f_total = state.sympy_expr(_tensor_shape[1]._sympy_())
                 else:
                     _f_total = str(_tensor_shape[1])
-                _free_part = _dst_parts[1] if len(_dst_parts) > 1 else f"0:{_f_total}"
+                _free_slice = next((p for p in slice_parts if isinstance(p, str) and ":" in p), None)
+                _free_part = _free_slice if _free_slice is not None else f"0:{_f_total}"
                 if ":" in _free_part:
                     _fs, _fe = _free_part.split(":", 1)
                     _fs = _fs.strip()
@@ -6090,19 +6079,21 @@ def _(state: CodegenState) -> None:
                     )
                 )
             elif _has_dyn_store:
-                _dst_parts = [p.strip() for p in slice_str.split(",")]
+                _dst_parts = [
+                    p if isinstance(p, str) else "__SENTINEL__"
+                    for p in slice_parts
+                ]
                 # Inline the same builder logic as _build_hbm_src (can't use it
                 # here because it closes over `tensor` / `_resolve_dim` in load).
                 _dyn_idx = None
                 _dyn_counter = None
                 _dyn_size = 0
-                for _i, _p in enumerate(_dst_parts):
-                    if _p.startswith("__DYN_AP__"):
+                for _i, _p in enumerate(slice_parts):
+                    if isinstance(_p, DynamicAP):
                         assert _dyn_idx is None, "multi-dyn store not supported"
                         _dyn_idx = _i
-                        _rest = _p[len("__DYN_AP__"):]
-                        _dyn_counter, _size_str = _rest.rsplit("__", 1)
-                        _dyn_size = int(_size_str)
+                        _dyn_counter = _p.counter
+                        _dyn_size = _p.block_size
                 _t_shape = list(tensor.shape)
                 if len(_t_shape) > 2:
                     while len(_t_shape) > 2 and _t_shape[0] == 1:

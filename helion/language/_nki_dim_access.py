@@ -109,6 +109,27 @@ class StridedGather(DimAccess):
     stride: int  # The stride between consecutive rows
 
 
+@dataclasses.dataclass(frozen=True)
+class IndirectAP:
+    """Deferred indirect DMA placed in slice_parts.
+
+    Covers both __AP_ROW_GATHER__ (pattern=None) and __AP_VEC_OFFSET__ (pattern is a string).
+    """
+    vec_var: str
+    p_count: int
+    pattern: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class DynamicAP:
+    """Deferred dynamic-loop DMA placed in slice_parts.
+
+    Covers __DYN_AP__.
+    """
+    counter: str
+    block_size: int
+
+
 def classify_leading_dims(
     leading_offsets: list[str],
     leading_block_sizes: list[int],

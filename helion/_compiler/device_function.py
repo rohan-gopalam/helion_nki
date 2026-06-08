@@ -282,6 +282,56 @@ class DeviceFunction:
             if x.startswith("_triton_config_")
         )
         self._variable_renames: dict[str, list[str]] = {}
+        self._nki_tile_lists: dict[str, list[str]] = {}  # var → [var_0, var_1, ...]
+        self._nki_sbuf_shapes: dict[str, list[int]] = {}  # var → [p, f]
+        # Track N-D logical shapes before flattening to 2D NKI layout.
+        # Maps var → [d0, d1, ..., dn] where d0*d1*...*d(n-2) = p and d(n-1) = f.
+        # Used to preserve leading dimensions during partition-axis reductions.
+        self._nki_logical_shapes: dict[str, list[int]] = {}  # var → [d0, d1, ..., dn]
+        # Loop-index SBUF tiles are generated from a scalar offset plus iota.
+        # Keep the scalar origin so index arithmetic such as ``tile.index % S``
+        # can lower to NKI tensor ops even when S is a lifted local variable.
+        self._nki_iota_offsets: dict[str, str] = {}
+        self._nki_iota_block_sizes: dict[str, str] = {}
+        # Names of kernel parameters that are Python scalars (float, int,
+        # bool) — used by NKIOpOverrides to route binary ops to
+        # tensor_scalar instead of tensor_tensor when the operand is a
+        # host scalar.  Populated in codegen_function_def when building
+        # the parameter list.
+        self._nki_scalar_arg_names: set[str] = set()
+        # Per-SBUF-var dtype tracking, used by broadcast / comparison codegen
+        # to allocate matching output buffers and pass through nc_transpose /
+        # nc_matmul constraints that require dst.dtype == data.dtype.
+        self._nki_sbuf_dtypes: dict[str, str] = {}
+        # HBM-source tracking: maps an SBUF var back to the HBM expression it
+        # was DMA-loaded from, so partition-broadcast codegen can re-DMA with
+        # a per-partition layout instead of tiling the existing SBUF tile.
+        self._nki_hbm_sources: dict[str, str] = {}
+        # Host tensor argument dtype overrides needed by NKI lowering. This is
+        # used when an HBM dtype has broken/unsupported DMA semantics but the
+        # Helion program immediately casts the value before computation.
+        self._nki_host_arg_casts: dict[str, str] = {}
+        # Loop-carry buffers that must not be modified in-place inside nested
+        # device loops.
+        self._nki_protected_vars: set[str] = set()
+        # Per-output-tensor return buffer info for multi-output kernels.
+        # Keyed by id(tensor). Keys are ints; values map to buf_name etc.
+        self._nki_return_buffers: dict[int, dict] = {}
+        # Tile lists where tiles represent the FREE dimension (not partition).
+        # These must be distributed along dim 1 when stored to a 2D buffer.
+        self._nki_free_dim_tile_lists: set[str] = set()
+        # PSUM-reuse alias map: keys are the SBUF result variable names that
+        # _nki_dot *would* have created for a matmul; values are the PSUM
+        # buffer names the matmul actually writes to. Populated by _nki_dot
+        # when the matmul's FX node carries meta["nki_keep_in_psum"]=True.
+        # Consumer ops (_nki_tensor_tensor / _nki_tensor_scalar /
+        # _nki_activation) resolve a data operand through this map to read
+        # from PSUM directly and skip the intermediate SBUF copy.
+        self._nki_psum_aliases: dict[str, str] = {}
+        # FX-node-name -> SBUF result var, so a consumer (which only has
+        # its predecessor's FX node name via meta["nki_read_psum_from"])
+        # can look up the SBUF name that _nki_dot produced.
+        self._nki_fx_matmul_vars: dict[str, str] = {}
         self.dce_vars: list[str] = []
         # Arg names referenced only by fusion placeholder strings
         # (<STORE_OUTPUT_*>, <LOAD_INPUT_*>), not by the AST body.
@@ -416,6 +466,7 @@ class DeviceFunction:
 
     def block_size_var(self, block_id: int) -> str | None:
         key = (block_id,)
+        env = CompileEnvironment.current()
 
         # Block size var could be used outside of a hl.tile loop, and at that point
         # no tile strategy has populated the cache yet, so we must lazily create
@@ -423,7 +474,6 @@ class DeviceFunction:
         # later strategies will reuse the cached name or intentionally replace it
         # (e.g. flattened loops, reductions).
         if key not in self.block_size_var_cache:
-            env = CompileEnvironment.current()
             block_value = env.block_sizes[block_id].from_config(self.config)
 
             if block_value is None:
@@ -432,6 +482,14 @@ class DeviceFunction:
             var_name = self.new_var(f"_BLOCK_SIZE_{block_id}")
             self.block_size_var_cache[key] = var_name
             self.constexpr_arg_with_host_def(var_name, block_value)
+        else:
+            # Some strategies pre-populate the cache with a symbol name only.
+            # Ensure the constexpr argument/host-side definition exists.
+            var_name = self.block_size_var_cache[key]
+            if var_name.isidentifier() and var_name not in self._constexpr_args:
+                block_value = env.block_sizes[block_id].from_config(self.config)
+                if block_value is not None:
+                    self.constexpr_arg_with_host_def(var_name, block_value)
 
         return self.block_size_var_cache[key]
 
@@ -477,6 +535,14 @@ class DeviceFunction:
         ]
         for n in name_group:
             self._variable_renames[n] = name_group
+        tile_vars: list[str] | None = None
+        for n in name_group:
+            if n in self._nki_tile_lists:
+                tile_vars = self._nki_tile_lists[n]
+                break
+        if tile_vars is not None:
+            for n in name_group:
+                self._nki_tile_lists[n] = tile_vars
 
     def variable_aliases(self, name: str) -> tuple[str, ...]:
         return tuple(self._variable_renames.get(name, [name]))
@@ -576,11 +642,48 @@ class DeviceFunction:
             self.dce_vars.append(name)
         return name
 
+    def register_tile_list(self, var_name: str, tile_vars: list[str]) -> None:
+        """Register var_name as a tile list backed by the given individual variables."""
+        if len(tile_vars) > 1:
+            self._nki_tile_lists[var_name] = tile_vars
+
+    def get_tile_list_vars(self, var_name: str) -> list[str] | None:
+        """Return individual tile variable names if var_name is a tile list, else None.
+
+        Also searches through the variable rename chain in case var_name is an
+        alias (e.g. phi-merged name) that hasn't been registered directly.
+        """
+        result = self._nki_tile_lists.get(var_name)
+        if result is not None:
+            return result
+        rename_group = self._variable_renames.get(var_name)
+        if rename_group:
+            for alias in rename_group:
+                result = self._nki_tile_lists.get(alias)
+                if result is not None:
+                    self._nki_tile_lists[var_name] = result
+                    return result
+        return None
+
+    def get_tile_list_count(self, var_name: str) -> int:
+        tile_vars = self._nki_tile_lists.get(var_name)
+        return len(tile_vars) if tile_vars else 1
+
+    def propagate_tile_list(self, src: str, dst: str) -> None:
+        tile_vars = self._nki_tile_lists.get(src)
+        if tile_vars:
+            self._nki_tile_lists[dst] = tile_vars
+
     def tensor_arg(
         self, fake_value: torch.Tensor, prefer_name: str | None = None
     ) -> TensorArg:
+        host_function = HostFunction.current()
+        if fake_value not in host_function.tensor_to_origin:
+            origin = self._recover_captured_tensor_origin(fake_value, host_function)
+            if origin is not None:
+                host_function.tensor_to_origin[fake_value] = origin
         if fake_value not in self._tensor_args:
-            origin = HostFunction.current().tensor_to_origin[fake_value]
+            origin = host_function.tensor_to_origin[fake_value]
             arg = TensorArg(
                 self.new_var(prefer_name or origin.suggest_var_name()),
                 fake_value,
@@ -589,6 +692,37 @@ class DeviceFunction:
             self.arguments.append(arg)
             self._tensor_args[fake_value] = arg
         return self._tensor_args[fake_value]
+
+    @staticmethod
+    def _recover_captured_tensor_origin(
+        fake_value: torch.Tensor,
+        host_function: HostFunction,
+    ) -> Origin | None:
+        """Recover origins for tensors captured by helper function closures.
+
+        Dynamo can represent a captured tensor inside a nested helper graph as an
+        ``aten.empty_strided`` constant. That produces a tensor with matching
+        metadata but no direct entry in ``tensor_to_origin``. Restrict recovery
+        to renamed origins (globals/closures), so ordinary kernel parameters
+        continue to use the explicit ``host_tensor`` path.
+        """
+
+        candidates: dict[str, Origin] = {}
+        fake_shape = tuple(fake_value.size())
+        fake_stride = tuple(fake_value.stride())
+        for known_tensor, origin in host_function.tensor_to_origin.items():
+            if not origin.needs_rename():
+                continue
+            if known_tensor.dtype != fake_value.dtype:
+                continue
+            if tuple(known_tensor.size()) != fake_shape:
+                continue
+            if tuple(known_tensor.stride()) != fake_stride:
+                continue
+            candidates[origin.host_str()] = origin
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        return None
 
     def tensor_descriptor_arg(
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
@@ -670,6 +804,10 @@ class DeviceFunction:
             )
             self.arguments.append(arg)
             self._expr_args[sym] = arg
+            # NKI: register Python-scalar kernel parameters so the
+            # NKIOpOverrides cast / binary-op paths can detect them and
+            # route to memset/tensor_scalar instead of tensor_tensor.
+            self._nki_scalar_arg_names.add(arg.name)
         return self._expr_args[sym]
 
     def constexpr_arg(self, name: str, value: object | None = None) -> bool:
@@ -749,6 +887,131 @@ class DeviceFunction:
         self.arguments.sort(key=lambda arg: arg.sort_key())
         return self.arguments
 
+    def _register_nki_dynamic_tensor_size_args(self) -> None:
+        env = CompileEnvironment.current()
+        if env.backend.name != "nki" or env.settings.static_shapes:
+            return
+        for arg in list(self.arguments):
+            if isinstance(arg, TensorArg):
+                for dim, size in enumerate(arg.fake_value.size()):
+                    if isinstance(size, torch.SymInt):
+                        expr = env.shape_env.simplify(size._sympy_())
+                        if expr.free_symbols:
+                            self.tensor_size(arg.fake_value, dim)
+
+    def _nki_return_statements(self) -> list[ast.stmt]:
+        """Generate return statement(s) for NKI kernel with one or more output buffers."""
+        bufs = getattr(self, "_nki_return_buffers", None)
+        if not bufs:
+            single = getattr(self, "_nki_return_buffer_name", None)
+            if single is not None:
+                return [statement_from_string(f"return {single}")]
+            return []
+        buf_names = [info["buf_name"] for info in bufs.values()]
+        if len(buf_names) == 1:
+            return [statement_from_string(f"return {buf_names[0]}")]
+        return [statement_from_string(f"return ({', '.join(buf_names)})")]
+
+    @staticmethod
+    def _is_nki_sbuf_allocation(stmt: ast.stmt) -> str | None:
+        if (
+            not isinstance(stmt, ast.Assign)
+            or len(stmt.targets) != 1
+            or not isinstance(stmt.targets[0], ast.Name)
+            or not isinstance(stmt.value, ast.Call)
+            or not isinstance(stmt.value.func, ast.Attribute)
+            or not isinstance(stmt.value.func.value, ast.Name)
+            or stmt.value.func.value.id != "nl"
+            or stmt.value.func.attr != "ndarray"
+        ):
+            return None
+        for keyword in stmt.value.keywords:
+            if (
+                keyword.arg == "buffer"
+                and isinstance(keyword.value, ast.Attribute)
+                and isinstance(keyword.value.value, ast.Name)
+                and keyword.value.value.id == "nl"
+                and keyword.value.attr == "sbuf"
+            ):
+                return stmt.targets[0].id
+        return None
+
+    def _should_rewrite_nki_sbuf_reassign(
+        self,
+        target: str,
+        source: str,
+        visible_allocs: dict[str, int],
+        depth: int,
+    ) -> bool:
+        if target == source or not target.startswith("_nki") or "_copy" in target:
+            return False
+        target_depth = visible_allocs.get(target)
+        source_depth = visible_allocs.get(source)
+        if target_depth is None or source_depth is None:
+            return False
+        if target_depth > depth or source_depth > depth:
+            return False
+        target_shape = self._nki_sbuf_shapes.get(target)
+        source_shape = self._nki_sbuf_shapes.get(source)
+        if target_shape is None or source_shape is None or target_shape != source_shape:
+            return False
+        target_dtype = self._nki_sbuf_dtypes.get(target)
+        source_dtype = self._nki_sbuf_dtypes.get(source)
+        return not (
+            target_dtype is not None
+            and source_dtype is not None
+            and target_dtype != source_dtype
+        )
+
+    def _rewrite_nki_sbuf_reassignments(
+        self, statements: list[ast.stmt], visible_allocs: dict[str, int], depth: int
+    ) -> None:
+        index = 0
+        while index < len(statements):
+            stmt = statements[index]
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Name)
+                and self._should_rewrite_nki_sbuf_reassign(
+                    stmt.targets[0].id, stmt.value.id, visible_allocs, depth
+                )
+            ):
+                statements[index] = statement_from_string(
+                    f"nisa.tensor_copy(dst={stmt.targets[0].id}, src={stmt.value.id})"
+                )
+                index += 1
+                continue
+
+            if allocated := self._is_nki_sbuf_allocation(stmt):
+                existing_depth = visible_allocs.get(allocated)
+                if (
+                    existing_depth is not None
+                    and existing_depth < depth
+                    and allocated in self._nki_sbuf_shapes
+                    and "_copy" not in allocated
+                ):
+                    del statements[index]
+                    continue
+                visible_allocs[allocated] = depth
+
+            if isinstance(stmt, (ast.For, ast.While)):
+                self._rewrite_nki_sbuf_reassignments(
+                    stmt.body, visible_allocs.copy(), depth + 1
+                )
+                self._rewrite_nki_sbuf_reassignments(
+                    stmt.orelse, visible_allocs.copy(), depth + 1
+                )
+            elif isinstance(stmt, ast.If):
+                self._rewrite_nki_sbuf_reassignments(
+                    stmt.body, visible_allocs.copy(), depth + 1
+                )
+                self._rewrite_nki_sbuf_reassignments(
+                    stmt.orelse, visible_allocs.copy(), depth + 1
+                )
+            index += 1
+
     def codegen_function_def(self) -> list[ast.stmt]:
         prefix = []
         if self._tensor_descriptor_args:
@@ -757,6 +1020,7 @@ class DeviceFunction:
             )
 
         backend = CompileEnvironment.current().backend
+        self._register_nki_dynamic_tensor_size_args()
         sorted_arguments = self.sorted_args()
 
         # Separate constexpr args: inline those with known literal values at
@@ -806,13 +1070,69 @@ class DeviceFunction:
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
 
+        tensor_shape_preamble: list[ast.AST] = []
+        if backend.name == "nki":
+            # Normalize tensor argument views at kernel entry to the 2D logical
+            # shape expected by codegen. Dynamic kernels use lifted tensor-size
+            # arguments here so one bound kernel can cover multiple input sizes.
+            def _nki_shape_part(arg: TensorArg, dim: int, s: object) -> str:
+                if isinstance(s, int):
+                    return str(s)
+                if isinstance(s, torch.SymInt):
+                    size_arg = self.tensor_size(arg.fake_value, dim)
+                    return size_arg.name
+                return self.literal_expr(s)
+
+            # Collect names of non-tensor scalar parameters (e.g.
+            # ``alpha: float``, ``scale: float``) so binary ops can
+            # route ``tile * alpha`` to ``tensor_scalar`` instead of
+            # ``tensor_tensor``.
+            for arg in param_args:
+                if not isinstance(arg, TensorArg):
+                    name = getattr(arg, "name", None)
+                    if isinstance(name, str):
+                        self._nki_scalar_arg_names.add(name)
+
+            for arg in param_args:
+                if isinstance(arg, TensorArg):
+                    # int64 args are cast to int32 at the launcher (see
+                    # default_nki_launcher) and also in _to_fake_tensor so
+                    # the traced kernel is declared with int32. No in-kernel
+                    # cast needed here.
+                    shape_parts = [
+                        _nki_shape_part(arg, dim, s)
+                        for dim, s in enumerate(arg.fake_value.size())
+                    ]
+                    if arg.fake_value.dim() == 1:
+                        # Reshape [N] → [1, N] so the large dimension is the
+                        # free axis.  This avoids tile-list fragmentation for
+                        # broadcast vectors like weight/bias and keeps the
+                        # partition dimension at 1 for natural broadcasting.
+                        shape_parts = ["1"] + shape_parts
+                    elif arg.fake_value.dim() > 2:
+                        # Reshape 3D+ tensors to 2D by combining all leading
+                        # dims into the first dim.  E.g. [B,M,K] → [B*M, K].
+                        # NKI SBUF only supports 2D tiles; DMA requires src/dst
+                        # dims to match. The batch loop uses b_idx*dim + offset
+                        # to index into this flattened tensor.
+                        leading = shape_parts[:-1]
+                        flat = " * ".join(leading)
+                        shape_parts = [f"({flat})"] + shape_parts[-1:]
+                    tensor_shape_preamble.append(
+                        statement_from_string(
+                            f"{arg.name} = {arg.name}.reshape([{', '.join(shape_parts)}])"
+                        )
+                    )
+
         function_decorator = backend.function_decorator_for_args(param_args)
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
                 *scalar_preamble,
+                *tensor_shape_preamble,
                 *self.preamble,
                 *self.body,
+                *self._nki_return_statements(),
             ],
         )
         if backend.name == "cute":
@@ -910,26 +1230,32 @@ class DeviceFunction:
             kernel_body = pipeline_inner_loads(
                 kernel_body, constexpr_values, rename_groups=rename_groups
             )
+        fn_def = ast_rename(
+            create(
+                ast.FunctionDef,
+                name=self.name,
+                args=create_arguments(args),
+                body=kernel_body,
+                decorator_list=[expr_from_string(function_decorator)]
+                if function_decorator
+                else [],
+                type_params=[],
+            ),
+            {k: v[0] for k, v in self._variable_renames.items()},
+        )
+        if backend.name == "nki":
+            # Replace SBUF self-reassignments with explicit tensor_copy and
+            # drop redundant re-allocations now that variable renames are final.
+            self._rewrite_nki_sbuf_reassignments(fn_def.body, {}, 0)
         return [
             *prefix,
-            ast_rename(
-                create(
-                    ast.FunctionDef,
-                    name=self.name,
-                    args=create_arguments(args),
-                    body=kernel_body,
-                    decorator_list=[expr_from_string(function_decorator)]
-                    if function_decorator
-                    else [],
-                    type_params=[],
-                ),
-                {k: v[0] for k, v in self._variable_renames.items()},
-            ),
+            fn_def,
         ]
 
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
         backend = env.backend
+        self._register_nki_dynamic_tensor_size_args()
 
         args: list[str] = []
         tensor_host_args: list[str] = []
@@ -1185,6 +1511,43 @@ class HelionTritonPrinter(TritonPrinter):
 
 def texpr(expr: sympy.Expr) -> str:
     return HelionTritonPrinter().doprint(expr)
+
+
+class HelionNKIPrinter(HelionTritonPrinter):
+    """Python-only expression printer for the NKI backend.
+
+    TritonPrinter emits ``triton_helpers.div_floor_integer`` and
+    ``triton_helpers.remainder_integer`` for FloorDiv / Mod on runtime
+    integer expressions, both of which are unresolvable inside a
+    @nki.jit kernel. We override to emit plain ``(a) // (b)`` and
+    ``(a) % (b)`` which evaluate the same way on host-Python integers
+    and are accepted by the NKI parser.
+    """
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        x, y = expr.args
+        return f"({self._print(x)} // {self._print(y)})"
+
+    def _print_Mod(self, expr: sympy.Expr) -> str:
+        x, y = expr.args
+        return f"({self._print(x)} % {self._print(y)})"
+
+    # sympy.floor(a / b) over int-valued args maps to a floordiv too.
+    def _print_floor(self, expr: sympy.Expr) -> str:
+        (arg,) = expr.args
+        if arg.is_Rational or (
+            isinstance(arg, sympy.Mul)
+            and len(arg.args) == 2
+            and arg.args[1].is_Pow
+        ):
+            # a / b style — fall through to default, which may still
+            # produce a helper. We keep this guard conservative.
+            pass
+        return super()._print_floor(expr)  # type: ignore[misc]
+
+
+def nki_texpr(expr: sympy.Expr) -> str:
+    return HelionNKIPrinter().doprint(expr)
 
 
 class HelionCutePrinter(HelionTritonPrinter):

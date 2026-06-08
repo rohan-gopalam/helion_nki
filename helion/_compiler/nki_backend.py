@@ -5445,6 +5445,14 @@ class NKIBackend(Backend):
         # guard.
         return numel
 
+    def sympy_printer_expr(self, expr: object) -> str:
+        # Route NKI sympy printing through HelionNKIPrinter (Python-only
+        # FloorDiv/Mod), mirroring how Pallas/CuTe override this hook. This
+        # replaces the reference branch's texpr() try/except special-case.
+        from .device_function import nki_texpr
+
+        return nki_texpr(expr)
+
     def range_str(
         self,
         begin: str | None,

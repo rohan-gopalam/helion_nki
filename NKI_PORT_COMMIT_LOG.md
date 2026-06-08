@@ -268,3 +268,48 @@ added to NKIBackend in P1.6.
 
 **Verification (gate passed):** `NKIProgramIDs` imports and subclasses `ProgramIDs`; host_function has 0
 `patch_tensor_factories` refs; `import helion` OK.
+
+## P1.9 — device_function.py: NKI tracking dicts, methods, printer
+
+**Files:** `helion/_compiler/device_function.py`, `helion/_compiler/nki_backend.py`
+
+**Applied:**
+1. **16 `_nki_*` tracking dicts/sets** in `__init__` (after `_variable_renames`, before `dce_vars`):
+   `_nki_tile_lists`, `_nki_sbuf_shapes` (read by tile_strategy in P1.16g), `_nki_logical_shapes`,
+   `_nki_iota_offsets`, `_nki_iota_block_sizes`, `_nki_scalar_arg_names`, `_nki_sbuf_dtypes`,
+   `_nki_hbm_sources`, `_nki_host_arg_casts`, `_nki_protected_vars`, `_nki_return_buffers`,
+   `_nki_free_dim_tile_lists`, `_nki_psum_aliases`, `_nki_fx_matmul_vars`. (More than the plan's "12".)
+2. **`block_size_var`**: hoisted `env=...` and added the `else` branch that lazily creates the constexpr
+   host-def when a strategy pre-populated the cache with just a symbol name.
+3. **variable-rename method**: propagate `_nki_tile_lists` across a phi/rename group.
+4. **Tile-list helpers**: `register_tile_list`, `get_tile_list_vars`, `get_tile_list_count`,
+   `propagate_tile_list` (before `tensor_arg`).
+5. **`tensor_arg`**: recover captured-tensor origins via new static `_recover_captured_tensor_origin`.
+6. **`_expr_args` path**: register Python-scalar params into `_nki_scalar_arg_names`.
+7. **5 NKI methods** before `codegen_function_def`: `_register_nki_dynamic_tensor_size_args`,
+   `_nki_return_statements`, `_is_nki_sbuf_allocation`, `_should_rewrite_nki_sbuf_reassign`,
+   `_rewrite_nki_sbuf_reassignments`.
+8. **`codegen_function_def`** (re-anchored onto upstream's heavily-refactored version that uses
+   `function_decorator_for_args` + a `kernel_body` list + cute pipeline passes): added the
+   `_register_nki_dynamic_tensor_size_args()` call; built the NKI `tensor_shape_preamble` (reshape tensor
+   args to 2D logical shape) and wove it + `_nki_return_statements()` into `kernel_body`
+   (`_nki_return_statements` returns `[]` for non-NKI so it's inert for other backends); restructured the
+   return to build `fn_def` then call `_rewrite_nki_sbuf_reassignments(fn_def.body, …)` for NKI only.
+9. **`codegen_function_call`**: added the `_register_nki_dynamic_tensor_size_args()` call.
+
+**PLAN CORRECTION — HelionNKIPrinter routing:** the plan's watch-out was right. Upstream routes sympy
+printing through `backend.sympy_printer_expr()` (base→`texpr`, Pallas→`pallas_texpr`, CuTe→`cute_texpr`),
+NOT through a `texpr` guard. So instead of patching `texpr` (the reference's approach), added
+`HelionNKIPrinter` + a module-level `nki_texpr()` to device_function.py, and overrode
+`NKIBackend.sympy_printer_expr` (in nki_backend.py) to call `nki_texpr` — matching the upstream idiom. The
+printer emits Python `//` / `%` instead of Triton `div_floor_integer`/`remainder_integer` helpers.
+
+**DEFERRED to P1.17 (store codegen):** the `codegen_function_call` NKI return-buffer call_str manipulation
+(`_nki_result[i]`, reshape/slice on the launcher return). Upstream added a generalized `_output_only_names`
+return-capture mechanism; the NKI `_nki_return_buffers` attrs are only populated by store codegen (not yet
+ported) and getattr-default to empty, so the branch is inert today. Will reconcile NKI return-capture against
+upstream's `_output_only_names` when store codegen lands.
+
+**Verification (gate passed):** module AST-parses; all 8 representative NKI methods present on DeviceFunction;
+`NKIBackend.sympy_printer_expr(x % 8)` → `(x % 8)` (Python modulo via HelionNKIPrinter); `import helion` OK,
+backends include nki.

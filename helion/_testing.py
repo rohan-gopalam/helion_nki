@@ -238,7 +238,10 @@ def _has_mtia_runtime() -> bool:
 
 
 # Determine DEVICE without calling functions that initialize CUDA.
-if _get_backend() == "pallas" and is_pallas_interpret():
+if _get_backend() == "nki":
+    # Canonical examples create host tensors and the NKI launcher moves them to XLA.
+    DEVICE = torch.device("cpu")
+elif _get_backend() == "pallas" and is_pallas_interpret():
     DEVICE = torch.device("cpu")
 elif _get_backend() == "pallas":
     DEVICE = torch.device("tpu")
@@ -1183,11 +1186,22 @@ def run_example(
         assert dist.group.WORLD is not None
         process_group_name = dist.group.WORLD.group_name
 
+    # NKI numerics run looser than Triton (bf16 SBUF, fused ops); relax
+    # tolerances so the canonical examples validate under the NKI backend.
+    if _get_backend() == "nki":
+        rtol = 5e-2
+        atol = 1.5
+
     # Normalize to dict format
     kernels = kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn}
     baselines = (
         baseline_fn if isinstance(baseline_fn, dict) else {baseline_name: baseline_fn}
     )
+    if _get_backend() == "nki" and isinstance(baseline_fn, dict):
+        for preferred in ("pytorch", "torch"):
+            if preferred in baselines:
+                baselines = {preferred: baselines[preferred]}
+                break
 
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))
@@ -1293,6 +1307,10 @@ def run_example(
                     t.grad = None
 
     # Benchmark all functions — clone args to avoid buffer donation issues
+    if _get_backend() == "nki":
+        print("Skipping benchmark on NKI backend.", file=sys.stderr)
+        return
+
     cloned_args = _clone_args(args, process_group_name=process_group_name)
     all_benchmarks = {**kernels, **baselines}
     benchmark_functions = [

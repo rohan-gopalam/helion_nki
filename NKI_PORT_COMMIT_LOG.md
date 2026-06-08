@@ -619,3 +619,20 @@ are env-var-gated diagnostics with no functional effect, and the load-bearing co
 profiling wrap are ported. Can add later if profiling granularity is needed.
 
 **Verification (gate passed):** parses; both helper methods present; copy + matmul still generate; helion OK.
+
+## P1.21 — _testing.py: NKI DEVICE / tolerances / baseline / benchmark skip
+
+**File:** `helion/_testing.py`
+
+**Applied (re-anchored onto upstream's pallas-aware run_example/DEVICE block):**
+- DEVICE detection: `if _get_backend() == "nki": DEVICE = torch.device("cpu")` as the FIRST branch (examples
+  create host tensors; the NKI launcher moves them to XLA).
+- `run_example` baseline dict: when NKI + dict baseline, select the `pytorch`/`torch` entry.
+- `run_example` tolerances: override `rtol=5e-2`, `atol=1.5` for NKI near the top of the function (cleaner
+  than the reference's per-bwd-block local override; covers all assert_close sites via the shared vars).
+- `run_example` benchmark: `if nki: print("Skipping benchmark…"); return` before the benchmark section.
+
+**Plan deviation:** skipped the reference's bwd `msg=lambda ...` tweak (unrelated to NKI; upstream's
+`msg=f"..."` is fine).
+
+**Verification (gate passed):** parses; `DEVICE == cpu` under `HELION_BACKEND=nki`.

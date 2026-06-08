@@ -811,3 +811,30 @@ reference (ModuleNotFoundError: nki_search, since the reference's autotuner over
 was never ported), and my harness counted error==error as "identical". Phase 3 (834689a2) removed that
 nki_search dependency, so those kernels now reach real codegen and expose the next layer. The hardware sweep
 is the authoritative signal, not the codegen harness, for config-less kernels.
+
+## P2.2-fix2 — NKI where via inductor path (concatenate, jagged_mean fixed)
+
+**File:** `helion/_compiler/inductor_lowering.py` (`prepare_node_lowering`).
+
+**Root cause:** Upstream ADDED a generic `where` ATen lowering (`where_lowering` +
+`codegen_where("common")`) that builds a `"{cond}/{x}/{y}"` expression template and feeds it to
+`backend.where_expr`. NKI's `where` is statement-emitting (`nisa.tensor_copy_predicated`, materializes/
+broadcasts operands) and returns a result var — it cannot consume unsubstituted `{x}`/`{y}` placeholders, so
+it raised `KeyError: Missing placeholders: ['y']`. The reference branch had NO `where` ATen lowering, so
+`where` always lowered through the Inductor OpsHandler (which materializes operands and dispatches to
+`NKIOpOverrides.where` via getattr).
+
+**Fix (surgical, mirrors reference):** in `prepare_node_lowering`, when backend is NKI and the node is
+`aten.where.self`, fall through to the inductor path instead of the ATen lowering — modeled exactly on the
+existing argmax/argmin cute skip a few lines above. Does NOT touch the `where` codegen itself.
+
+**Hardware-verified (the authoritative signal; codegen-diff is unreliable for autotuned kernels since port
+vs reference pick different configs):**
+- concatenate: FAIL → **PASS** (57s)
+- jagged_mean: FAIL → **PASS**
+- jsd (uses where, was already passing): still **PASS** — NO regression
+- jagged_hstu_attn: progressed past the where bug to a deeper NKI-kernel type error
+  ('add' got (object,int)) — a separate pre-existing-class issue (documented complex 5D case), not a where regression.
+
+Earlier direct-call and route-to-overrides attempts were reverted (they shifted var-numbering / mishandled
+host-scalar operands). The dispatch-skip is the minimal correct fix.

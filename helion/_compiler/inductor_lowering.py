@@ -130,6 +130,17 @@ def prepare_node_lowering(
             torch.ops.aten.argmin.default,
         } and not _should_use_cute_argreduce_lowering(node):
             pass
+        elif (
+            node.target is torch.ops.aten.where.self
+            and CompileEnvironment.current().backend.name == "nki"
+        ):
+            # Upstream added a generic where ATen lowering whose "common" handler
+            # builds a "{cond}/{x}/{y}" expression template fed to where_expr.
+            # NKI's where is statement-emitting (nisa.tensor_copy_predicated) and
+            # must materialize/broadcast operands through the Inductor OpsHandler
+            # — exactly how the reference branch (which has no where ATen lowering)
+            # lowers it. Fall through to the inductor path for NKI.
+            pass
         else:
             node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
             return

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import functools
 import re
@@ -436,7 +437,15 @@ class TensorType(TypeInfo):
             if isinstance(value, TensorType):
                 rhs_rank = value.fake_value.ndim
                 # Allow scalar tensors (rank 0) to be assigned to any rank (broadcasts)
-                if rhs_rank != 0 and lhs_rank != rhs_rank:
+                allow_trailing_singletons = (
+                    CompileEnvironment.current().backend.name == "nki"
+                )
+                rhs_trailing_singletons = (
+                    allow_trailing_singletons
+                    and rhs_rank > lhs_rank
+                    and all(dim == 1 for dim in value.fake_value.shape[lhs_rank:])
+                )
+                if rhs_rank != 0 and lhs_rank != rhs_rank and not rhs_trailing_singletons:
                     raise exc.RankMismatch(
                         lhs_rank,
                         rhs_rank,
@@ -759,7 +768,15 @@ class CallableType(LiteralType):
             for x in proxy_args
         ):
             if self.value in self._new_symint_on_host_fns() and origin.is_host():
-                return SymIntType.new_unbacked(origin)
+                hint = 8192
+                with contextlib.suppress(Exception):
+                    hinted_args, hinted_kwargs = tree_map_only(
+                        torch.SymInt, env.size_hint, (proxy_args, proxy_kwargs)
+                    )
+                    hinted_result = self.value(*hinted_args, **hinted_kwargs)
+                    if isinstance(hinted_result, int):
+                        hint = int(hinted_result)
+                return SymIntType(origin, env.create_unbacked_symint(hint=hint))
             if isinstance(self.value, type) and issubclass(
                 self.value, ConfigFragmentType
             ):

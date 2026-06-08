@@ -98,3 +98,40 @@ reference, so it affects all backends. Applied as-is to match the reference (and
 unnecessary guards"). **Open follow-up:** confirm at P1.22/P2 that this doesn't shift Triton codegen for
 int tunables; if it does and that matters, revisit guarding. loops.py/exc.py/__init__.py edits from the
 plan were correctly dropped.
+
+## P1.3b — Port NKI type-inference deltas (trailing-singleton + symint-hint)
+
+**File:** `helion/_compiler/type_info.py` (NOT `type_propagation.py` — see correction below).
+
+**PLAN CORRECTION (file location):** The plan said port these into `type_propagation.py`. But upstream's
+`type_propagation.py → type_info.py` split moved `TensorType` and `CallableType` into **`type_info.py`**
+(`type_propagation` only re-exports them). So both NKI deltas were applied to `type_info.py`.
+
+**PLAN CORRECTION (method names):** The reference's method was `TensorType.propagate_assignment`; upstream
+renamed/reorganized it to **`TensorType.propagate_setitem`** (L429). The CallableType hunk lives in
+**`CallableType.propagate_call`** (L705). Applied to the correct methods.
+
+**Two deltas applied (verbatim from reference logic):**
+1. **Trailing-singletons (in `propagate_setitem`):** when `backend.name == "nki"`, allow a higher-rank RHS to
+   be assigned to a lower-rank LHS slice if the extra trailing dims are all size-1 (`rhs_trailing_singletons`).
+   NKI's 2D SBUF model produces `[P, F, 1]`-style shapes that must assign into `[P, F]` lanes without a
+   RankMismatch. This delta IS NKI-guarded.
+2. **Symint-hint capture (in `propagate_call`):** for host-side `_new_symint_on_host_fns` calls, instead of
+   `SymIntType.new_unbacked(origin)` (hint defaults to 8192), evaluate the function on size-hinted args to
+   compute a concrete `hint`, then `SymIntType(origin, env.create_unbacked_symint(hint=hint))`. Gives NKI
+   tile/loop bounds a realistic size hint. NOT backend-guarded in the reference (applies to all backends).
+   Added `import contextlib` (was absent); `tree_map_only` already imported.
+
+**NOT applied (correctly, per plan):**
+- `JaggedTileIndexType` — already in upstream `type_info.py` (L… ); not duplicated (verified count 1/0).
+- `patch_tensor_factories` guard — upstream already guards it at type_propagation.py L903–911 via
+  `backend.pad_factory_tensors_to_power_of_2`; NKI participates by overriding that property to False in P1.6.
+  No edit here.
+
+**Verification (gate passed):**
+- `trailing_singletons` present in `TensorType.propagate_setitem`; `create_unbacked_symint(hint=hint)` present
+  in `CallableType.propagate_call`; `type_propagation` re-export of both classes intact.
+- `JaggedTileIndexType` count: type_info=1, type_propagation=0 (not duplicated).
+- Regression: `import helion` OK.
+
+**Open follow-up:** delta #2 is cross-backend (unconditional) — confirm at P1.22 it doesn't shift Triton codegen.

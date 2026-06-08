@@ -4976,3 +4976,16 @@ class MetalBackend(Backend):
         if not changed:
             return config
         return Config.from_dict({**config.config, "num_threads": num_threads})
+
+
+# Backward-compat shim: NKIOpOverrides and NKIBackend were historically defined
+# in this module; they now live in nki_backend.py (extracted during the upstream
+# port). Resolve them lazily via module __getattr__ (PEP 562) so external code
+# and examples using `from helion._compiler.backend import NKIOpOverrides` keep
+# working, without a circular import (nki_backend imports Backend from here).
+def __getattr__(name: str) -> object:
+    if name in ("NKIOpOverrides", "NKIBackend"):
+        from . import nki_backend
+
+        return getattr(nki_backend, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

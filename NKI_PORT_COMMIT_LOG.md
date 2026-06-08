@@ -761,3 +761,29 @@ agnostic, minimal NKI surface.
 change; `rms_norm` (config-less) now runs through the autotuner (the prior `ModuleNotFoundError:
 nki_search` is gone) and generates a kernel BYTE-IDENTICAL to the reference (both 8093 bytes) — its
 simulate-bwd gradient delta is a simulate/precision artifact, not a port regression (codegen matches ref).
+
+## P2.2-fix1 — Triage fixes from the hardware sweep (stale imports + BlockIDStrategyMapping)
+
+The hardware sweep surfaced failures; triaged from logs (codegen errors, no hardware needed to reproduce):
+
+1. **Stale `NKIOpOverrides` imports (port bug).** Verbatim-extracted blocks (P1.14/P1.19) kept
+   `from .backend import NKIOpOverrides`, but P1.6 moved it to `nki_backend`. Fixed 4 sites:
+   aten_lowering.py (3, incl. one importing `NKIBackend` too) and atomic_ops.py (1) → `from .nki_backend`.
+   This fixes the `ImportError` in jagged_hstu_attn and any kernel hitting those NKI codegen paths.
+
+2. **Backward-compat shim in backend.py.** The reference example `fused_nki_ops.py` (a probe test) imports
+   `from helion._compiler.backend import NKIOpOverrides` directly. Added a module-level `__getattr__` (PEP
+   562) to backend.py that lazily resolves `NKIOpOverrides`/`NKIBackend` from nki_backend — no circular
+   import (nki_backend imports Backend from backend), full backward-compat. fused_nki_ops codegen now OK.
+
+3. **`BlockIDStrategyMapping` has no `.values()` (upstream drift).** memory_ops.py:8953 called `.values()` on
+   `block_id_to_strategy`, which upstream wrapped in `BlockIDStrategyMapping` (has `.items()`, not
+   `.values()`). Made it robust to both dict and the mapping. Fixes jagged_layer_norm
+   (now byte-identical to reference) and unblocks jagged_mean to the next issue.
+
+**Verification:** all 3 files parse; fused_nki_ops + jagged_layer_norm codegen OK (jagged_layer_norm
+byte-identical to ref); matmul still byte-identical (no regression).
+
+**Remaining (separate, autotuner-related):** `aten.where 'Missing placeholders: y'` in concatenate /
+jagged_mean / jagged_hstu_attn — surfaces only when the new base autotuner explores configs the reference's
+NKIFiniteSearch never did. Tracked as Phase 3 task #2.

@@ -2945,7 +2945,7 @@ def codegen_permute_nki(ctx: LoweringContext, node: Node) -> object:
     not yet supported.
     """
     import ast as _ast
-    from .backend import NKIOpOverrides, NKIBackend
+    from .nki_backend import NKIOpOverrides, NKIBackend
     from .compile_environment import CompileEnvironment
     from .ast_extension import statement_from_string
 
@@ -3115,7 +3115,7 @@ def codegen_stack_nki(ctx: LoweringContext, node: Node) -> object:
     if out_val is None or not isinstance(out_val, torch.Tensor):
         raise NotImplementedError("NKI stack requires output shape metadata")
 
-    from .backend import NKIOpOverrides
+    from .nki_backend import NKIOpOverrides
     import sympy as _sp_stack
     _bs_subs_stack: dict[_sp_stack.Symbol, int] = {}
     for _bid in range(len(env.block_sizes)):
@@ -3229,7 +3229,7 @@ def codegen_expand_nki(ctx: LoweringContext, node: Node) -> object:
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
 
-    from .backend import NKIOpOverrides
+    from .nki_backend import NKIOpOverrides
 
     env = CompileEnvironment.current()
     state = getattr(env, "_codegen_state", None)

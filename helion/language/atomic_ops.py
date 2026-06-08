@@ -1780,7 +1780,7 @@ ATOMIC_OPS: frozenset[Callable[..., object]] = frozenset(
 def _(state: CodegenState) -> ast.AST:
     from .._compiler.ast_extension import create
     from .._compiler.ast_extension import statement_from_string
-    from .._compiler.backend import NKIOpOverrides
+    from .._compiler.nki_backend import NKIOpOverrides
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.host_function import HostFunction
     from .memory_ops import _nki_row_index_gather

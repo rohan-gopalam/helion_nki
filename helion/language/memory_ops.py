@@ -8950,7 +8950,14 @@ def _(state: CodegenState) -> ast.AST:
                 _tile_dispatch = getattr(state, "tile_strategy", None)
                 _active_loops = getattr(state.codegen, "active_device_loops", {})
                 if _tile_dispatch is not None:
-                    _strategies = list(getattr(_tile_dispatch, "block_id_to_strategy", {}).values())
+                    # Upstream wraps block_id_to_strategy in a
+                    # BlockIDStrategyMapping (no .values(); has .items());
+                    # older/dict forms have .values(). Support both.
+                    _bid_map = getattr(_tile_dispatch, "block_id_to_strategy", {})
+                    if hasattr(_bid_map, "values"):
+                        _strategies = list(_bid_map.values())
+                    else:
+                        _strategies = [_v for _, _v in _bid_map.items()]
                     # Iterate in descending block_id order so we pick the
                     # innermost active jagged tile's mask (highest block_id =
                     # latest allocated = innermost loop).  This prevents an

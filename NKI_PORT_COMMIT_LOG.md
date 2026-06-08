@@ -599,3 +599,23 @@ Purely additive (+349/-0).
 
 **Verification (gate passed):** parses; `nki` in `atomic_add._codegen`; `load`/`store` nki codegen present
 (dependency satisfied); copy + matmul kernels still generate; `import helion` OK.
+
+## P1.20 — runtime/kernel.py: NKI config completion + profiling
+
+**File:** `helion/runtime/kernel.py`
+
+**Applied (re-anchored onto upstream's refactored BoundKernel):**
+- Added `import copy`, `import os`, `import time` (none present upstream).
+- Added `_complete_nki_partial_config` (pads a partial NKI block_sizes config with safe per-axis defaults
+  that divide the size hint, partition axis ≤128) and `_clone_config` (deep-copies config.config AND
+  preserves `platform_target`) as `BoundKernel` methods, after `_compile_repr`.
+- In `to_triton_code`: replaced upstream's `config = Config(**config.config)` (which DROPS platform_target)
+  with `config = self._clone_config(config)` + `self._complete_nki_partial_config(config)` before normalize.
+- Added the `HELION_NKI_PROFILE` stderr timing wrap around `self._run(*args)` in `__call__`.
+
+**Plan deviation (justified):** skipped the reference's profiling prints *inside* `compile()` (the internal
+`to_triton_code`/`PyCodeCache.load` timing) — they depend on the exact refactored `compile()` structure,
+are env-var-gated diagnostics with no functional effect, and the load-bearing config-completion + the _run
+profiling wrap are ported. Can add later if profiling granularity is needed.
+
+**Verification (gate passed):** parses; both helper methods present; copy + matmul still generate; helion OK.

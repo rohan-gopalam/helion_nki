@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
 import dataclasses
 import functools
 import inspect
 import itertools
 import logging
 import operator
+import os
 import re
 import sys
 import textwrap
+import time
 import types
 from typing import TYPE_CHECKING
 from typing import Any
@@ -641,6 +644,53 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             parts.append(f"index_dtype={settings.index_dtype}")
         return f"@helion.kernel({', '.join(parts)})"
 
+    def _complete_nki_partial_config(self, config: Config) -> None:
+        if self.env.backend.name != "nki":
+            return
+        block_sizes = config.config.get("block_sizes")
+        if block_sizes is None:
+            return
+
+        def _flatten(values: object) -> list[object]:
+            if isinstance(values, (list, tuple)):
+                result: list[object] = []
+                for value in values:
+                    result.extend(_flatten(value))
+                return result
+            return [values]
+
+        values = _flatten(block_sizes)
+        expected = len(self.env.config_spec.block_sizes)
+        if not values or len(values) >= expected:
+            return
+        default_block_sizes = self.env.config_spec.default_config().config.get(
+            "block_sizes", []
+        )
+        if not isinstance(default_block_sizes, list) or len(default_block_sizes) < expected:
+            return
+        safe_defaults = list(default_block_sizes)
+        for i, spec in enumerate(self.env.config_spec.block_sizes):
+            if i >= len(safe_defaults):
+                break
+            if i == 0:
+                continue
+            size_hint = int(max(spec.size_hint, 1))
+            safe = min(int(safe_defaults[i]), 128)
+            while safe > 1 and size_hint % safe != 0:
+                safe //= 2
+            safe_defaults[i] = max(safe, 1)
+        config.config["block_sizes"] = [
+            *values,
+            *safe_defaults[len(values) : expected],
+        ]
+
+    @staticmethod
+    def _clone_config(config: Config) -> Config:
+        return Config(
+            platform_target=config.platform_target,
+            **copy.deepcopy(config.config),
+        )
+
     def to_code(
         self,
         config: ConfigLike | None = None,
@@ -667,7 +717,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             # specific to this BoundKernel's config_spec.  Without this,
             # reusing the same Config across compilations with different
             # constexpr values carries stale entries from an earlier call.
-            config = Config(**config.config)  # pyrefly: ignore [bad-argument-type]
+            # _clone_config preserves platform_target (NKI), which a plain
+            # Config(**config.config) would drop.
+            config = self._clone_config(config)
+            self._complete_nki_partial_config(config)
             self.env.config_spec.normalize(config)
             with measure("BoundKernel.generate_ast"):
                 # pyrefly: ignore [bad-argument-type]
@@ -1078,7 +1131,25 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             assert self._run is not None
             self.maybe_log_repro(log.warning, args)
 
-        return self._run(*args)
+        _nki_profile = os.environ.get("HELION_NKI_PROFILE", "0") not in (
+            "0",
+            "false",
+            "",
+        )
+        if _nki_profile:
+            print(
+                "      [Profile] Starting self._run(*args) [this triggers NKI AOT compilation]...",
+                file=sys.stderr,
+            )
+        t_run_start = time.time()
+        res = self._run(*args)
+        t_run_end = time.time()
+        if _nki_profile:
+            print(
+                f"      [Profile] self._run took {t_run_end - t_run_start:.2f} seconds.",
+                file=sys.stderr,
+            )
+        return res
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """

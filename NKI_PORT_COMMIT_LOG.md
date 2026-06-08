@@ -636,3 +636,38 @@ profiling wrap are ported. Can add later if profiling granularity is needed.
 `msg=f"..."` is fine).
 
 **Verification (gate passed):** parses; `DEVICE == cpu` under `HELION_BACKEND=nki`.
+
+## P1.22 — byte-for-byte codegen verification gate + return-buffer fix + tests
+
+**Files:** `helion/_compiler/device_function.py` (return-buffer fix), `test/test_nki_port_codegen.py` (new).
+
+**Methodology:** created a reference worktree (`git worktree add /tmp/ref_wt fix-nki-kernel-compilation`)
+and a generator (`/tmp/gen_one.py`). With `PYTHONHASHSEED=0`, confirmed reference codegen is DETERMINISTIC
+(ref-vs-ref identical), then diffed port `to_triton_code` vs reference for representative patterns.
+
+**Results:**
+| Pattern | Kernel | Result |
+|---|---|---|
+| pointwise/DMA | copy | **byte-IDENTICAL** (43 lines) |
+| matmul | addmm tiled | **byte-IDENTICAL** (128 lines) |
+| reduction | row sum | **byte-IDENTICAL** (64 lines) |
+| gather/indirect | embedding-style | **semantically identical** — only `0 + N` (ref) vs `N` (port) folding on literal-zero free-dim slice starts |
+
+**FIX caught by the gate (the deferred P1.9 item):** the copy diff initially showed the port emitting
+`_launcher(...)` instead of `out = _launcher(...).reshape([...])` — the NKI return-buffer capture was missing
+because `codegen_function_call`'s NKI branch was deferred to P1.17. Added it now: grafted the NKI
+`_nki_return_buffers` (multi-output → `_nki_post_call_stmts`) and `_nki_return_host_var`/`reshape`/`slice`
+(single-output) handling into upstream's `codegen_function_call` before the `_output_only_names` path.
+After the fix, copy is byte-identical.
+
+**Known cosmetic delta (gather):** every gather diff hunk is `0 + 256` ↔ `256` — semantically identical
+(same numeric guard, same slice range, same compiled NEFF). The NKI memory_ops block is verbatim-identical to
+the reference, so this stems from a shared slice-string folding difference upstream, not an NKI-logic error.
+Left as-is (not a correctness issue); flagged for optional follow-up if exact byte-parity on gather is
+required.
+
+**Tests:** added `test/test_nki_port_codegen.py` — 4 structural codegen tests (copy/matmul/reduce/gather),
+all PASS, guarding the invariants without hardware.
+
+**Verification (gate passed):** 3/4 patterns byte-identical, gather semantically-identical; all 4 codegen
+tests pass; no Triton leakage anywhere.

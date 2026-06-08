@@ -1294,7 +1294,50 @@ class DeviceFunction:
         launcher_call = (
             f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})"
         )
-        if output_only_names:
+        # NKI captures the launcher's return buffer(s) back into the host output
+        # tensor(s), with the reshape/slice that maps the 2D SBUF layout back to
+        # the caller's logical shape. Populated by the NKI store codegen.
+        nki_bufs = getattr(self, "_nki_return_buffers", None)
+        if backend.name == "nki" and nki_bufs and len(nki_bufs) > 1:
+            result_var = "_nki_result"
+            call_statement = statement_from_string(
+                f"{result_var} = {launcher_call}",
+                call_grid_expr=call_grid_expr,
+            )
+            post_stmts: list[ast.stmt] = []
+            for i, info in enumerate(nki_bufs.values()):
+                host_var = info["host_var"]
+                reshape = info["host_reshape"]
+                if reshape is not None:
+                    post_stmts.append(
+                        statement_from_string(
+                            f"{host_var} = {result_var}[{i}].reshape({reshape})"
+                        )
+                    )
+                else:
+                    post_stmts.append(
+                        statement_from_string(f"{host_var} = {result_var}[{i}]")
+                    )
+            self._nki_post_call_stmts = post_stmts
+        elif backend.name == "nki" and (
+            (return_host_var := getattr(self, "_nki_return_host_var", None)) is not None
+        ):
+            return_host_reshape = getattr(self, "_nki_return_host_reshape", None)
+            return_host_slice = getattr(self, "_nki_return_host_slice", None)
+            if return_host_slice is not None:
+                # Padding was applied to the HBM buffer; clip with a slice.
+                call_str = f"{return_host_var} = {launcher_call}{return_host_slice}"
+            elif return_host_reshape is not None:
+                call_str = (
+                    f"{return_host_var} = {launcher_call}.reshape({return_host_reshape})"
+                )
+            else:
+                call_str = f"{return_host_var} = {launcher_call}"
+            call_statement = statement_from_string(
+                call_str,
+                call_grid_expr=call_grid_expr,
+            )
+        elif output_only_names:
             if len(output_only_names) == 1:
                 assign_target = output_only_names[0]
             else:

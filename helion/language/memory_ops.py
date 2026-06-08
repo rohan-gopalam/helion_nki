@@ -11045,6 +11045,20 @@ def _(state: CodegenState) -> None:
                             block_id = _bid
                             break
 
+        # tile_id(tile) produces an unbacked symbol that _nki_subscript_block_id
+        # often can't map back to a block_id. Recover it from the tile_id FX
+        # node's first arg (the tile whose .id this is), whose meta["val"] is
+        # the block's symint. Without this, the store falls through to the
+        # size-hint folding path below and emits a constant row index (e.g.
+        # offset_0 // 128 -> 8192) so every block writes the same row.
+        if _is_tile_id_s and block_id is None and isinstance(fx_node_i, torch.fx.Node):
+            _tid_args = getattr(fx_node_i, "args", ())
+            if _tid_args and isinstance(_tid_args[0], torch.fx.Node):
+                _tid_val = _tid_args[0].meta.get("val")
+                if isinstance(_tid_val, torch.SymInt):
+                    _rec_bid = env.get_block_id(_tid_val)
+                    if _rec_bid is not None:
+                        block_id = _rec_bid
         if _is_tile_id_s and block_id is not None:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)

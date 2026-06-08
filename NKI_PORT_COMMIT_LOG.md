@@ -884,3 +884,26 @@ writes to the same wrong row → wrong gradient. The reference keeps it symbolic
 recovered fused_nki_ops/jagged_layer_norm/jagged_sum). Remaining: 3 diagnosed-regressions (layer_norm,
 rms_norm + the same store-folding class), 2 to-recheck (long_sum, low_mem_dropout, split_k_barrier may share
 the offset-folding or be separate), 3 pre-existing, 1 harness-artifact, 4 blocked-as-expected.
+
+## P2.2e — FIX: recover block_id for tile_id stores (layer_norm regression fixed)
+
+**File:** `helion/language/memory_ops.py` (NKI store codegen, `_is_tile_id_s` path).
+
+**Root cause (fully traced):** for a per-block return-buffer store like
+`grad_weight_blocks[mb_cta.id, :]`, the store sees `_is_tile_id_s=True` (FX target `tile_id`) but
+`_nki_subscript_block_id` returns `block_id=None` (the tile_id's unbacked symbol u4 doesn't map via
+`env.get_block_id`). So `if _is_tile_id_s and block_id is not None` was False → fell through to the
+size-hint folding path, emitting `nki_return_buf[8192 ...]` (8192 = offset's size_hint) for the row index —
+every block wrote the SAME wrong row → wrong gradient.
+
+**Fix:** when `_is_tile_id_s and block_id is None`, recover the block_id from the tile_id FX node's first
+arg — `fx_node_i.args[0].meta["val"]` is the tile's block symint (e.g. u0), and `env.get_block_id(u0)=0`
+(verified via probe). Then the store takes the symbolic `offset_0 // 128` path, matching the reference.
+
+**Verified:**
+- layer_norm_bwd codegen now **BYTE-IDENTICAL to reference** (8192 gone, `offset_0 // 128` restored).
+- Hardware: **layer_norm FAIL → PASS**; grouped_gemm + moe_matmul_ogs (which the fix also touched, adding a
+  harmless `else: pass` bounds-guard branch) **stay PASS** — no regression.
+- 13 other byte-identical examples unchanged.
+
+(rms_norm still fails — a separate bwd issue, triaged next.)

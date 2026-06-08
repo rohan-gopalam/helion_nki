@@ -31,6 +31,7 @@ from .host_function import HostFunction
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
 from .program_id import L2GroupingProgramIDs
+from .program_id import NKIProgramIDs
 from .program_id import PersistentBlockedProgramIDs
 from .program_id import PersistentInterleavedProgramIDs
 from .program_id import PIDInfo
@@ -1899,8 +1900,28 @@ class DeviceGridState(DeviceLoopOrGridState):
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
-        for lane_var, extent in reversed(self.lane_loops):
-            wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
+        for entry in reversed(self.lane_loops):
+            # NKI uses a 3-tuple (lane_var, body_prefix_stmts, extent) to inject
+            # nisa.iota index setup at the top of each loop body where lane_var
+            # is in scope; other backends use the 2-tuple (lane_var, extent).
+            if len(entry) == 3:
+                lane_var, body_prefix, extent = entry
+                iter_expr = (
+                    extent if isinstance(extent, str) else f"range({extent})"
+                )
+                wrapped = [
+                    create(
+                        ast.For,
+                        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+                        iter=expr_from_string(iter_expr),
+                        body=[*body_prefix, *wrapped],
+                        orelse=[],
+                        type_comment=None,
+                    )
+                ]
+            else:
+                lane_var, extent = entry
+                wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
         return wrapped
 
 
@@ -1916,8 +1937,28 @@ class PersistentReductionState(DeviceLoopOrGridState):
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
-        for lane_var, extent in reversed(self.lane_loops):
-            wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
+        for entry in reversed(self.lane_loops):
+            # NKI uses a 3-tuple (lane_var, body_prefix_stmts, extent) to inject
+            # nisa.iota index setup at the top of each loop body where lane_var
+            # is in scope; other backends use the 2-tuple (lane_var, extent).
+            if len(entry) == 3:
+                lane_var, body_prefix, extent = entry
+                iter_expr = (
+                    extent if isinstance(extent, str) else f"range({extent})"
+                )
+                wrapped = [
+                    create(
+                        ast.For,
+                        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+                        iter=expr_from_string(iter_expr),
+                        body=[*body_prefix, *wrapped],
+                        orelse=[],
+                        type_comment=None,
+                    )
+                ]
+            else:
+                lane_var, extent = entry
+                wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
         return wrapped
 
 
@@ -3814,6 +3855,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         # TODO(jansel): refactor this to share code with codegen_grid
         block_ids = self.block_ids
         env = CompileEnvironment.current()
+        if env.backend.name == "nki":
+            return self._codegen_device_loop_nki(state)
         dtype = env.index_type()
         block_sizes = self.block_size
         body = innermost_body = []
@@ -3921,6 +3964,478 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             block_id_to_info=block_id_to_info,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+        )
+
+    def _codegen_device_loop_nki(self, state: CodegenState) -> DeviceLoopState:
+        # TODO(jansel): refactor this to share code with codegen_grid
+        block_ids = self.block_ids
+        env = CompileEnvironment.current()
+        dtype = env.index_type()
+        block_sizes = self.block_size
+        body = innermost_body = []
+        for_node: ast.For | None = None
+        assert len(block_sizes) == len(block_ids)
+        _, begins, ends, _ = state.ast_args
+        _, _, proxy_ends, _ = state.proxy_args
+        assert isinstance(begins, list)
+        assert isinstance(ends, list)
+        assert isinstance(proxy_ends, list)
+        # For NKI device loops, use dimension size as loop end (e.g. x.shape[1] for K)
+        # so the range is 0..dim_size with step block_size, not 0..128.
+        # Only apply when begin == 0 (top-level loops).  For nested loops with a
+        # non-zero begin (e.g. inner tile of hl.tile(mb_cta.begin, mb_cta.end)),
+        # bs_info.size is the range *length* (32), not the absolute end
+        # (offset_0 + 32), so replacing ends[i] with bs_info.size would give a
+        # wrong constant stop value and make all but the first outer iteration empty.
+        if env.backend.name == "nki":
+            ends = list(ends)
+            proxy_ends = list(proxy_ends)
+            for i, block_idx in enumerate(block_ids):
+                begin_i = begins[i]
+                begin_is_zero = (
+                    (isinstance(begin_i, int) and begin_i == 0)
+                    or (
+                        isinstance(begin_i, torch.SymInt)
+                        and begin_i._sympy_() == 0
+                    )
+                )
+                if not begin_is_zero:
+                    continue  # keep the original absolute end for nested loops
+                bs_info = env.block_sizes[block_idx]
+                if isinstance(bs_info.size, (int, torch.SymInt)):
+                    ends[i] = bs_info.size
+                    proxy_ends[i] = bs_info.size
+                elif bs_info.size is None:
+                    # Dynamic bound.
+                    # neuronx-cc does not support nested dynamic_range loops.
+                    # When multiple jagged tiles with data-dependent bounds are
+                    # nested, outer ones must use affine_range (with a static
+                    # ceiling derived from the block-size spec) while only the
+                    # innermost uses dynamic_range.
+                    #
+                    # Detection: if this is a jagged tile AND there exists
+                    # another jagged tile registered in the env with a HIGHER
+                    # block_id (allocated later → lives in an inner scope), this
+                    # tile is an outer jagged tile and should use affine_range.
+                    # Block IDs are allocated in source order, so a higher id
+                    # means it appears lexically later (inside) this loop.
+                    _is_outer_jagged = False
+                    if env.is_jagged_tile(block_idx):
+                        # A jagged tile should use affine_range (instead of
+                        # dynamic_range) only if there is another jagged tile
+                        # CURRENTLY BEING LOWERED (i.e. its add_device_loop
+                        # context is open) that has a lower block_id.
+                        # Lower block_id = allocated earlier in source order =
+                        # outer loop.  Sequential sibling jagged loops never
+                        # overlap in active_device_loops; only true nesting
+                        # does.  This is the retroactive detection: when the
+                        # INNER tile is processed, we demote the outer tile
+                        # in-place from dynamic_range to affine_range (see
+                        # the post-build block below).
+                        _active_loops = getattr(state.codegen, "active_device_loops", {})
+                        _outer_jagged_bid: int | None = None
+                        for _chk_bid in _active_loops:
+                            if (
+                                env.is_jagged_tile(_chk_bid)
+                                and _chk_bid < block_idx
+                                and _active_loops.get(_chk_bid)
+                            ):
+                                _outer_jagged_bid = _chk_bid
+                                break
+                        _is_outer_jagged = (_outer_jagged_bid is not None)
+                    if _is_outer_jagged:
+                        # THIS tile is the inner tile; _outer_jagged_bid is
+                        # the outer jagged tile that already used dynamic_range.
+                        # Demote the outer tile retroactively: replace its
+                        # for_node.iter from dynamic_range to affine_range with
+                        # a static max_size bound.  The outer tile's mask
+                        # (_NKINDTileStrategy._setup_mask) handles per-row
+                        # jagged masking so correctness is preserved.
+                        assert _outer_jagged_bid is not None
+                        _outer_loop_states = _active_loops.get(_outer_jagged_bid, [])
+                        if _outer_loop_states:
+                            _outer_state = _outer_loop_states[-1]
+                            _outer_for = getattr(_outer_state, "for_node", None)
+                            if _outer_for is not None:
+                                try:
+                                    _outer_bs_spec = env.config_spec.block_sizes.block_id_lookup(_outer_jagged_bid)
+                                    _outer_max = _outer_bs_spec.max_size
+                                    _outer_bs_size = env.block_sizes[_outer_jagged_bid].from_config(state.config)
+                                    _outer_bs_str = str(int(_outer_bs_size)) if isinstance(_outer_bs_size, (int, bool)) else str(_outer_max)
+                                    _outer_for.iter = expr_from_string(
+                                        f"nl.affine_range(0, {_outer_max}, {_outer_bs_str})"
+                                    )
+                                    # Remove from _nki_dyn_loops so downstream
+                                    # codegen (iota, DMA AP) treats it as static.
+                                    _dyn_loops_demote = getattr(state.device_function, "_nki_dyn_loops", {})
+                                    _dyn_loops_demote.pop(_outer_jagged_bid, None)
+                                except Exception:
+                                    pass
+                        # THIS (inner) tile proceeds to dynamic_range setup below.
+                        # Fall through — do NOT continue.
+                    # Dynamic bound: emit register setup + SBUF counter.
+                    # The loop body will rewrite offset_var uses to reference
+                    # the counter tile.
+                    from .ast_extension import statement_from_string
+                    import ast as _ast_mod
+                    end_ast = ends[i]
+                    end_expr_str = (
+                        _ast_mod.unparse(end_ast)
+                        if isinstance(end_ast, _ast_mod.AST)
+                        else str(end_ast)
+                    )
+                    bnd_reg = state.device_function.new_var("_dyn_bnd_reg")
+                    counter_var = state.device_function.new_var("_dyn_counter")
+                    counter_float_var = state.device_function.new_var("_dyn_counter_f")
+                    def _nki_has_sbuf_shape(name: str) -> bool:
+                        if name in state.device_function._nki_sbuf_shapes:
+                            return True
+                        lookup = name
+                        while "_copy" in lookup:
+                            lookup = lookup[: lookup.rfind("_copy")]
+                            if lookup in state.device_function._nki_sbuf_shapes:
+                                return True
+                        return False
+
+                    if _nki_has_sbuf_shape(end_expr_str):
+                        bnd_sbuf = end_expr_str
+                    else:
+                        bnd_sbuf = state.device_function.new_var("_dyn_bnd_sbuf")
+                        state.add_statement(statement_from_string(
+                            f"{bnd_sbuf} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={bnd_sbuf}, src={end_expr_str})"
+                        ))
+                    state.add_statement(statement_from_string(
+                        f"{bnd_reg} = nisa.register_alloc()"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.register_load({bnd_reg}, {bnd_sbuf})"
+                    ))
+                    # Init counter to -step (int32 SBUF tile). We increment
+                    # at the start of each iteration, so iter 1 counter = 0,
+                    # iter 2 counter = step, etc.
+                    step_init = int(block_sizes[i]) if isinstance(block_sizes[i], (int, bool)) else 1
+                    state.add_statement(statement_from_string(
+                        f"{counter_var} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.memset({counter_var}, value={-step_init})"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"{counter_float_var} = nl.ndarray([1, 1], nl.float32, buffer=nl.sbuf)"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.memset({counter_float_var}, value={float(-step_init)})"
+                    ))
+                    # Stash state on device_function so load/store/iota can
+                    # detect we're inside a dynamic loop and rewrite.
+                    if not hasattr(state.device_function, "_nki_dyn_loops"):
+                        state.device_function._nki_dyn_loops = {}
+                    step_int = int(block_sizes[i]) if isinstance(block_sizes[i], (int, bool)) else 1
+                    _offset_var = self.offset_var(block_idx)
+                    state.device_function._nki_dyn_loops[block_idx] = {
+                        "reg": bnd_reg,
+                        "counter": counter_var,
+                        "counter_float": counter_float_var,
+                        "step": step_int,
+                        "bound_sbuf": bnd_sbuf,
+                        "offset_var": _offset_var,
+                        # Signals memory_ops.py to emit a static prefill and
+                        # redirect y-loads to the padded output buffer, fixing
+                        # the oob_mode.skip partial-tile data loss bug.
+                        # Only set for jagged-style loops where the end bound
+                        # comes from a tensor_reduce(max) — those always produce
+                        # a variable named "nki_reduce".  General tensor-bound
+                        # loops (hl.tile(end[0])) use DMA-loaded scalars and
+                        # must NOT trigger the prefill path.
+                        "needs_prefill": bnd_sbuf.startswith("nki_reduce"),
+                    }
+                    state.device_function._nki_dyn_range_end_var = bnd_reg
+                    state.device_function._nki_dyn_current_block_id = block_idx
+            # Clamp block_size to loop extent: NKI's dma_copy uses
+            # [offset:offset+block_size] which can go OOB when block_size
+            # exceeds tensor dim (e.g. x_offsets[33] with block_size=64).
+            _clamped_bs = list(block_sizes)
+            for i, block_idx in enumerate(block_ids):
+                try:
+                    _numel = env.block_sizes[block_idx].numel
+                except (AssertionError, AttributeError):
+                    # Dynamic (tensor) bound: can't clamp at compile time
+                    continue
+                _num_int: int | None = None
+                if isinstance(_numel, (int, bool)):
+                    _num_int = int(_numel)
+                elif isinstance(_numel, torch.SymInt):
+                    try:
+                        _num_int = env.size_hint(_numel)
+                    except Exception:
+                        _num_int = None
+                elif isinstance(_numel, sympy.Expr):
+                    try:
+                        _num_int = int(_numel)
+                    except (TypeError, ValueError):
+                        try:
+                            _num_int = int(env.size_hint(_numel))
+                        except Exception:
+                            _num_int = None
+                cur_bs = block_sizes[i]
+                if (_num_int is not None
+                        and isinstance(cur_bs, (int, bool))
+                        and int(cur_bs) > _num_int):
+                    _clamped_bs[i] = _num_int
+            if _clamped_bs != list(block_sizes):
+                try:
+                    config_block_sizes = state.config.config.get("block_sizes")
+                    if isinstance(config_block_sizes, list):
+                        for bid, new_bs in zip(block_ids, _clamped_bs, strict=True):
+                            try:
+                                idx = env.config_spec.block_sizes.block_id_to_index(bid)
+                            except Exception:
+                                continue
+                            config_block_sizes[idx] = new_bs
+                except Exception:
+                    pass
+                block_sizes = _clamped_bs
+        block_id_to_info = {}
+        thread_axis_offset = self._thread_axis_offset(state)
+        thread_axis_map = self._thread_axis_map()
+        # If we set up _nki_dyn_loops above, clear the legacy single-var
+        # so the range_str fallback doesn't consume it for the wrong dimension.
+        if getattr(state.device_function, "_nki_dyn_loops", {}):
+            state.device_function._nki_dyn_range_end_var = None
+        for block_idx, block_size, begin, end, proxy_end in self._reorder(
+            [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
+        ):
+            offset_var = self.offset_var(block_idx)
+            index_var = self.index_var(block_idx)
+            if block_size != 1:
+                block_size_var_for_constexpr = self.block_size_var(block_idx)
+                assert block_size_var_for_constexpr is not None
+                self._setup_block_size_constexpr(
+                    state,
+                    block_size_var_for_constexpr,
+                    block_size,
+                    block_idx=block_idx,
+                )
+                block_size_var = self.block_size_var(block_idx)
+                assert block_size_var is not None
+            else:
+                block_size_var = "1"
+            end_var_name = state.codegen.lift(
+                self._to_ast(end, to_dtype=dtype), dce=True, prefix="end"
+            ).id
+            block_id_to_info[block_idx] = LoopDimInfo(
+                end_var_name=end_var_name,
+                end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
+            )
+
+            # For dynamic-bound loops (block_idx in _nki_dyn_loops), emit
+            # nl.dynamic_range with the pre-allocated register directly instead
+            # of going through range_str (which can't know the block_id).
+            _dyn_info_here = getattr(state.device_function, "_nki_dyn_loops", {}).get(block_idx)
+            if _dyn_info_here is not None and env.backend.name == "nki":
+                _dyn_reg_here = _dyn_info_here["reg"]
+                _begin_str = "0"
+                if isinstance(begin, int):
+                    _begin_str = str(begin)
+                for_node = create(
+                    ast.For,
+                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                    iter=expr_from_string(
+                        f"nl.dynamic_range({_begin_str}, {_dyn_reg_here}, {block_size_var})"
+                    ),
+                    body=body,
+                    orelse=[],
+                    type_comment=None,
+                )
+                # Consume the legacy single-var if it was set for this block
+                if getattr(state.device_function, "_nki_dyn_range_end_var", None) == _dyn_reg_here:
+                    state.device_function._nki_dyn_range_end_var = None
+            else:
+                # NKI: if begin is a [1,1] SBUF tensor (dynamic scalar), load it into
+                # a register and use dynamic_range(begin_reg, end, step).
+                _nki_dyn_begin_reg = None
+                if env.backend.name == "nki" and begin is not None and not isinstance(begin, (int, bool)):
+                    import ast as _ast_mod_begin
+                    from .ast_extension import statement_from_string
+                    _begin_ast = self._to_ast(begin, to_dtype=dtype)
+                    _begin_name = _ast_mod_begin.unparse(_begin_ast) if isinstance(_begin_ast, _ast_mod_begin.AST) else str(begin)
+                    _sbuf_shapes = getattr(state.device_function, "_nki_sbuf_shapes", {})
+                    _begin_sbuf_shape = _sbuf_shapes.get(_begin_name)
+                    if _begin_sbuf_shape is None:
+                        _lk = _begin_name
+                        while "_copy" in _lk:
+                            _lk = _lk[:_lk.rfind("_copy")]
+                            _begin_sbuf_shape = _sbuf_shapes.get(_lk)
+                            if _begin_sbuf_shape is not None:
+                                break
+                    if _begin_sbuf_shape is not None and _begin_sbuf_shape == [1, 1]:
+                        # If a preceding needs_prefill dynamic loop used this SBUF
+                        # as its end-bound, the static prefill already wrote y to all
+                        # columns. The tail loop is redundant — suppress it entirely.
+                        _dyn_loops_skip = getattr(state.device_function, "_nki_dyn_loops", {})
+                        _skip_tail = any(
+                            _dl.get("needs_prefill") and _dl.get("bound_sbuf") == _begin_name
+                            for _dl in _dyn_loops_skip.values()
+                        )
+                        if _skip_tail:
+                            state.device_function._nki_skip_tail_loop = True
+                            _nki_dyn_begin_reg = None
+                        else:
+                            state.device_function._nki_skip_tail_loop = False
+                            _nki_dyn_begin_reg = state.device_function.new_var("_dyn_begin_reg")
+                            state.add_statement(statement_from_string(
+                                f"{_nki_dyn_begin_reg} = nisa.register_alloc()"
+                            ))
+                            state.add_statement(statement_from_string(
+                                f"nisa.register_load({_nki_dyn_begin_reg}, {_begin_name})"
+                            ))
+                        # Emit a counter SBUF that tracks the actual integer offset.
+                        # Init to begin - step; first loop-body increment → begin.
+                        # This mirrors the dyn-end loop counter so dma_copy AP can use it.
+                        _step_val = int(block_size) if isinstance(block_size, (int, bool)) else 1
+                        _dyn_begin_counter = state.device_function.new_var("_dyn_begin_counter")
+                        _dyn_begin_counter_f = state.device_function.new_var("_dyn_begin_counter_f")
+                        state.device_function._nki_sbuf_shapes[_dyn_begin_counter] = [1, 1]
+                        state.device_function._nki_sbuf_dtypes[_dyn_begin_counter] = "nl.int32"
+                        state.device_function._nki_sbuf_shapes[_dyn_begin_counter_f] = [1, 1]
+                        state.device_function._nki_sbuf_dtypes[_dyn_begin_counter_f] = "nl.float32"
+                        state.add_statement(statement_from_string(
+                            f"{_dyn_begin_counter} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={_dyn_begin_counter}, src={_begin_name})"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_scalar(dst={_dyn_begin_counter}, "
+                            f"data={_dyn_begin_counter}, op0=nl.subtract, operand0={_step_val})"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"{_dyn_begin_counter_f} = nl.ndarray([1, 1], nl.float32, buffer=nl.sbuf)"
+                        ))
+                        # Cast int32 → float32: memset to 0.0, then add the int32 value.
+                        # tensor_tensor(float32, float32, int32, nl.add) converts int32 to float.
+                        state.add_statement(statement_from_string(
+                            f"nisa.memset({_dyn_begin_counter_f}, value=0.0)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_tensor(dst={_dyn_begin_counter_f}, "
+                            f"data1={_dyn_begin_counter_f}, data2={_dyn_begin_counter}, op=nl.add)"
+                        ))
+                        # Track the offset var so guards skip the >= 0 check for it
+                        if not hasattr(state.device_function, "_nki_dyn_begin_offset_vars"):
+                            state.device_function._nki_dyn_begin_offset_vars = set()
+                        state.device_function._nki_dyn_begin_offset_vars.add(offset_var)
+                        # Store counter info so loop_index_statements and dma_copy AP can use it
+                        if not hasattr(state.device_function, "_nki_dyn_loops"):
+                            state.device_function._nki_dyn_loops = {}
+                        state.device_function._nki_dyn_loops[block_idx] = {
+                            "reg": _nki_dyn_begin_reg,
+                            "counter": _dyn_begin_counter,
+                            "counter_float": _dyn_begin_counter_f,
+                            "step": _step_val,
+                            "bound_sbuf": _begin_name,
+                            "offset_var": offset_var,
+                        }
+                _skip_tail_loop = getattr(state.device_function, "_nki_skip_tail_loop", False)
+                if _skip_tail_loop:
+                    for_node = create(
+                        ast.For,
+                        target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        iter=expr_from_string("nl.affine_range(0, 0, 1)"),
+                        body=body, orelse=[], type_comment=None,
+                    )
+                elif _nki_dyn_begin_reg is not None:
+                    for_node = create(
+                        ast.For,
+                        target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        iter=expr_from_string(
+                            f"nl.dynamic_range({_nki_dyn_begin_reg}, {{end}}, {block_size_var})",
+                            end=self._to_ast(end, to_dtype=dtype),
+                        ),
+                        body=body,
+                        orelse=[],
+                        type_comment=None,
+                    )
+                else:
+                    for_node = create(
+                        ast.For,
+                        target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        iter=expr_from_string(
+                            self.get_range_call_str(
+                                state.config,
+                                [block_idx],
+                                begin="{begin}",
+                                end="{end}",
+                                step=block_size_var,
+                            ),
+                            begin=self._to_ast(begin, to_dtype=dtype),
+                            end=self._to_ast(end, to_dtype=dtype),
+                        ),
+                        body=body,
+                        orelse=[],
+                        type_comment=None,
+                    )
+            assert for_node.body is body
+            uses_thread_axis = self._uses_thread_axis(block_size)
+            axis = thread_axis_offset + thread_axis_map[block_idx]
+            bs = block_size_var if uses_thread_axis else "1"
+            idx_stmts = _backend_loop_index_statements(
+                env.backend,
+                offset_var=offset_var,
+                block_size_var=bs,
+                dtype=dtype,
+                axis=axis,
+                index_var=index_var,
+            )
+            extra_body = list(idx_stmts)
+            # pyrefly: ignore [missing-attribute]
+            mask_statement = self._setup_mask(
+                state, block_idx, block_size, index_var, end
+            )
+            if mask_statement is not None:
+                if isinstance(mask_statement, list):
+                    extra_body.extend(mask_statement)
+                else:
+                    extra_body.append(mask_statement)
+            # If this block is dynamic, prepend counter-increment at the
+            # START of the loop body (counter was init to -step, so first
+            # iteration brings it to 0 before index use).
+            _dyn_loops_sa = getattr(state.device_function, "_nki_dyn_loops", {})
+            _counter_inc_stmt = None
+            if block_idx in _dyn_loops_sa:
+                from .ast_extension import statement_from_string
+                _counter = _dyn_loops_sa[block_idx]["counter"]
+                _counter_float = _dyn_loops_sa[block_idx].get("counter_float")
+                _step = _dyn_loops_sa[block_idx]["step"]
+                _counter_inc_stmt = statement_from_string(
+                    f"nisa.tensor_scalar(dst={_counter}, data={_counter}, op0=nl.add, operand0={_step})"
+                )
+                if _counter_float is not None:
+                    _counter_inc_stmt = [
+                        _counter_inc_stmt,
+                        statement_from_string(
+                            f"nisa.tensor_scalar(dst={_counter_float}, data={_counter_float}, op0=nl.add, operand0={float(_step)})"
+                        ),
+                    ]
+            # pyrefly: ignore [unsupported-operation]
+            if _counter_inc_stmt is not None:
+                # Put increment BEFORE iota/mask so indices use the updated counter.
+                if isinstance(_counter_inc_stmt, list):
+                    body[:] = [*_counter_inc_stmt, *extra_body, *body]
+                else:
+                    body[:] = [_counter_inc_stmt, *extra_body, *body]
+            else:
+                body[:] = [*extra_body, *body]
+            body = [for_node]
+        assert for_node is not None
+        return DeviceLoopState(
+            self,
+            for_node=for_node,
+            inner_statements=innermost_body,
+            block_id_to_info=block_id_to_info,
         )
 
     def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:

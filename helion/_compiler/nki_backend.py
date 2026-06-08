@@ -5257,6 +5257,13 @@ class NKIBackend(Backend):
                 # Adding [None, :] produces 3D indexing on 2D SBUF tiles.
                 return False
 
+            def mask_var(self, block_idx: int) -> str | None:
+                # NKI may query mask_var for a block whose _setup_mask never
+                # ran; the reference returns None gracefully (vs upstream's []
+                # which would KeyError). Use .get to preserve that behavior
+                # without affecting other backends.
+                return self.mask_vars.get(block_idx)
+
             def _setup_mask(
                 self,
                 state: "CodegenState",

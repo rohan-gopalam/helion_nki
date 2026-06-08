@@ -498,3 +498,29 @@ helion` OK; smoke still at expected `load` boundary.
 
 **Verification (gate passed):** parses; `_codegen_grid_nki` present on `_BaseNDTileStrategy`; the NKI guard
 is in `codegen_grid`; `import helion` OK.
+
+### P1.16d+e — codegen_device_loop NKI branch + DeviceGridState 3-tuple lane loops + mask_var
+
+**Applied:**
+- `_BaseNDTileStrategy.codegen_device_loop`: early-branch `if env.backend.name == "nki": return
+  self._codegen_device_loop_nki(state)` right after `env`. Inserted `_codegen_device_loop_nki` (472 lines,
+  the reference's entire codegen_device_loop renamed) before `compact_shape`. This keeps upstream's
+  refactored 112-line body (thread-axis/LoopDimInfo/steps) fully intact and isolates the NKI dynamic-range/
+  register logic. Verified deps (`_thread_axis_offset/_map`, `_uses_thread_axis(block_size)`, `_setup_mask`,
+  `_reorder`, `DeviceLoopState` fields) all exist upstream.
+- `DeviceGridState.wrap_body`: handle the NKI 3-tuple `lane_loops` entry `(lane_var, body_prefix, extent)`
+  (string range_expr + body-prefix iota injection) alongside upstream's 2-tuple `_create_lane_loop` path.
+  `_codegen_grid_nki` emits 3-tuples, so this is required. Applied to both wrap_body definitions.
+- `from .program_id import NKIProgramIDs` added (the reference imports it; `_codegen_device_loop_nki` calls
+  `set_pid(NKIProgramIDs())`).
+- `_NKINDTileStrategy.mask_var` override (`.get()`) added in nki_backend.py — localizes the reference's
+  `NDTileStrategy.mask_var` `.get()` change to NKI only, avoiding touching cute.
+
+**Plan deviations (justified):** Skipped the reference's `NDTileStrategy.mask_var` `.get()` change (did it via
+the NKI subclass override instead — safer, cute untouched) and the `CuteNDTileStrategy._setup_block_size_constexpr
+(block_idx=)` additions (CuteNDTileStrategy is cute-only, never NKI — verified only instantiated in
+backend.py L4620 — so block_idx would never trigger the NKI guard; cosmetic, skipped to minimize diff).
+
+**Verification (gate passed):** parses; `import helion` OK; **end-to-end smoke now runs the full NKI tile
+path** (grid + device loop — the prior NKIProgramIDs NameError is fixed) and fails cleanly at the expected
+`codegen for API function load` boundary (P1.17, next step). P1.16 functionally complete.

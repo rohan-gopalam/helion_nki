@@ -1068,7 +1068,11 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state, block_idx, block_size, index_var, numel
             )
             if mask_statement is not None:
-                state.add_statement(mask_statement)
+                if isinstance(mask_statement, list):
+                    for _ms in mask_statement:
+                        state.add_statement(_ms)
+                else:
+                    state.add_statement(mask_statement)
             pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
             pids.append(pid)
         pids.codegen(state)
@@ -1561,6 +1565,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         "step": step_int,
                         "bound_sbuf": bnd_sbuf,
                         "offset_var": _offset_var,
+                        # Signals memory_ops.py to emit a static prefill and
+                        # redirect y-loads to the padded output buffer, fixing
+                        # the oob_mode.skip partial-tile data loss bug.
+                        "needs_prefill": True,
                     }
                     state.device_function._nki_dyn_range_end_var = bnd_reg
                     state.device_function._nki_dyn_current_block_id = block_idx
@@ -1682,13 +1690,26 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                             if _begin_sbuf_shape is not None:
                                 break
                     if _begin_sbuf_shape is not None and _begin_sbuf_shape == [1, 1]:
-                        _nki_dyn_begin_reg = state.device_function.new_var("_dyn_begin_reg")
-                        state.add_statement(statement_from_string(
-                            f"{_nki_dyn_begin_reg} = nisa.register_alloc()"
-                        ))
-                        state.add_statement(statement_from_string(
-                            f"nisa.register_load({_nki_dyn_begin_reg}, {_begin_name})"
-                        ))
+                        # If a preceding needs_prefill dynamic loop used this SBUF
+                        # as its end-bound, the static prefill already wrote y to all
+                        # columns. The tail loop is redundant — suppress it entirely.
+                        _dyn_loops_skip = getattr(state.device_function, "_nki_dyn_loops", {})
+                        _skip_tail = any(
+                            _dl.get("needs_prefill") and _dl.get("bound_sbuf") == _begin_name
+                            for _dl in _dyn_loops_skip.values()
+                        )
+                        if _skip_tail:
+                            state.device_function._nki_skip_tail_loop = True
+                            _nki_dyn_begin_reg = None
+                        else:
+                            state.device_function._nki_skip_tail_loop = False
+                            _nki_dyn_begin_reg = state.device_function.new_var("_dyn_begin_reg")
+                            state.add_statement(statement_from_string(
+                                f"{_nki_dyn_begin_reg} = nisa.register_alloc()"
+                            ))
+                            state.add_statement(statement_from_string(
+                                f"nisa.register_load({_nki_dyn_begin_reg}, {_begin_name})"
+                            ))
                         # Emit a counter SBUF that tracks the actual integer offset.
                         # Init to begin - step; first loop-body increment → begin.
                         # This mirrors the dyn-end loop counter so dma_copy AP can use it.
@@ -1736,7 +1757,15 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                             "bound_sbuf": _begin_name,
                             "offset_var": offset_var,
                         }
-                if _nki_dyn_begin_reg is not None:
+                _skip_tail_loop = getattr(state.device_function, "_nki_skip_tail_loop", False)
+                if _skip_tail_loop:
+                    for_node = create(
+                        ast.For,
+                        target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        iter=expr_from_string("nl.affine_range(0, 0, 1)"),
+                        body=body, orelse=[], type_comment=None,
+                    )
+                elif _nki_dyn_begin_reg is not None:
                     for_node = create(
                         ast.For,
                         target=create(ast.Name, id=offset_var, ctx=ast.Store()),
@@ -1785,7 +1814,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
-                extra_body.append(mask_statement)
+                if isinstance(mask_statement, list):
+                    extra_body.extend(mask_statement)
+                else:
+                    extra_body.append(mask_statement)
             # If this block is dynamic, prepend counter-increment at the
             # START of the loop body (counter was init to -step, so first
             # iteration brings it to 0 before index use).

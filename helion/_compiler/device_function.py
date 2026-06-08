@@ -1100,8 +1100,12 @@ class DeviceFunction:
         else:
             return_host_var = getattr(self, "_nki_return_host_var", None)
             return_host_reshape = getattr(self, "_nki_return_host_reshape", None)
+            return_host_slice = getattr(self, "_nki_return_host_slice", None)
             if return_host_var is not None:
-                if return_host_reshape is not None:
+                if return_host_slice is not None:
+                    # Padding was applied to the HBM buffer; clip with a slice.
+                    call_str = f"{return_host_var} = {call_str}{return_host_slice}"
+                elif return_host_reshape is not None:
                     call_str = f"{return_host_var} = {call_str}.reshape({return_host_reshape})"
                 else:
                     call_str = f"{return_host_var} = " + call_str

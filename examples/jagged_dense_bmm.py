@@ -34,11 +34,12 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 from helion._testing import run_example
 import helion.language as hl
 
 
-@helion.kernel(backend="nki", autotune_effort="none", config=helion.Config())
+@helion.kernel()
 def jagged_dense_bmm(
     seq_offsets: torch.Tensor,
     jagged: torch.Tensor,
@@ -57,10 +58,8 @@ def jagged_dense_bmm(
         starts = seq_offsets[tile_b]
         ends = seq_offsets[tile_b.index + 1]
         seq_len = ends - starts
-        max_seq_len = seq_len.amax()
 
-        for tile_len in hl.tile(0, max_seq_len):
-            mask: torch.Tensor = tile_len.index[None, :] < seq_len[:, None]
+        for tile_len in hl.jagged_tile(seq_len):
             jagged_indices = starts[:, None] + tile_len.index[None, :]
 
             for tile_k in hl.tile(0, K):
@@ -69,7 +68,6 @@ def jagged_dense_bmm(
                     jagged_data = hl.load(
                         jagged,
                         [jagged_indices[:, :, None] * D + tile_d.index[None, None, :]],
-                        extra_mask=mask[:, :, None] & (tile_d.index[None, None, :] < D),
                     )  # [tile_b, tile_len, tile_d]
                     dense_data = dense[tile_b, tile_d, tile_k]
 
@@ -86,7 +84,6 @@ def jagged_dense_bmm(
                     output,
                     [jagged_indices[:, :, None] * K + tile_k.index[None, None, :]],
                     acc,
-                    extra_mask=mask[:, :, None],
                 )
     return output.reshape(L, K)
 
@@ -130,26 +127,22 @@ def random_input(
     max_seq_len: int = 3,
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    lengths = torch.randint(
-        max_seq_len + 1, size=(batch_size,), device=torch.device("cuda")
-    )
-    seq_offsets = torch.zeros(
-        (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
-    )
+    lengths = torch.randint(max_seq_len + 1, size=(batch_size,), device=DEVICE)
+    seq_offsets = torch.zeros((batch_size + 1,), dtype=torch.int64, device=DEVICE)
     seq_offsets[1:] = torch.cumsum(lengths, dim=0)
     jagged_size = int(seq_offsets[-1].item())
     jagged = (
-        torch.empty((jagged_size, D), dtype=dtype, device=torch.device("cuda"))
+        torch.empty((jagged_size, D), dtype=dtype, device=DEVICE)
         .uniform_(-1.0, 1.0)
         .requires_grad_()
     )
     dense = (
-        torch.empty((batch_size, D, K), dtype=dtype, device=torch.device("cuda"))
+        torch.empty((batch_size, D, K), dtype=dtype, device=DEVICE)
         .uniform_(-1.0, 1.0)
         .requires_grad_()
     )
     bias = (
-        torch.empty((batch_size, K), dtype=dtype, device=torch.device("cuda"))
+        torch.empty((batch_size, K), dtype=dtype, device=DEVICE)
         .uniform_(-1.0, 1.0)
         .requires_grad_()
     )

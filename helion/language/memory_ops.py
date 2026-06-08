@@ -4117,6 +4117,30 @@ def _(state: CodegenState) -> ast.AST:
         # Build pattern based on where dyn_dim_idx is
         if len(tensor_shape) == 2:
             P_total, F_total = tensor_shape
+            # Use padded stride when reading from the padded return buffer.
+            # Check both the committed name and any pre-reserved name.
+            _ret_buf_name = getattr(device_fn, "_nki_return_buffer_name", None)
+            _padded_f = getattr(device_fn, "_nki_return_buf_free_dim", None)
+            if _padded_f is None:
+                # May not be set yet if the store hasn't fired; check dyn_loops.
+                for _dli_r in getattr(device_fn, "_nki_dyn_loops", {}).values():
+                    _pb_r = _dli_r.get("pre_reserved_buf") or _dli_r.get("prefill_buf")
+                    if _pb_r and _pb_r == name_str:
+                        # The padded size was recorded alongside the step.
+                        _step_r = _dli_r.get("step", 1)
+                        if _step_r > 1:
+                            try:
+                                _f_r = int(tensor_shape[1])
+                                if _f_r % _step_r != 0:
+                                    _padded_f = ((_f_r + _step_r - 1) // _step_r) * _step_r
+                            except (ValueError, TypeError):
+                                pass
+                        break
+            if _padded_f is not None and name_str in (
+                _ret_buf_name,
+                *[_d.get("pre_reserved_buf", "") for _d in getattr(device_fn, "_nki_dyn_loops", {}).values()],
+            ):
+                F_total = _padded_f
             if dyn_dim_idx == 0:
                 # partition is dynamic, free is static from parts[1]
                 # parts[1] is like "0:F" or "offset_0:offset_0+128"
@@ -4671,7 +4695,37 @@ def _(state: CodegenState) -> ast.AST:
             if tensor.dim() == 1 and len(slice_parts) == 1:
                 hbm_src_expr = _build_hbm_src(name, ["0:1", slice_parts[0]])
             else:
-                hbm_src_expr = _build_hbm_src(name, slice_parts)
+                # OOB-skip fix: when loading from y inside a needs_prefill dynamic
+                # loop, redirect to nki_return_buf instead.  That buffer is padded to
+                # ceil(F/step)*step and prefilled with y, so no DMA is partially OOB.
+                _dyn_loops_ld = getattr(state.device_function, "_nki_dyn_loops", {})
+                _load_src = name
+                for _dl_info in _dyn_loops_ld.values():
+                    if not _dl_info.get("needs_prefill"):
+                        continue
+                    _ctr = _dl_info["counter"]
+                    _ctr_f = _dl_info.get("counter_float", "")
+                    if not any(
+                        p.startswith("__DYN_AP__") and (_ctr in p or _ctr_f in p)
+                        for p in slice_parts
+                    ):
+                        continue
+                    # Record y's name for the store path to emit the prefill.
+                    if "y_src" not in _dl_info:
+                        _dl_info["y_src"] = name
+                    # Redirect to the return buffer (padded, prefilled with y).
+                    _ret_buf = getattr(state.device_function, "_nki_return_buffer_name", None)
+                    if _ret_buf:
+                        _load_src = _ret_buf
+                    else:
+                        # Store hasn't fired yet — pre-reserve the name.
+                        _pre = _dl_info.get("pre_reserved_buf")
+                        if not _pre:
+                            _pre = device_fn.new_var("nki_return_buf")
+                            _dl_info["pre_reserved_buf"] = _pre
+                        _load_src = _pre
+                    break
+                hbm_src_expr = _build_hbm_src(_load_src, slice_parts)
         else:
             slice_str = ", ".join(slice_parts)
             # For 1D tensors reshaped to [1, N] at kernel entry, the DMA source
@@ -5312,7 +5366,13 @@ def _(state: CodegenState) -> None:
             if tensor_id in device_fn._nki_return_buffers:
                 ret_buf_name = device_fn._nki_return_buffers[tensor_id]["buf_name"]
             else:
-                ret_buf_name = device_fn.new_var("nki_return_buf")
+                # If the load path pre-reserved a buffer name, reuse it.
+                _pre_reserved = None
+                for _dli in getattr(device_fn, "_nki_dyn_loops", {}).values():
+                    if _dli.get("pre_reserved_buf") and "prefill_emitted" not in _dli:
+                        _pre_reserved = _dli["pre_reserved_buf"]
+                        break
+                ret_buf_name = _pre_reserved if _pre_reserved else device_fn.new_var("nki_return_buf")
                 dtype_str = env.backend.dtype_str(tensor.dtype)
                 shape_parts = []
                 for dim_i in range(tensor.dim()):
@@ -5368,6 +5428,31 @@ def _(state: CodegenState) -> None:
                     shape_str = ", ".join(shape_parts)
                     if base_shape is not None:
                         host_reshape = f"[{', '.join(str(d) for d in base_shape)}]"
+                    # OOB-skip padding: when a dynamic loop's DMA tile size does not
+                    # evenly divide the output's free dimension, oob_mode=skip silently
+                    # drops the entire last DMA (not just the OOB elements), losing the
+                    # final valid data.  Pad the free dim to the next tile-size multiple
+                    # so every DMA is fully in-bounds.  The host_reshape clips it back
+                    # to the real shape when the result is returned.
+                    _dyn_loops_alloc = getattr(device_fn, "_nki_dyn_loops", {})
+                    for _dli_alloc in _dyn_loops_alloc.values():
+                        _step_alloc = _dli_alloc.get("step", 1)
+                        if _step_alloc > 1 and len(shape_parts) == 2:
+                            try:
+                                _f_alloc = int(shape_parts[1])
+                                if _f_alloc % _step_alloc != 0:
+                                    _f_padded = ((_f_alloc + _step_alloc - 1) // _step_alloc) * _step_alloc
+                                    # Use a slice [:, :F] to trim padding rather than
+                                    # reshape (which would fail: P*F_padded != P*F).
+                                    host_reshape = None
+                                    device_fn._nki_return_host_slice = f"[:, :{_f_alloc}]"
+                                    shape_str = f"{shape_parts[0]}, {_f_padded}"
+                                    # Record the padded free-dim size so the AP-pattern
+                                    # builders use the correct stride for this buffer.
+                                    device_fn._nki_return_buf_free_dim = _f_padded
+                            except (ValueError, TypeError):
+                                pass
+                            break
                 device_fn.preamble.append(
                     statement_from_string(
                         f"{ret_buf_name} = nl.ndarray([{shape_str}], dtype={dtype_str}, buffer=nl.shared_hbm)"
@@ -6030,7 +6115,99 @@ def _(state: CodegenState) -> None:
                 _t_shape = [int(_d) if isinstance(_d, int) else int(env.size_hint(_d)) for _d in _t_shape]
                 if len(_t_shape) == 2:
                     _P, _F = _t_shape
+                    # If the return buffer was padded, use the padded free-dim as the
+                    # stride in the AP pattern so writes land at the correct addresses.
+                    _padded_F = getattr(device_fn, "_nki_return_buf_free_dim", None)
+                    _orig_F = _F
+                    if _padded_F is not None and name == getattr(device_fn, "_nki_return_buffer_name", None):
+                        _F = _padded_F
                     if _dyn_idx == 1:
+                        # Emit the static prefill (y → nki_return_buf) once, before
+                        # the dynamic loop.  The prefill uses static column offsets so
+                        # every tile is fully in-bounds in the padded buffer.
+                        _dyn_loops_st = getattr(device_fn, "_nki_dyn_loops", {})
+                        for _bid_st, _dl_st in _dyn_loops_st.items():
+                            if (
+                                _dl_st.get("needs_prefill")
+                                and _dl_st.get("counter") == _dyn_counter
+                                and "prefill_emitted" not in _dl_st
+                                and "y_src" in _dl_st
+                            ):
+                                _dl_st["prefill_emitted"] = True
+                                _y_src = _dl_st["y_src"]
+                                _stk = state.codegen.statements_stack
+                                _pstmts: list = _stk[-2] if len(_stk) >= 2 else _stk[-1]
+                                _part_part_pre = _dst_parts[0]
+                                if ":" in _part_part_pre:
+                                    _pps, _ppe = _part_part_pre.split(":", 1)
+                                    _pps = _pps.strip()
+                                    _pplus = _ppe.find("+")
+                                    _ppc = int(_ppe[_pplus + 1:].strip()) if _pplus >= 0 else 1
+                                else:
+                                    _pps, _ppc = "0", _P
+                                _pre_dtype = env.backend.dtype_str(tensor.dtype)
+                                # Full tiles using the ORIGINAL y width (y is unpadded).
+                                _n_full = _orig_F // _dyn_size
+                                _rem    = _orig_F % _dyn_size
+                                try:
+                                    _pps_int = int(_pps)
+                                    _base_off = _pps_int * _F   # padded stride for out
+                                    _base_off_y = _pps_int * _orig_F  # orig stride for y
+                                    _row_guard = f"{_pps} >= 0 and {_pps} + {_ppc} <= {_P}"
+                                except ValueError:
+                                    _base_off = f"({_pps}) * {_F}"
+                                    _base_off_y = f"({_pps}) * {_orig_F}"
+                                    _row_guard = None
+                                from .._compiler.ast_extension import create as _ast_create
+                                import ast as _ast_pre
+                                if _n_full > 0:
+                                    _pv = device_fn.new_var("_pre_c")
+                                    _pt = device_fn.new_var("_pre_tile")
+                                    _pcs = device_fn.new_var("_pre_c_sbuf")
+                                    _ppat_y = f"[[{_orig_F}, {_ppc}], [1, {_dyn_size}]]"
+                                    _ppat_o = f"[[{_F}, {_ppc}], [1, {_dyn_size}]]"
+                                    _pb: list = [
+                                        statement_from_string(f"{_pt} = nl.ndarray([{_ppc}, {_dyn_size}], {_pre_dtype}, buffer=nl.sbuf)"),
+                                        statement_from_string(f"nisa.memset({_pt}, value=0)"),
+                                        statement_from_string(f"{_pcs} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"),
+                                        statement_from_string(f"nisa.memset({_pcs}, value={_pv})"),
+                                    ]
+                                    _src_ap = f"{_y_src}.ap(pattern={_ppat_y}, scalar_offset={_pcs}, indirect_dim=1, offset={_base_off_y})"
+                                    _dst_ap = f"{name}.ap(pattern={_ppat_o}, scalar_offset={_pcs}, indirect_dim=1, offset={_base_off})"
+                                    if _row_guard:
+                                        _pb.append(statement_from_string(f"if {_row_guard}: nisa.dma_copy(dst={_pt}, src={_src_ap}, oob_mode=nisa.oob_mode.skip)"))
+                                        _pb.append(statement_from_string(f"if {_row_guard}: nisa.dma_copy(dst={_dst_ap}, src={_pt}, oob_mode=nisa.oob_mode.skip)"))
+                                    else:
+                                        _pb.append(statement_from_string(f"nisa.dma_copy(dst={_pt}, src={_src_ap}, oob_mode=nisa.oob_mode.skip)"))
+                                        _pb.append(statement_from_string(f"nisa.dma_copy(dst={_dst_ap}, src={_pt}, oob_mode=nisa.oob_mode.skip)"))
+                                    _pstmts.append(_ast_create(
+                                        _ast_pre.For,
+                                        target=_ast_create(_ast_pre.Name, id=_pv, ctx=_ast_pre.Store()),
+                                        iter=expr_from_string(f"nl.affine_range(0, {_n_full * _dyn_size}, {_dyn_size})"),
+                                        body=_pb, orelse=[], type_comment=None,
+                                    ))
+                                if _rem > 0:
+                                    _rem_start = _n_full * _dyn_size
+                                    _rt = device_fn.new_var("_pre_tail_tile")
+                                    _rc = device_fn.new_var("_pre_tail_ctr")
+                                    _rpat_y = f"[[{_orig_F}, {_ppc}], [1, {_rem}]]"
+                                    _rpat_o = f"[[{_F}, {_ppc}], [1, {_rem}]]"
+                                    _rs: list = [
+                                        statement_from_string(f"{_rt} = nl.ndarray([{_ppc}, {_rem}], {_pre_dtype}, buffer=nl.sbuf)"),
+                                        statement_from_string(f"nisa.memset({_rt}, value=0)"),
+                                        statement_from_string(f"{_rc} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"),
+                                        statement_from_string(f"nisa.memset({_rc}, value={_rem_start})"),
+                                    ]
+                                    _rsrc = f"{_y_src}.ap(pattern={_rpat_y}, scalar_offset={_rc}, indirect_dim=1, offset={_base_off_y})"
+                                    _rdst = f"{name}.ap(pattern={_rpat_o}, scalar_offset={_rc}, indirect_dim=1, offset={_base_off})"
+                                    if _row_guard:
+                                        _rs.append(statement_from_string(f"if {_row_guard}: nisa.dma_copy(dst={_rt}, src={_rsrc}, oob_mode=nisa.oob_mode.skip)"))
+                                        _rs.append(statement_from_string(f"if {_row_guard}: nisa.dma_copy(dst={_rdst}, src={_rt}, oob_mode=nisa.oob_mode.skip)"))
+                                    else:
+                                        _rs.append(statement_from_string(f"nisa.dma_copy(dst={_rt}, src={_rsrc}, oob_mode=nisa.oob_mode.skip)"))
+                                        _rs.append(statement_from_string(f"nisa.dma_copy(dst={_rdst}, src={_rt}, oob_mode=nisa.oob_mode.skip)"))
+                                    _pstmts.extend(_rs)
+                                break
                         _part_part = _dst_parts[0]
                         if ":" in _part_part:
                             _ps, _pe = _part_part.split(":", 1)

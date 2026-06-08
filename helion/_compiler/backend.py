@@ -1232,11 +1232,18 @@ class NKIOpOverrides:
                     return casted, out_dtype
 
                 def _expand_cross(name: str, shape: list[int]) -> str:
+                    original_name = name
                     dtype = _lookup_cross_dtype(name, out_dtype)
                     name, dtype = _cast_cross_bitwise(name, shape, dtype)
-                    if shape[1] == p_target:
+                    # Use shape to disambiguate when P != F; fall back to
+                    # variable name when P == F (iota vars are always [1,F]).
+                    if shape[1] == f_target and shape[1] != p_target:
+                        return _replicate_row(name, dtype)
+                    if shape[1] == p_target and shape[1] != f_target:
                         return _replicate_col(_row_to_col(name, p_target, dtype), out_dtype)
-                    return _replicate_row(name, dtype)
+                    if original_name.startswith("indices_") or "indices_" in original_name:
+                        return _replicate_row(name, dtype)
+                    return _replicate_col(_row_to_col(name, p_target, dtype), out_dtype)
 
                 a_expanded = _expand_cross(dst, a_cross_shape)
                 b_expanded = _expand_cross(b_str, b_cross_shape)
@@ -1784,6 +1791,14 @@ class NKIOpOverrides:
 
         a_sbuf_shape = _lookup_sbuf_shape(dst)
         b_sbuf_shape = _lookup_sbuf_shape(b_str)
+        # Squeeze 3D+ shapes to 2D before comparing partition dimensions.
+        # SBUF shapes may be stored as 3D (e.g. [1, tile_len, tile_k] for a
+        # hl.zeros accumulator). The actual NKI layout is the flattened 2D
+        # form, so [1, 128, 128] must compare as [128, 128].
+        if a_sbuf_shape is not None:
+            a_sbuf_shape = NKIOpOverrides._squeeze_shape_2d(list(a_sbuf_shape))
+        if b_sbuf_shape is not None:
+            b_sbuf_shape = NKIOpOverrides._squeeze_shape_2d(list(b_sbuf_shape))
         _has_partition_mismatch = (
             dst_tile_vars is None
             and b_tile_vars is None
@@ -1987,6 +2002,18 @@ class NKIOpOverrides:
             b_bcast = _emit_sbuf_replicate(
                 b_str, b_sbuf_shape, p_count, b_sbuf_shape[1], _bcast_dtype_str
             )
+            # In-place accumulation: when a == dst (e.g. acc += bias), write
+            # back into dst directly rather than allocating a new buffer that
+            # the caller ignores.
+            _a_str = ast.unparse(a) if isinstance(a, ast.AST) else str(a)
+            if _a_str == dst:
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.tensor_tensor(dst={dst}, data1={dst}, "
+                        f"data2={b_bcast}, op={op})"
+                    )
+                )
+                return dst
             new_dst_b = state.device_function.new_var(prefix, dce=True)
             state.device_function._nki_sbuf_shapes[new_dst_b] = [p_count, b_sbuf_shape[1]]
             state.device_function._nki_sbuf_dtypes[new_dst_b] = _bcast_dtype_str
@@ -2713,6 +2740,11 @@ class NKIOpOverrides:
                         _base_name = _base_name[: _base_name.rfind("_copy")]
                     _base_shape = _lookup_loop_acc_shape(_base_name)
                     _b_shape = _lookup_loop_acc_shape(_b_name)
+                    # Squeeze 3D shapes to 2D so [1,128,128] compares as [128,128].
+                    if _base_shape is not None:
+                        _base_shape = NKIOpOverrides._squeeze_shape_2d(list(_base_shape))
+                    if _b_shape is not None:
+                        _b_shape = NKIOpOverrides._squeeze_shape_2d(list(_b_shape))
                     if (
                         _base_name != _a_name
                         and _base_shape is not None
@@ -2726,6 +2758,34 @@ class NKIOpOverrides:
                                 f"op={op_tensor_tensor})"
                             )
                         )
+                        return _base_name
+                    # Partition mismatch after squeeze: rhs [1,F] vs acc [P,F].
+                    if (
+                        _base_name != _a_name
+                        and _base_shape is not None
+                        and _b_shape is not None
+                        and len(_base_shape) >= 2 and len(_b_shape) >= 2
+                        and _b_shape[0] == 1
+                        and _b_shape[1] == _base_shape[1]
+                        and _base_shape[0] > 1
+                    ):
+                        _bcast_b = _acc_state.device_function.new_var(
+                            "_nki_bias_bcast", dce=True
+                        )
+                        _acc_state.device_function._nki_sbuf_shapes[_bcast_b] = list(_base_shape)
+                        _b_dtype_acc = _acc_state.device_function._nki_sbuf_dtypes.get(
+                            _b_name, "nl.float32"
+                        )
+                        _acc_state.device_function._nki_sbuf_dtypes[_bcast_b] = _b_dtype_acc
+                        _acc_state.add_statement(statement_from_string(
+                            f"{_bcast_b} = nl.broadcast_to({_b_name}, "
+                            f"shape=({_base_shape[0]}, {_base_shape[1]}))"
+                        ))
+                        _acc_state.add_statement(statement_from_string(
+                            f"nisa.tensor_tensor(dst={_base_name}, "
+                            f"data1={_base_name}, data2={_bcast_b}, "
+                            f"op={op_tensor_tensor})"
+                        ))
                         return _base_name
 
         a_is_scalar = cls._is_scalar_operand(a)
@@ -2835,6 +2895,11 @@ class NKIOpOverrides:
                         _base_name = _base_name[: _base_name.rfind("_copy")]
                     _base_shape = _lookup_loop_acc_shape(_base_name)
                     _b_shape = _lookup_loop_acc_shape(_b_name)
+                    # Squeeze 3D shapes to 2D so [1,128,128] compares as [128,128].
+                    if _base_shape is not None:
+                        _base_shape = NKIOpOverrides._squeeze_shape_2d(list(_base_shape))
+                    if _b_shape is not None:
+                        _b_shape = NKIOpOverrides._squeeze_shape_2d(list(_b_shape))
                     if (
                         _base_name != _a_name
                         and _base_shape is not None
@@ -2848,6 +2913,35 @@ class NKIOpOverrides:
                                 f"op={op_tensor_tensor})"
                             )
                         )
+                        return _base_name
+                    # Partition mismatch after squeeze: rhs [1,F] vs acc [P,F].
+                    # Broadcast rhs to [P,F] and write back into accumulator.
+                    if (
+                        _base_name != _a_name
+                        and _base_shape is not None
+                        and _b_shape is not None
+                        and len(_base_shape) >= 2 and len(_b_shape) >= 2
+                        and _b_shape[0] == 1
+                        and _b_shape[1] == _base_shape[1]
+                        and _base_shape[0] > 1
+                    ):
+                        _bcast_b = _acc_state.device_function.new_var(
+                            "_nki_bias_bcast", dce=True
+                        )
+                        _acc_state.device_function._nki_sbuf_shapes[_bcast_b] = list(_base_shape)
+                        _b_dtype_acc = _acc_state.device_function._nki_sbuf_dtypes.get(
+                            _b_name, "nl.float32"
+                        )
+                        _acc_state.device_function._nki_sbuf_dtypes[_bcast_b] = _b_dtype_acc
+                        _acc_state.add_statement(statement_from_string(
+                            f"{_bcast_b} = nl.broadcast_to({_b_name}, "
+                            f"shape=({_base_shape[0]}, {_base_shape[1]}))"
+                        ))
+                        _acc_state.add_statement(statement_from_string(
+                            f"nisa.tensor_tensor(dst={_base_name}, "
+                            f"data1={_base_name}, data2={_bcast_b}, "
+                            f"op={op_tensor_tensor})"
+                        ))
                         return _base_name
 
         # Check for broadcast pattern: [M,N] op [M,1] after 3D squeeze
@@ -3133,16 +3227,18 @@ class NKIOpOverrides:
                                 return casted, out_dtype
 
                             def _expand(name: str, shape: list[int]) -> str:
+                                original_name = name
                                 dtype = _lookup_sbuf_dtype(name, out_dtype)
                                 name, dtype = _cast_for_bitwise(name, shape, dtype)
-                                if shape[1] == p_target:
+                                if shape[1] == f_target and shape[1] != p_target:
+                                    return _emit_row_replicate(name, p_target, f_target, dtype)
+                                if shape[1] == p_target and shape[1] != f_target:
                                     col = _emit_row_to_col(name, p_target, dtype)
-                                    return _emit_col_replicate(
-                                        col, p_target, f_target, out_dtype
-                                    )
-                                return _emit_row_replicate(
-                                    name, p_target, f_target, dtype
-                                )
+                                    return _emit_col_replicate(col, p_target, f_target, out_dtype)
+                                if original_name.startswith("indices_") or "indices_" in original_name:
+                                    return _emit_row_replicate(name, p_target, f_target, dtype)
+                                col = _emit_row_to_col(name, p_target, dtype)
+                                return _emit_col_replicate(col, p_target, f_target, out_dtype)
 
                             a_expanded = _expand(a_name, a_shape)
                             b_expanded = _expand(b_name, b_shape)
@@ -5763,7 +5859,7 @@ class NKIBackend(Backend):
                 block_size: "SymIntLike",
                 index_var: str,
                 end: object,
-            ) -> "ast.stmt | None":
+            ) -> "list[ast.stmt] | ast.stmt | None":
                 from .compile_environment import CompileEnvironment as _CE_nki
                 _env_nki = _CE_nki.current()
                 if not _env_nki.is_jagged_tile(block_idx):
@@ -5903,23 +5999,7 @@ class NKIBackend(Backend):
                     f"data2={_parent_bcast}, op=nl.less)"
                 ))
 
-                from .ast_extension import create as _create_mask
-                import ast as _ast2
-                # Return a compound statement block using a module node
-                # Since _setup_mask returns one stmt, we'll use a For loop trick.
-                # Actually return None and add all stmts directly.
-                # Return a compound statement (if True: stmts...) so all NKI ops
-                # land inside the loop body. Since _setup_mask return value is placed
-                # inside the loop by the caller, wrapping in 'if True:' is correct.
-                from .ast_extension import create as _create_mask
-                from .ast_extension import expr_from_string as _efr_mask
-                import ast as _ast_nki_mask
-                return _create_mask(
-                    _ast_nki_mask.If,
-                    test=_efr_mask("True"),
-                    body=stmts,
-                    orelse=[],
-                )
+                return stmts
 
         env = CompileEnvironment.current()
         block_size_infos = [env.block_sizes[i] for i in block_ids]

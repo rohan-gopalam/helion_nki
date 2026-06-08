@@ -185,3 +185,40 @@ unregistered. To be narrowed to `except ImportError` once nki_backend.py is stab
 **Verification (gate passed):** `nki_backend.py` does not exist yet, so `'nki' not in list_backends()` and
 `import helion` still works (ImportError swallowed). `_maybe_register_nki()` is idempotent. backends =
 `['triton','pallas','cute','tileir','metal']` (nki appears only after P1.6).
+
+## P1.6 — Create nki_backend.py (extract NKIOpOverrides + NKIBackend) [CENTERPIECE]
+
+**File:** `helion/_compiler/nki_backend.py` (NEW, ~6750 lines). Core `backend.py` left UNTOUCHED.
+
+**What & why:** On the reference branch the entire NKI backend lived inline in `backend.py`
+(lines 636–7321: `NKIOpOverrides` 636→5768, module helper `_validate_nki_tensor_shape` 5769→5808,
+`NKIBackend` 5809→7321). Upstream's `backend.py` has neither, and uses a plugin registry. So this step
+**extracts** that 6686-line block verbatim into a standalone `nki_backend.py` that self-registers.
+
+**How built (guarantees verbatim block):**
+- Extracted lines 636–7321 from `fix-nki-kernel-compilation:backend.py` via `git show | sed -n`.
+- Prepended a fresh module header: docstring + minimal module-level imports the block needs
+  (`abc`, `ast`, `torch`, `exc`, `expr_from_string`, `Backend`, `register_compiler_backend`) plus a
+  TYPE_CHECKING block (`OpsHandler`/`InductorOpOverrides`, `Config`, `BoundKernel`, `Argument`,
+  `DeviceFunction`, `TileStrategy`). All heavy deps (CompileEnvironment, device_function, torch_xla)
+  are lazy-imported inside method bodies (71 CompileEnvironment lazy-imports etc.), so the module imports
+  cleanly with no torch_xla at load — plugin semantics preserved.
+- Appended `register_compiler_backend(NKIBackend)` at module end.
+
+**Two upstream-new Backend hooks overridden (the reference didn't need these; added by hand):**
+- `pad_factory_tensors_to_power_of_2` → `False` (base default True). Replaces the reference's
+  patch_tensor_factories guard, which upstream relocated onto this backend property (see P1.3b/P1.4).
+- `static_rdim_size(numel)` → `numel` exact (base default `next_power_of_2(numel)` = 512 for 300).
+  Replaces the reference's inline ReductionLoopBlockSizeSource NKI guard (deferred here from P1.4).
+
+**Verification (gate passed):**
+- AST parses; module imports directly.
+- `NKIBackend()` instantiates → `__abstractmethods__` is EMPTY (all 7 of upstream's abstractmethods —
+  name, dtype_str, acc_type, function_decorator, constexpr_type, default_launcher_name, library_imports —
+  are concretely implemented in the extracted class).
+- `import helion` now registers nki: `list_backends()` = `[...,'nki']`; `get_backend_class('nki')` resolves.
+- `dtype_str(int64)='nl.int32'`; `pad_factory_tensors_to_power_of_2 is False`; `static_rdim_size(300)==300`.
+- `git diff upstream/main -- backend.py` empty (core backend.py untouched).
+
+**Known forward dependency (not a failure):** `NKIBackend.function_decorator` calls
+`helion.runtime.settings.get_neuron_target`, which P1.7 adds. Not exercised by the P1.6 gate; resolved at P1.7.

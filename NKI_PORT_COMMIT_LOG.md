@@ -436,3 +436,29 @@ said NKI may have added it); only the `register_codegen("nki")` handler is appen
 helpers (`constant_repr`, `map_arg`, `_env_arg`, `statement_from_string`, `passthrough_masked_value`) present
 upstream; **`'nki' in codegen_impls` confirmed on all 15 lowering objects** (and the register_codegen
 `assert backend not in codegen_impls` guarantees no double-registration); `import helion` OK.
+
+## P1.15 — inductor_lowering.py: NKI reduction wrap, mean, dtype, mod/remainder/fmod, fx recording
+
+**File:** `helion/_compiler/inductor_lowering.py` (real delta only 181 lines — smaller than the plan implied)
+
+**PLAN CORRECTIONS CONFIRMED by the real merge-base→reference diff (the draft's errors are NOT in it):**
+- `_check_block_broadcast_compatibility` ctx: **NOT changed** (upstream already has `ctx`; the reference
+  delta doesn't touch it). Left untouched. ✓
+- `_patched_inductor_config` / `INDUCTOR_PATCH` rename: **not in the delta** — no such change needed.
+
+**Applied (6 hunks):**
+1. `ReductionLowering.codegen`: wrap the `strategy.codegen_reduction(...)` call in `with env.set_codegen_state(state):`.
+2. `ReductionLowering.get_masked_value`: add `"mean"` to `{sum,prod,min,max}`. UNCONDITIONAL (matches reference;
+   affects all backends — flagged for P1.22 cross-backend verification, see earlier user question).
+3. `GenerateASTFromInductor._default`: wrap the parent-handler call in try/except; for NKI, raise
+   `BackendUnsupported` for unmapped activation ops (`_NKI_ACTIVATION_NAMES` set). Preserved upstream's
+   metal `"::"` handling.
+4. `to_dtype`: NKI `backend.cast_ast(..., src_dtype=)` branch, inserted after upstream's cute fp8 branch.
+5. `mod`/`remainder`/`fmod` methods (str-arg for NKI → `_default`), before `def load`.
+6. `GraphInterpreter`: `record_fx_node_ast` at the multi-output site, the single-result site, and the
+   placeholder branch of `run_node`; plus the tile-list phi handling in `codegen_call_with_graph`
+   (`get_tile_list_vars`→`register_tile_list` instead of emitting a copy), preserving upstream's
+   `statement_owner_node` wrapper.
+
+**Verification (gate passed):** parses; `'mean'` in get_masked_value; mod/remainder/fmod present;
+`_check_block_broadcast_compatibility` untouched; `import helion` OK; smoke still at expected `load` boundary.

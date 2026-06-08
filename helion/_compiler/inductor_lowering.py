@@ -917,14 +917,16 @@ class ReductionLowering(InductorLowering):
 
             strategy = BlockReductionStrategy(state, self.block_index)
 
-        result_ast = strategy.codegen_reduction(
-            state,
-            output_name,
-            reduction.reduction_type,
-            dims[0],
-            repr_input,
-            node.meta["val"],
-        )
+        env = CompileEnvironment.current()
+        with env.set_codegen_state(state):
+            result_ast = strategy.codegen_reduction(
+                state,
+                output_name,
+                reduction.reduction_type,
+                dims[0],
+                repr_input,
+                node.meta["val"],
+            )
         # For looped reductions, the actual value is assigned after the loop in
         # the strategy's outer_suffix. Casting at this point would reference the
         # result before it is defined. The strategy is responsible for casting
@@ -946,7 +948,7 @@ class ReductionLowering(InductorLowering):
 
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         # reduction types that preserve zeroness
-        if self.reduction_type in {"sum", "prod", "min", "max"}:
+        if self.reduction_type in {"sum", "prod", "min", "max", "mean"}:
             value = inductor_masked_value(self, node)
             if value == 0:
                 return value
@@ -1118,9 +1120,54 @@ class GenerateASTFromInductor(DefaultHandler):
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
     ) -> str:
-        result_str = _unpack_opsvalue(
-            getattr(self.parent_handler, name)(*args, **kwargs)
-        )
+        try:
+            result_str = _unpack_opsvalue(
+                getattr(self.parent_handler, name)(*args, **kwargs)
+            )
+        except AttributeError as e:
+            backend = CompileEnvironment.current().backend
+            # NKI: fail fast for activation ops not explicitly mapped to
+            # nisa.activation in NKIOpOverrides.
+            if backend.codegen_name == "nki":
+                _NKI_ACTIVATION_NAMES = {
+                    "copy",
+                    "square",
+                    "sigmoid",
+                    "relu",
+                    "gelu",
+                    "gelu_dx",
+                    "gelu_apprx_tanh",
+                    "gelu_apprx_sigmoid",
+                    "gelu_apprx_sigmoid_dx",
+                    "silu",
+                    "silu_dx",
+                    "tanh",
+                    "softplus",
+                    "mish",
+                    "erf",
+                    "erf_dx",
+                    "exp",
+                    "log",
+                    "sin",
+                    "arctan",
+                    "sqrt",
+                    "rsqrt",
+                    "reciprocal",
+                    "sign",
+                    "abs",
+                    # Common unary op that users expect but NKI activation does not support.
+                    "cos",
+                }
+                if name in _NKI_ACTIVATION_NAMES:
+                    raise exc.BackendUnsupported(
+                        "nki",
+                        f"activation op {name!r} is not mapped for NKI codegen. "
+                        "Supported NKI activation codegen ops: "
+                        "copy, square, sigmoid, relu, gelu, gelu_apprx_tanh, "
+                        "gelu_apprx_sigmoid, silu, tanh, softplus, mish, erf, "
+                        "exp, log, sin, arctan, sqrt, rsqrt, reciprocal, sign, abs.",
+                    ) from e
+            raise
         # C++ namespace syntax (::) is not valid Python.  Replace with dot
         # notation so expr_from_string can parse it as attribute access.
         if CompileEnvironment.current().backend_name == "metal" and "::" in result_str:
@@ -1150,6 +1197,11 @@ class GenerateASTFromInductor(DefaultHandler):
                 x=self._to_ast(x),
             )
             return self._lift(cast_expr)
+        backend = CompileEnvironment.current().backend
+        if backend.codegen_name == "nki" and src_dtype is not None and src_dtype != dtype:
+            return self._lift(backend.cast_ast(
+                self._to_ast(x), dtype, src_dtype=src_dtype
+            ))
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 
@@ -1213,6 +1265,21 @@ class GenerateASTFromInductor(DefaultHandler):
             result_expr = self._maybe_cast_to_expected_dtype(result_expr)
 
         return self._lift(result_expr)
+
+    def mod(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.codegen_name == "nki":
+            return self._default("mod", (str(a), str(b)), {})
+        return self._default("mod", (a, b), {})
+
+    def remainder(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.codegen_name == "nki":
+            return self._default("remainder", (str(a), str(b)), {})
+        return self._default("remainder", (a, b), {})
+
+    def fmod(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.codegen_name == "nki":
+            return self._default("fmod", (str(a), str(b)), {})
+        return self._default("fmod", (a, b), {})
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
@@ -1421,7 +1488,9 @@ class GraphInterpreter(LoweringContext, Interpreter):
                             user for user in n.users if user.target == getitem
                         ]
                         if len(getitem_users) > 0:
-                            return self._collect_multi_outputs(n, result)
+                            multi_outputs = self._collect_multi_outputs(n, result)
+                            self.cg.record_fx_node_ast(n, multi_outputs)
+                            return multi_outputs
 
                     if result is None:
                         return None
@@ -1453,6 +1522,7 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(repr(result.value), n)
                                 )
+                        self.cg.record_fx_node_ast(n, result)
                         return result
                     if not isinstance(result, (ast.Name, ast.Constant)):
                         self.cg.add_statement(create(ast.Expr, value=result))
@@ -1463,7 +1533,13 @@ class GraphInterpreter(LoweringContext, Interpreter):
                     raise InductorLoweringError(
                         f"Error in codegen for node {n.name} ({n.target}): {e}"
                     ) from e
-        return super().run_node(n)
+        result = super().run_node(n)
+        # For placeholder nodes, register their AST in fx_node_to_ast so that
+        # inner-loop subscript analysis (e.g. _nki_shifted_tile_subscript) can
+        # look up outer-loop variables like tile_c.begin * chunk_size.
+        if n.op == "placeholder" and isinstance(result, ast.AST):
+            self.cg.record_fx_node_ast(n, result)
+        return result
 
 
 def codegen_call_with_graph(
@@ -1490,10 +1566,14 @@ def codegen_call_with_graph(
                 # Phi nodes will merge variable names from outside the loop, but the old value
                 # of those variables could have usages.
                 copy_name = cg.device_function.new_var(arg.id + "_copy")
-                with cg.statement_owner_node(placeholder):
-                    cg.add_statement(
-                        statement_from_string(f"{copy_name} = {{arg}}", arg=arg)
-                    )
+                tile_vars = cg.device_function.get_tile_list_vars(arg.id)
+                if tile_vars is not None:
+                    cg.device_function.register_tile_list(copy_name, tile_vars)
+                else:
+                    with cg.statement_owner_node(placeholder):
+                        cg.add_statement(
+                            statement_from_string(f"{copy_name} = {{arg}}", arg=arg)
+                        )
                 new_args.append(expr_from_string(copy_name))
             else:
                 with cg.statement_owner_node(placeholder):

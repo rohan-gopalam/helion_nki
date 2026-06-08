@@ -486,3 +486,15 @@ intact.
 
 **Verification (gate passed):** parses; `_setup_block_size_constexpr` signature has `block_idx`; `import
 helion` OK; smoke still at expected `load` boundary.
+
+### P1.16c — codegen_grid NKI early-branch + _codegen_grid_nki method
+
+**Applied to `_BaseNDTileStrategy`:**
+- `codegen_grid`: added `if env.backend.name == "nki": return self._codegen_grid_nki(state, block_ids,
+  block_sizes, begins, ends)` right after `ends` is resolved (before upstream's `_root_grid_steps`/
+  thread-axis path). Clean early-return — NKI bypasses select_pid_strategy entirely.
+- Inserted `_codegen_grid_nki` (265 lines, verbatim from reference L1096-1360) as a method, before `_to_ast`.
+- Verified the reference's `_to_ast` is byte-identical to upstream's (no NKI delta there — not touched).
+
+**Verification (gate passed):** parses; `_codegen_grid_nki` present on `_BaseNDTileStrategy`; the NKI guard
+is in `codegen_grid`; `import helion` OK.

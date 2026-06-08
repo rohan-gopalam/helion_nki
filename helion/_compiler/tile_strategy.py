@@ -3417,6 +3417,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         else:
             ends = [ends_arg]
         assert len(ends) == len(block_ids)
+
+        if env.backend.name == "nki":
+            return self._codegen_grid_nki(state, block_ids, block_sizes, begins, ends)
+
         steps = self._root_grid_steps(state)
 
         tracker = ThreadAxisTracker()
@@ -3508,6 +3512,272 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             block_id_to_info=block_id_to_info,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+        )
+
+    def _codegen_grid_nki(
+        self,
+        state: CodegenState,
+        block_ids: list[int],
+        block_sizes: list[int],
+        begins: list[object],
+        ends: list[object],
+    ) -> DeviceGridState:
+        """NKI: emit nl.affine_range loops instead of program_id grid parallelism.
+
+        NKI SBUF is 2D: the partition dim is capped at 128. Helion reshapes
+        3D+ inputs [B, M, K] → [B*M, K] at kernel entry, so the effective
+        partition extent of a tile group is ``prod(block_sizes[:-1])``.
+
+        To keep user configs running unchanged when they are "too big" for
+        NKI (e.g. ``block_sizes=[128, 128, 128]`` for a 3D kernel gives a
+        flattened partition of 16384), we auto-clamp the leading tile dims
+        downward — 1 at a time from the outermost — until the flattened
+        partition product fits in 128. The outermost loop then iterates
+        more times with a smaller step, preserving correctness. The user's
+        config is treated as an upper bound; we only reduce, never grow.
+        """
+        env = CompileEnvironment.current()
+        _NKI_PMAX = 128
+        _orig_block_sizes = list(block_sizes)
+        block_sizes = list(block_sizes)  # make mutable
+
+        # Scan the FX graph for creation ops with higher-rank shapes. If any
+        # allocation has N>=2 leading dims (plus a trailing free dim) whose
+        # symbols match this loop's block_ids, the flattened partition
+        # extent of that allocation is the product of our block_sizes at
+        # those positions — and must fit in 128. We collect the maximum
+        # number of leading block_sizes that would contribute to a body
+        # allocation's partition, then cap the product of those
+        # block_sizes at _NKI_PMAX.
+        _body_leading_count = _nki_body_leading_count(state, block_ids, env)
+
+        # NKI SBUF is 2D with partition dim ≤128. Helion reshapes 3D+ tiles
+        # [B, M, K] to [B*M, K] at allocation time, so when a kernel body
+        # allocates a tile like ``hl.zeros([tile_b, tile_m, head_dim])``,
+        # the flattened partition is ``tile_b * tile_m``. If the user's
+        # config declares a product of tile sizes that exceeds 128, clamp
+        # the outermost dims down to 1 (one at a time) until the product
+        # fits. This keeps user configs "just working" when they're too
+        # big for NKI — the outer loop just iterates more times with a
+        # smaller step. The final tile dim (free axis) is never clamped.
+        if len(block_sizes) >= 2:
+            def _resolve_bs(bs: object) -> int | None:
+                if isinstance(bs, (int, bool)):
+                    return int(bs)
+                if isinstance(bs, torch.SymInt):
+                    try:
+                        return env.size_hint(bs)
+                    except Exception:
+                        return None
+                return None
+
+            resolved = [_resolve_bs(bs) for bs in block_sizes]
+            if all(r is not None for r in resolved):
+                def _prod_leading() -> int:
+                    p = 1
+                    for r in resolved[:-1]:
+                        assert r is not None
+                        p *= r
+                    return p
+
+                target = _NKI_PMAX
+
+                def _prod_body_leading() -> int:
+                    # How many of THIS loop's block_sizes end up as
+                    # partition dims for the largest body allocation.
+                    #
+                    # For a simple 2D tile loop (e.g. bmm [B,M,N]), the
+                    # kernel reshape flattens [B,M,K]→[B*M,K] so N-1
+                    # leading dims contribute to the partition.
+                    #
+                    # For a higher-rank loop (e.g. 5D mamba2 tile), the
+                    # body allocations may only use 1-2 of the loop's
+                    # block_ids — scanning the FX graph via
+                    # ``_body_leading_count`` gives the actual count.
+                    #
+                    # Use _body_leading_count when > 0 (the scan found real
+                    # body allocations). Fall back to len(block_sizes)-1
+                    # only when the scan returned 0 (couldn't detect any),
+                    # and only when the loop rank is ≤ 3 (the simple case
+                    # the conservative floor was designed for). For loops
+                    # with rank > 3, using len-1 as the floor causes
+                    # over-clamping: a 5D loop with a 2D body allocation
+                    # would get floor=4 instead of 1, collapsing the
+                    # partition-contributing tile dim to block_size=1.
+                    if _body_leading_count > 0:
+                        count = _body_leading_count
+                    elif len(block_sizes) <= 3:
+                        # Conservative fallback for simple 2D/3D loops
+                        count = len(block_sizes) - 1
+                    else:
+                        # High-rank loop with no detected body allocations:
+                        # use 1 as the minimal safe count rather than
+                        # len-1 which would over-clamp.
+                        count = 1
+                    count = min(count, len(block_sizes))  # can't exceed loop rank
+                    p = 1
+                    for r in resolved[:count]:
+                        assert r is not None
+                        p *= r
+                    return p
+
+                for i in range(len(block_sizes)):
+                    # Leave at least the last dim uncollapsed so we don't
+                    # accidentally force the free axis to 1.
+                    if i == len(block_sizes) - 1 and _prod_body_leading() <= target:
+                        break
+                    while _prod_body_leading() > target:
+                        if resolved[i] is None or resolved[i] <= 1:
+                            break
+                        new_bs = max(1, resolved[i] // 2)
+                        if new_bs == resolved[i]:
+                            new_bs = 1
+                        resolved[i] = new_bs
+                        block_sizes[i] = new_bs
+                    if _prod_body_leading() <= target:
+                        break
+
+                # If the body uses a 3D allocation of the same shape as the
+                # tile variables (common pattern like hl.zeros([tile_b,
+                # tile_m, head_dim])), the second-to-last block_size also
+                # contributes to the flattened partition. We already cap
+                # leading dims above; as a safety net, if prod_all > cap
+                # and prod_leading ≤ cap, also clamp the last leading-ish
+                # dim once. In practice this case is rare and the above
+                # loop handles it.
+                if block_sizes != _orig_block_sizes:
+                    # Propagate the clamp into state.config so any code
+                    # that re-derives the block size via
+                    # env.block_sizes[bid].from_config_assert(state.config)
+                    # (e.g. hl.full / hl.zeros body allocations, mm sizing)
+                    # sees the reduced value.
+                    try:
+                        config_block_sizes = state.config.config.get("block_sizes")
+                        if isinstance(config_block_sizes, list):
+                            for bid, new_bs in zip(block_ids, block_sizes, strict=True):
+                                try:
+                                    idx = env.config_spec.block_sizes.block_id_to_index(bid)
+                                except Exception:
+                                    continue
+                                config_block_sizes[idx] = new_bs
+                    except Exception:
+                        pass
+
+        lane_loops: list[tuple[str, list[ast.stmt], str]] = []
+
+        # Clamp block_size to loop extent. NKI's dma_copy uses
+        # ``offset:offset+block_size`` which goes OOB when block_size > extent
+        # even though the outer range limits iterations. For tensors where
+        # dim size is small (e.g. x_offsets [B+1=33]), reduce block_size.
+        _clamped: list[object] = []
+        for bsz, begin, end, block_idx in zip(block_sizes, begins, ends, block_ids, strict=True):
+            _numel = env.block_sizes[block_idx].numel
+            _num_int: int | None = None
+            if isinstance(_numel, (int, bool)):
+                _num_int = int(_numel)
+            elif isinstance(_numel, torch.SymInt):
+                try:
+                    _num_int = env.size_hint(_numel)
+                except Exception:
+                    _num_int = None
+            elif isinstance(_numel, sympy.Expr):
+                try:
+                    _num_int = int(_numel)
+                except (TypeError, ValueError):
+                    try:
+                        _num_int = int(env.size_hint(_numel))
+                    except Exception:
+                        _num_int = None
+            if _num_int is not None and isinstance(bsz, (int, bool)) and int(bsz) > _num_int:
+                _clamped.append(_num_int)
+            else:
+                _clamped.append(bsz)
+        if _clamped != list(block_sizes):
+            # Propagate to config
+            try:
+                config_block_sizes = state.config.config.get("block_sizes")
+                if isinstance(config_block_sizes, list):
+                    for bid, new_bs in zip(block_ids, _clamped, strict=True):
+                        try:
+                            idx = env.config_spec.block_sizes.block_id_to_index(bid)
+                        except Exception:
+                            continue
+                        config_block_sizes[idx] = new_bs
+            except Exception:
+                pass
+            block_sizes = _clamped
+
+        for block_idx, block_size, begin, end in zip(
+            block_ids, block_sizes, begins, ends, strict=True
+        ):
+            block_size_info = env.block_sizes[block_idx]
+            numel = block_size_info.numel
+            offset_var = self.offset_var(block_idx)
+            index_var = self.index_var(block_idx)
+
+            self._setup_block_size_constexpr(
+                state,
+                self.block_size_var(block_idx),
+                block_size,
+                block_idx=block_idx,
+            )
+
+            def _safe_int(x: object) -> int | None:
+                if isinstance(x, (int, bool)):
+                    return int(x)
+                if isinstance(x, float):
+                    return int(x)
+                if isinstance(x, torch.SymInt):
+                    return env.size_hint(x)
+                if isinstance(x, sympy.Expr):
+                    try:
+                        return int(x)
+                    except (TypeError, ValueError):
+                        if x.free_symbols:
+                            try:
+                                return int(env.size_hint(x))
+                            except Exception:
+                                return None
+                        return None
+                return None
+
+            begin_int = _safe_int(begin)
+            begin_str = str(begin_int) if begin_int is not None else "0"
+            if numel is not None:
+                numel_int = _safe_int(numel)
+                end_str = str(numel_int) if numel_int is not None else state.sympy_expr(_to_sympy(numel))
+            else:
+                end_int = _safe_int(end)
+                end_str = str(end_int) if end_int is not None else str(end)
+            step_int = _safe_int(block_size)
+            step_str = str(step_int) if step_int is not None else "1"
+            range_expr = f"nl.affine_range({begin_str}, {end_str}, {step_str})"
+
+            # Emit the per-position index tile (nisa.iota) at the top of the
+            # loop body so tile.index / tile.index-based masks can be
+            # evaluated against a real SBUF vector. ``bs`` matches what the
+            # generic codegen_device_loop path uses — see _BaseNDTileStrategy.
+            uses_thread_axis = self._uses_thread_axis(block_size)
+            bs = self.block_size_var(block_idx) if uses_thread_axis else "1"
+            if bs is None:
+                bs = "1"
+            dtype_str = env.index_type()
+            idx_stmts = _backend_loop_index_statements(
+                env.backend,
+                offset_var=offset_var,
+                block_size_var=bs,
+                dtype=dtype_str,
+                axis=0,
+                index_var=index_var,
+            )
+            lane_loops.append((offset_var, idx_stmts, range_expr))
+
+        if state.device_function.pid is None:
+            state.device_function.set_pid(NKIProgramIDs())
+
+        block_id_to_info = self._create_block_id_info_dict(state)
+        return DeviceGridState(
+            self, block_id_to_info=block_id_to_info, lane_loops=lane_loops
         )
 
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:

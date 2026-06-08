@@ -730,3 +730,34 @@ under a synthetic module name `_ex_<stem>`, which breaks `register_tunable`/modu
 
 This is the strongest possible regression signal: the port reproduces the reference's NKI codegen exactly
 across the entire suite, with no hardware/compile needed.
+
+---
+
+# PHASE 3 — Autotuning (hook into upstream's hardware-agnostic autotuner)
+
+## P3.1 — Delegate NKIBackend.autotune to the base autotuner + get_do_bench
+
+**File:** `helion/_compiler/nki_backend.py`. Per the user's guidance ("hook into the current autotuner as
+that should be hardware agnostic"; their nki_search.py was shallow) — did NOT port the 385-line
+`NKIFiniteSearch`. Instead:
+
+- **Removed the `NKIFiniteSearch` dependency.** `NKIBackend.autotune` now delegates to
+  `super().autotune(...)` (the upstream `Backend.autotune`: handles single-config, FiniteSearch over explicit
+  configs, `autotune_effort="none"`→default, and the full search), wrapped to fall back to
+  `_safe_default_config` if the search raises (e.g. all candidates overflow SBUF).
+- **Added `NKIBackend.get_do_bench` → `do_bench_generic`.** This is the one genuinely-needed hardware hook:
+  Triton-event timing / CUDA sync aren't available on XLA, so NKI uses the generic wall-clock benchmark
+  (same path Pallas/CPU use). The NKI launcher runs `xm.mark_step()` internally so each timed call is
+  synchronized; `do_bench_generic` already does warmup+repeat+`synchronize_device`. This replaces the
+  reference's bespoke `_nki_bench` wall-clock loop with the upstream-native extension point.
+- Kept `_safe_default_config` (NKI-safe block sizes) + `_complete_nki_partial_config` (P1.20).
+
+**Why this is better than the reference:** the reference fully overrode autotuning with a parallel shallow
+search; this hooks NKI into upstream's real autotuner via the documented `get_do_bench` extension point, so
+NKI automatically gets FiniteSearch, effort profiles, caching, and future autotuner features — hardware-
+agnostic, minimal NKI surface.
+
+**Verification:** nki_backend parses/imports, `get_do_bench` present; `matmul` still byte-identical after the
+change; `rms_norm` (config-less) now runs through the autotuner (the prior `ModuleNotFoundError:
+nki_search` is gone) and generates a kernel BYTE-IDENTICAL to the reference (both 8093 bytes) — its
+simulate-bwd gradient delta is a simulate/precision artifact, not a port regression (codegen matches ref).

@@ -17,6 +17,7 @@ import abc
 import ast
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Callable
 from typing import Sequence
 
 import torch
@@ -6680,6 +6681,20 @@ class NKIBackend(Backend):
     def inductor_op_overrides(self) -> InductorOpOverrides:
         return NKIOpOverrides()
 
+    def get_do_bench(self) -> Callable[..., float | tuple[float, ...]]:
+        """NKI uses the generic wall-clock benchmark.
+
+        ``do_bench_generic`` already does warmup + repeated wall-clock timing
+        with ``synchronize_device`` between calls; the NKI launcher itself runs
+        ``xm.mark_step()`` internally, so each timed call is fully synchronized.
+        This lets NKI plug into the upstream (hardware-agnostic) autotuner with
+        no custom search class — Triton-event timing isn't available on XLA, and
+        this is the same generic path Pallas/CPU backends use.
+        """
+        from ..autotuner.benchmarking import do_bench_generic
+
+        return do_bench_generic
+
     def autotune(
         self,
         bound_kernel: BoundKernel[Any],
@@ -6688,28 +6703,19 @@ class NKIBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        """Autotune NKI kernel by trying a small set of NKI-safe block-size configs.
+        """Hook into the upstream (hardware-agnostic) autotuner.
 
-        Uses NKIFiniteSearch which handles XLA synchronization and catches
-        per-config errors (e.g. SBUF overflow) without aborting the search.
-        Falls back to the safe default config if all configs fail.
+        Delegates to ``Backend.autotune`` — which handles single-config,
+        finite-search over explicit configs, ``autotune_effort="none"`` (default
+        config), and the full search — using NKI's ``get_do_bench`` for timing.
+        If the search raises (e.g. every candidate overflows SBUF), fall back to
+        a hardware-safe default config so the kernel still compiles/runs.
         """
-        if not force and bound_kernel.kernel.configs:
-            # User supplied explicit configs; use finite search over them.
-            if len(bound_kernel.kernel.configs) == 1:
-                return bound_kernel.kernel.configs[0]
-            configs = bound_kernel.kernel.configs
-        else:
-            bound_kernel.settings.check_autotuning_disabled()
-            configs = None  # let NKIFiniteSearch generate safe candidates
-
-        from ..autotuner.nki_search import NKIFiniteSearch
-
-        effort = bound_kernel.settings.autotune_effort
         try:
-            return NKIFiniteSearch(bound_kernel, args, configs=configs, effort=effort).autotune()
+            return super().autotune(bound_kernel, args, force=force, **kwargs)
         except Exception as e:
             import logging as _logging
+
             _logging.getLogger(__name__).warning(
                 f"[NKI autotune] search failed ({type(e).__name__}: {e}), "
                 "falling back to safe default config"

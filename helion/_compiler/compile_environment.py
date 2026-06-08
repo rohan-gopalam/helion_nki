@@ -152,6 +152,7 @@ def _make_numel_check(
 
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Sequence
     from types import TracebackType
     from typing_extensions import Self
@@ -302,6 +303,19 @@ class CompileEnvironment:
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
+        # Set during codegen so backends (e.g. NKI) can emit statements and
+        # return the result variable name; see NKI_STATEMENT_BASED_CODEGEN.md Option B.
+        self._codegen_state: object | None = None
+
+    @contextlib.contextmanager
+    def set_codegen_state(self, state: object | None) -> Iterator[None]:
+        """Temporarily set _codegen_state so backends can emit statements (e.g. NKI nisa.*)."""
+        old = self._codegen_state
+        self._codegen_state = state
+        try:
+            yield
+        finally:
+            self._codegen_state = old
 
     def specialize_expr(self, expr: sympy.Expr) -> sympy.Expr:
         """Substitute any specialized vars with their concrete values."""
@@ -914,6 +928,13 @@ class CompileEnvironment:
     def _to_fake_tensor(self, tensor: torch.Tensor, source: Source) -> torch.Tensor:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
+        # NKI does not support int64 tensors. Silently promote the fake's
+        # dtype to int32 so the traced kernel code uses int32 throughout.
+        # The launcher (default_nki_launcher) performs the matching
+        # int64→int32 cast on the real tensor before launch.
+        fake_dtype = tensor.dtype
+        if self.backend_name == "nki" and fake_dtype == torch.int64:
+            fake_dtype = torch.int32
         if isinstance(tensor, FakeTensor):
             # FakeTensor from an outer tracing context (e.g. make_fx, Dynamo).
             # Create fresh symbols in our own ShapeEnv to avoid leaking
@@ -937,17 +958,27 @@ class CompileEnvironment:
             result = torch.empty_strided(
                 new_sizes,
                 new_strides,
-                dtype=tensor.dtype,
+                dtype=fake_dtype,
                 device=tensor.device,
             )
         elif self.settings.static_shapes:
             result = torch.empty_strided(
                 tensor.size(),
                 tensor.stride(),
-                dtype=tensor.dtype,
+                dtype=fake_dtype,
                 device=tensor.device,
             )
         else:
+            if fake_dtype != tensor.dtype:
+                # Fake-tensor converter infers dtype from the real tensor's
+                # metadata; pre-cast via an empty tensor of the target dtype
+                # so the fake-propagation sees int32.
+                tensor = torch.empty_strided(
+                    tensor.size(),
+                    tensor.stride(),
+                    dtype=fake_dtype,
+                    device=tensor.device,
+                )
             result = self.fake_mode.fake_tensor_converter.from_real_tensor(
                 self.fake_mode, tensor, shape_env=self.shape_env, source=source
             )
@@ -972,7 +1003,13 @@ class CompileEnvironment:
                 # This preserves the original value passed to the kernel.
                 if expr in var_hints:
                     return int(var_hints[expr])
-                # Fall back to default hint if not found
+                hinted_expr = expr.xreplace(var_hints)
+                if not hinted_expr.free_symbols:
+                    return int(hinted_expr)
+                with contextlib.suppress(Exception):
+                    # pyrefly: ignore [no-matching-overload]
+                    return int(self.shape_env.size_hint(expr))
+                # Fall back to default hint if not found.
                 return 8192
 
             return shape_env_size_hint(self.shape_env, n._sympy_())

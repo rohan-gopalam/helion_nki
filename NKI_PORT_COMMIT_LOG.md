@@ -135,3 +135,36 @@ renamed/reorganized it to **`TensorType.propagate_setitem`** (L429). The Callabl
 - Regression: `import helion` OK.
 
 **Open follow-up:** delta #2 is cross-backend (unconditional) — confirm at P1.22 it doesn't shift Triton codegen.
+
+## P1.4 — compile_environment.py: set_codegen_state + NKI int64/size_hint guards
+
+**File:** `helion/_compiler/compile_environment.py`
+
+**Applied (3 of the reference's NKI pieces):**
+1. **`set_codegen_state` context manager + `self._codegen_state` attribute** (added after `has_barrier` /
+   after `__init__`). The keystone for NKI statement-based codegen ("Option B"): during codegen the active
+   state is parked on the env so NKI op-lowerings can emit `nisa.*` statements and return a result var name.
+   Genuinely absent upstream (grep count 0). Added `from collections.abc import Iterator` under TYPE_CHECKING.
+2. **int64→int32 fake-tensor promotion** in `_to_fake_tensor`: compute `fake_dtype` once (int64→int32 when
+   `backend_name=='nki'`) and thread it through ALL THREE upstream branches — the new `FakeTensor` branch,
+   `static_shapes`, and the `from_real_tensor` else-branch (with the pre-cast empty-tensor trick). Upstream
+   refactored this method to 3 branches (reference had 2); the cast is applied to each so int64 never leaks.
+3. **`size_hint` unbacked-symbol fallback**: before defaulting to 8192, try `expr.xreplace(var_hints)` (return
+   if fully concrete) then `shape_env.size_hint(expr)`. Helps NKI bounds resolve to real hints.
+
+**NOT applied here (handled elsewhere — plan corrections):**
+- **`backend_factory` dict + `from .backend import NKIBackend`**: the reference hardcoded `"nki": NKIBackend`
+  in a dict and hard-imported it. Upstream uses the registry (`get_backend_class(settings.backend)()`), and
+  the plugin constraint FORBIDS a hard NKI import here. Skipped — NKI registers via backend_registry (P1.5/P1.6).
+- **`jagged_tile_parent_ids`/`jagged_tile_mask_shapes` dicts + `register_jagged_tile`/`is_jagged_tile`**:
+  ALREADY present upstream (L270-271, L1222-1226) from upstream's own jagged_tile work. Not re-added.
+- **NKI reduction-DMA power-of-2 guard** in `ReductionLoopBlockSizeSource.from_config`: the reference inlined
+  `if backend_name=='nki': return max(1, size_hint())`. Upstream replaced that whole path with a backend hook
+  `backend.static_rdim_size(size)` (Pallas already returns exact `numel`; Triton/CuTe round to pow2). The
+  correct NKI port is to override `NKIBackend.static_rdim_size` to return `numel` exact — **deferred to P1.6**.
+  No edit needed in this file.
+
+**Verification (gate passed):** `set_codegen_state` present; `_to_fake_tensor` has `fake_dtype`/`torch.int32`;
+`size_hint` has the `hinted_expr` fallback; module AST-parses; `import helion` OK.
+
+**Open follow-up:** ensure P1.6 adds `NKIBackend.static_rdim_size(numel) -> numel`.

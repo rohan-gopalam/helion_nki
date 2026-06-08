@@ -373,3 +373,27 @@ end-handling (L1454). All upstream's own jagged work. So only TWO NKI pieces wer
 silu pop present; module AST-parses; `import helion` OK.
 
 **Deviation:** the reference's commented-out `_nki_dyn_loops` cleanup block (already dead) was not ported.
+
+## P1.12 — reduction_strategy.py: NKI deferred reduction (guide-omitted; 232-line delta)
+
+**File:** `helion/_compiler/reduction_strategy.py`
+
+**Applied (re-anchored onto upstream's refactored ReductionStrategy/Looped/Block + cute vec-fold path):**
+1. **`call_reduction_function`**: pass `fake_input=/fake_output=` to `backend.reduction_expr` ONLY when
+   `backend.name=="nki"`. PLAN CORRECTION confirmed (R15): upstream's base `reduction_expr` takes
+   `threads_in_group`, NOT `fake_input/fake_output` (which NKIBackend's override carries). Passing them
+   unconditionally would `TypeError` on other backends, so it's NKI-guarded.
+2. **`LoopedReductionStrategy.codegen`**: after the `{acc} = {acc_full}` outer_prefix append, add the NKI
+   `full_memset_stmt` init + `_nki_sbuf_shapes[acc]` registration (`getattr(backend,"full_memset_stmt",None)`
+   is None for non-NKI → inert). In the non-indexed branch, for NKI emit the deferred post-loop reduction
+   directly into `outer_suffix` (`_NKI_REDUCTION_OPS` map → `nisa.tensor_reduce` with part-size resolution
+   from `_nki_sbuf_shapes`/shape_dims/fake_input, mean scaling, `[:,0]` extract) and `return` early to skip
+   the shared `maybe_reshape`/`cast_expr` tail; non-NKI keeps upstream's `_cute_cross_warp_reduction_expr or
+   call_reduction_function` path untouched.
+3. **`debug_dtype_asserts`** guard: `and backend.name != "nki"` (NKI doesn't emit `tl.static_assert`).
+4. **`BlockReductionStrategy`** zero-dim path: NKI `full_memset_stmt` ndarray+memset variant.
+
+**Verification (gate passed):** module AST-parses; `full_memset_stmt` exists only on NKIBackend (None
+elsewhere → inert); `cast_expr`/`full_expr`/`is_indexed_reduction`/`reduction_combine_expr` resolve;
+`import helion` OK; end-to-end smoke still fails at the SAME expected boundary (missing `load` codegen,
+P1.17) — no reduction-wiring regression.

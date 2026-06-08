@@ -595,6 +595,18 @@ class ReductionStrategy(TileStrategy):
                 dim,
                 fake_output,
             )
+        if backend.name == "nki":
+            # NKIBackend.reduction_expr carries fake_input/fake_output (it needs
+            # the shapes to emit the right tensor_reduce); the upstream base and
+            # other backends use threads_in_group instead and would reject these.
+            return backend.reduction_expr(
+                input_name,
+                reduction_type,
+                dim,
+                block_size_var=self.block_size_var(self.block_index),
+                fake_input=fake_input,
+                fake_output=fake_output,
+            )
         return backend.reduction_expr(
             input_name,
             reduction_type,
@@ -1410,6 +1422,21 @@ class LoopedReductionStrategy(ReductionStrategy):
             device_loop.outer_prefix.append(
                 statement_from_string(f"{acc} = {acc_full}")
             )
+            nki_memset = getattr(backend, "full_memset_stmt", None)
+            if nki_memset is not None:
+                device_loop.outer_prefix.append(
+                    statement_from_string(nki_memset(acc, constant_repr(default)))
+                )
+            # Register SBUF shape for NKI multi-user detection on copy vars
+            if backend.name == "nki" and hasattr(self.fn, "_nki_sbuf_shapes"):
+                resolved_dims = []
+                for d in shape_dims:
+                    try:
+                        resolved_dims.append(int(d))
+                    except (TypeError, ValueError):
+                        break
+                if len(resolved_dims) >= 2:
+                    self.fn._nki_sbuf_shapes[acc] = resolved_dims
             result = self.fn.new_var(state.fx_node.name, dce=True)
             if not backend.is_indexed_reduction(reduction_type):
                 vec_input = input_name
@@ -1454,20 +1481,139 @@ class LoopedReductionStrategy(ReductionStrategy):
                     reduction_type, acc, vec_input, acc_dtype
                 )
                 state.add_statement(f"{acc} = {combine_expr}")
-                expr = self._cute_cross_warp_reduction_expr(
-                    state,
-                    device_loop,
-                    acc,
-                    reduction_type,
-                    default,
-                    acc_dtype,
-                ) or self.call_reduction_function(
-                    acc,
-                    reduction_type,
-                    dim,
-                    fake_input,
-                    fake_output,
-                )
+
+                # For NKI backend, defer the final reduction to outer_suffix
+                # (after the loop) instead of computing it inline. We emit the
+                # tensor_reduce directly here and assign `result` in outer_suffix,
+                # then return early so the shared post-processing below is skipped.
+                if backend.name == "nki":
+                    _NKI_REDUCTION_OPS = {
+                        "sum": "nl.add",
+                        "max": "nl.maximum",
+                        "min": "nl.min",
+                        "prod": "nl.mul",
+                        "mean": "nl.add",
+                    }
+                    op = _NKI_REDUCTION_OPS.get(reduction_type)
+                    if op is not None:
+                        reduction_stmts = []
+                        nki_reduce_var = self.fn.new_var("nki_reduce", dce=True)
+                        device_fn = getattr(state.codegen, "device_function", None)
+                        sbuf_shape = None
+                        if device_fn is not None and hasattr(
+                            device_fn, "_nki_sbuf_shapes"
+                        ):
+                            sbuf_shape = device_fn._nki_sbuf_shapes.get(input_name)
+                            if sbuf_shape is None:
+                                sbuf_shape = device_fn._nki_sbuf_shapes.get(acc)
+                        if sbuf_shape is None and shape_dims:
+                            _dim_str = shape_dims[0]
+                            try:
+                                sbuf_shape = [int(_dim_str)]
+                            except (ValueError, TypeError):
+                                _local_vars: dict[str, int] = {}
+                                for _bid2 in range(len(env.block_sizes)):
+                                    _bs2 = env.block_sizes[_bid2]
+                                    _sym = _bs2.symbol()
+                                    _cfg_val = int(
+                                        _bs2.from_config_assert(state.config)
+                                    )
+                                    _local_vars[str(_sym)] = _cfg_val
+                                    for _dbg in _bs2.debug_names:
+                                        _local_vars[_dbg] = _cfg_val
+                                try:
+                                    sbuf_shape = [
+                                        int(eval(_dim_str, {}, _local_vars))  # noqa: S307
+                                    ]
+                                except Exception:
+                                    pass
+                        if sbuf_shape is not None and len(sbuf_shape) >= 1:
+                            part_size = sbuf_shape[0]
+                            dst_shape = f"[{part_size}, 1]"
+                        elif fake_input is not None and fake_input.ndim >= 2:
+                            part_size_sym = fake_input.size(0)
+                            if isinstance(part_size_sym, torch.SymInt):
+                                import sympy as _sympy
+
+                                _bs_subs: dict[_sympy.Symbol, int] = {}
+                                for _bid in range(len(env.block_sizes)):
+                                    _bs = env.block_sizes[_bid]
+                                    _bs_subs[_bs.symbol()] = int(
+                                        _bs.from_config_assert(state.config)
+                                    )
+                                part_size = int(part_size_sym._sympy_().subs(_bs_subs))
+                            else:
+                                part_size = int(part_size_sym)
+                                for _bid in range(len(env.block_sizes)):
+                                    _bs = env.block_sizes[_bid]
+                                    if not _bs.reduction:
+                                        _hint_val = env.size_hint(_bs.var._sympy_())
+                                        _cfg_val = int(
+                                            _bs.from_config_assert(state.config)
+                                        )
+                                        if (
+                                            int(_hint_val) == part_size
+                                            and _cfg_val != part_size
+                                        ):
+                                            part_size = _cfg_val
+                                            break
+                            dst_shape = f"[{part_size}, 1]"
+                        else:
+                            dst_shape = "[1, 1]"
+                        reduction_stmts.append(
+                            f"{nki_reduce_var} = nl.ndarray({dst_shape}, nl.float32, buffer=nl.sbuf)"
+                        )
+                        reduction_stmts.append(
+                            f"nisa.tensor_reduce(dst={nki_reduce_var}, op={op}, data={acc}, axis={dim}, keepdims=True)"
+                        )
+                        if reduction_type == "mean" and fake_input is not None:
+                            reduction_extent = fake_input.size(dim)
+                            if isinstance(reduction_extent, sympy.Basic):
+                                reduction_extent = env.size_hint(reduction_extent)
+                            reduction_extent = int(reduction_extent)
+                            if reduction_extent > 0:
+                                scale = 1.0 / reduction_extent
+                                reduction_stmts.append(
+                                    f"nisa.tensor_scalar(dst={nki_reduce_var}, data={nki_reduce_var}, "
+                                    f"op0=nl.multiply, operand0={repr(scale)}, op1=None)"
+                                )
+                        if (
+                            fake_output is not None
+                            and fake_output.ndim == fake_input.ndim - 1
+                            and dim == 1
+                        ):
+                            expr = f"{nki_reduce_var}[:, 0]"
+                        else:
+                            expr = nki_reduce_var
+                        for stmt in reduction_stmts:
+                            device_loop.outer_suffix.append(
+                                statement_from_string(stmt)
+                            )
+                        expr = self.maybe_reshape(expr, dim, fake_input, fake_output)
+                        expr = backend.cast_expr(expr, _dtype_str(fake_output.dtype))
+                        device_loop.outer_suffix.append(
+                            statement_from_string(f"{result} = {expr}")
+                        )
+                        return expr_from_string(result)
+                    else:
+                        expr = self.call_reduction_function(
+                            acc, reduction_type, dim, fake_input, fake_output
+                        )
+                else:
+                    expr = self._cute_cross_warp_reduction_expr(
+                        state,
+                        device_loop,
+                        acc,
+                        reduction_type,
+                        default,
+                        acc_dtype,
+                    ) or self.call_reduction_function(
+                        acc,
+                        reduction_type,
+                        dim,
+                        fake_input,
+                        fake_output,
+                    )
             else:
                 acc_index = self.fn.new_var(f"{state.fx_node.name}_acc_index", dce=True)
                 index_dtype = env.index_dtype
@@ -1500,7 +1646,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             device_loop.outer_suffix.append(statement_from_string(f"{result} = {expr}"))
 
             # Optional: emit a dtype static assert right after the assignment when enabled
-            if env.settings.debug_dtype_asserts:
+            if env.settings.debug_dtype_asserts and backend.name != "nki":
                 device_loop.outer_suffix.append(
                     statement_from_string(
                         f"tl.static_assert({result}.dtype == {_dtype_str(fake_output.dtype)})"
@@ -2250,8 +2396,18 @@ class BlockReductionStrategy(ReductionStrategy):
             is_zero_dim = True
         if is_zero_dim:
             shape_dims = self.fn.tile_strategy.shape_dims([*fake_output.size()])
+            backend = env.backend
+            nki_memset = getattr(backend, "full_memset_stmt", None)
+            if nki_memset is not None:
+                var = self.fn.new_var("zero_dim_default", dce=True)
+                ndarray_expr = backend.full_expr(shape_dims, "0", fake_output.dtype)
+                state.add_statement(statement_from_string(f"{var} = {ndarray_expr}"))
+                state.add_statement(
+                    statement_from_string(nki_memset(var, constant_repr(default)))
+                )
+                return expr_from_string(var)
             return expr_from_string(
-                env.backend.full_expr(
+                backend.full_expr(
                     shape_dims, constant_repr(default), fake_output.dtype
                 )
             )

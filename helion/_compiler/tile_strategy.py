@@ -1568,7 +1568,12 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                         # Signals memory_ops.py to emit a static prefill and
                         # redirect y-loads to the padded output buffer, fixing
                         # the oob_mode.skip partial-tile data loss bug.
-                        "needs_prefill": True,
+                        # Only set for jagged-style loops where the end bound
+                        # comes from a tensor_reduce(max) — those always produce
+                        # a variable named "nki_reduce".  General tensor-bound
+                        # loops (hl.tile(end[0])) use DMA-loaded scalars and
+                        # must NOT trigger the prefill path.
+                        "needs_prefill": bnd_sbuf.startswith("nki_reduce"),
                     }
                     state.device_function._nki_dyn_range_end_var = bnd_reg
                     state.device_function._nki_dyn_current_block_id = block_idx

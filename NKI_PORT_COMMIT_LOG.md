@@ -251,3 +251,20 @@ real bind, which requires the codegen steps P1.10+; deferred to those gates.)
 (lazy import confirmed); all 4 files AST-parse; `_default_nki_launcher` in output_header disallowed_names.
 
 **Plan deviation:** skipped the `BackendLiteral`/`_get_backend` mapping edits (registry-driven upstream).
+
+## P1.8 — program_id.py: NKIProgramIDs (host_function edit dropped)
+
+**File:** `helion/_compiler/program_id.py`. **No edit:** `helion/_compiler/host_function.py`.
+
+**What & why:** Appended `class NKIProgramIDs(ProgramIDs)` after `CuteProgramIDs`. NKI compiles a single
+program whose grid is always `(1,)` — all tiling happens via `nl.affine_range` loops inside the kernel — so
+`codegen` is a no-op and `codegen_grid` returns `(1,)`. Verbatim from reference; orthogonal to upstream's
+CuTe PID work.
+
+**host_function.py NOT touched (plan-confirmed):** the reference guarded `patch_tensor_factories` in
+host_function with `backend_name != "nki"`, but upstream removed `patch_tensor_factories` from host_function
+entirely (grep count 0). NKI's equivalent guard is the `pad_factory_tensors_to_power_of_2=False` override
+added to NKIBackend in P1.6.
+
+**Verification (gate passed):** `NKIProgramIDs` imports and subclasses `ProgramIDs`; host_function has 0
+`patch_tensor_factories` refs; `import helion` OK.

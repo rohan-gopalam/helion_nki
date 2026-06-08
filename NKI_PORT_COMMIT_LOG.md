@@ -350,3 +350,26 @@ block in `_add_device_loop`; it was already disabled (dead comment) so not porte
   next unported step (P1.17 memory_ops). This confirms the generate_ast wiring is correct and the failure is
   a clean not-yet-implemented at the expected boundary.
 - Regression: `import helion` OK.
+
+## P1.11 — device_ir.py: SiLU decomp guard + set_codegen_state wraps
+
+**File:** `helion/_compiler/device_ir.py`
+
+**MAJOR FINDING — most of P1.11 is already upstream.** Verified upstream already has: `JaggedTileIndexType`
+import (from type_info, L63), `_get_custom_decomp_table` with the stack pop, `_make_fx` using it,
+`hl.jagged_tile` in the WalkDeviceAST func_type assert (L1322), and the `JaggedTileIndexType` `amax()` jagged
+end-handling (L1454). All upstream's own jagged work. So only TWO NKI pieces were genuinely missing:
+
+**Applied:**
+1. **SiLU decomp pop** in `_get_custom_decomp_table`: `if backend_name == "nki": decomp_table.pop(aten.silu.default)`
+   so SiLU lowers via `NKIOpOverrides.silu` instead of the aliasing `x*sigmoid(x)` decomposition.
+2. **`set_codegen_state(state)` wraps** on the control-flow codegen methods (the keystone from P1.4, so NKI
+   op-lowerings can emit statements while inside these graphs). Re-anchored onto upstream's refactored
+   versions: `ForLoopGraphInfo.codegen` (wrap the `add_device_loop` ctx), `IfGraphInfo.codegen` (BOTH the if
+   body and the else-branch `set_statements` — upstream split these), `WhileLoopGraphInfo.codegen` (BOTH the
+   `emit_condition` inner block AND the body block — 2 paths), `HelperFunctionGraphInfo.codegen`. 6 wraps total.
+
+**Verification (gate passed):** `CompileEnvironment` already imported; 6 `set_codegen_state` wraps present;
+silu pop present; module AST-parses; `import helion` OK.
+
+**Deviation:** the reference's commented-out `_nki_dyn_loops` cleanup block (already dead) was not ported.

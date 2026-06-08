@@ -105,6 +105,11 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
     decomp_table.pop(torch.ops.aten.stack.default, None)
+    # Keep SiLU as a first-class op for NKI so it lowers via NKIOpOverrides.silu.
+    # The default decomposition (x * sigmoid(x)) can alias operands and break
+    # statement-based in-place NKI codegen for SwiGLU-like patterns.
+    if CompileEnvironment.current().backend_name == "nki":
+        decomp_table.pop(torch.ops.aten.silu.default, None)
     # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
     decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
     # Map F.gelu(x, approximate="tanh") to a single _gelu_tanh_approx FX
@@ -332,8 +337,9 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         # different lane-loop shapes for the reduce vs consume sweeps.
         # pyrefly: ignore [missing-attribute]
         state.codegen._cute_active_graph_info = self
+        env = CompileEnvironment.current()
         try:
-            with state.codegen.add_device_loop(
+            with env.set_codegen_state(state), state.codegen.add_device_loop(
                 state.device_function.tile_strategy.codegen_device_loop(
                     state, self.block_ids
                 ),
@@ -427,20 +433,23 @@ class IfGraphInfo(NodeArgsGraphInfo):
 
         assert isinstance(state.codegen, GenerateAST)
 
+        env = CompileEnvironment.current()
         test = state.ast_arg(0)
         body_stmts: list[ast.AST] = []
         orelse_stmts: list[ast.AST] = []
         if_ast_node = create(ast.If, test=test, body=body_stmts, orelse=orelse_stmts)
         state.add_statement(if_ast_node)
 
-        with state.codegen.set_statements(body_stmts):
+        with env.set_codegen_state(state), state.codegen.set_statements(body_stmts):
             if_outputs = codegen_call_with_graph(state.codegen, self.graph, if_args)
 
         else_outputs = []
         if self.else_branch is not None:
             else_graph = state.get_graph(self.else_branch)
             assert isinstance(else_graph, ElseGraphInfo)
-            with state.codegen.set_statements(orelse_stmts):
+            with env.set_codegen_state(state), state.codegen.set_statements(
+                orelse_stmts
+            ):
                 else_outputs = codegen_call_with_graph(
                     state.codegen, else_graph.graph, else_args
                 )
@@ -508,12 +517,15 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[2]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
+        env = CompileEnvironment.current()
 
         def emit_condition(
             target_statements: list[ast.AST],
             cond_args: list[ast.AST] | None = None,
         ) -> ast.expr:
-            with state.codegen.set_statements(target_statements):
+            with env.set_codegen_state(state), state.codegen.set_statements(
+                target_statements
+            ):
                 cond_outputs = codegen_call_with_graph(
                     state.codegen,
                     cond_info.graph,
@@ -552,7 +564,9 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
         )
 
         body_statements: list[ast.AST] = []
-        with state.codegen.set_statements(body_statements):
+        with env.set_codegen_state(state), state.codegen.set_statements(
+            body_statements
+        ):
             outputs = codegen_call_with_graph(
                 state.codegen,
                 self.graph,
@@ -2588,7 +2602,9 @@ class HelperFunctionGraphInfo(NodeArgsGraphInfo):
     def codegen(self, state: CodegenState) -> list[object]:
         from .helper_function import codegen_helper_function_graph_info
 
-        return codegen_helper_function_graph_info(self, state)
+        env = CompileEnvironment.current()
+        with env.set_codegen_state(state):
+            return codegen_helper_function_graph_info(self, state)
 
 
 def validate_host_tensor_usage(graph: torch.fx.Graph) -> None:

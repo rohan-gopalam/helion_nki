@@ -692,3 +692,18 @@ torch), not just byte-identical to the reference. Paused here per plan for revie
 
 **NEXT: P2.2** — full `examples/run_nki_examples.py` sweep (~2-3 hrs cold), expect 47 pass + 5 blocked xfail
 (nvfp4_gemm, fused_linear_jsd, mamba2_chunk_scan, mamba2_chunk_state, grpo_loss).
+
+## P2 infra — HELION_NKI_SIMULATE CPU launcher (fast correctness path)
+
+**File:** `helion/runtime/__init__.py`
+
+**What & why:** Added `_nki_simulate_launcher` + a `HELION_NKI_SIMULATE=1` opt-in branch at the top of
+`default_nki_launcher`. When set, the kernel runs on CPU via `nki.simulate(kernel)(args)` instead of
+compiling through neuronx-cc and executing on Trainium. This is MUCH faster (no compile) and is used for
+correctness validation across the example sweep without burning hours of neuronx-cc time. Off by default
+(env-gated) so the byte-identical default behavior and the real hardware path are unchanged. Mirrors the XLA
+launcher's int64->int32 cast and dynamic_range LNC auto-bump; converts numpy results back to torch on the
+caller's device.
+
+**Verification:** pointwise add + matmul both PASS via `HELION_NKI_SIMULATE=1` (CPU, no Trainium compile),
+matching torch within NKI tolerances. (User noted CPU sim is faster than the compiler step — confirmed.)

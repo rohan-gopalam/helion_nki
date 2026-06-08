@@ -194,14 +194,77 @@ def default_launcher(
         raise
 
 
+def _nki_simulate_launcher(
+    nki_kernel: object,
+    *args: object,
+    **kwargs: object,
+) -> object:
+    """Run an NKI kernel on CPU via nki.simulate (no neuronx-cc / Trainium).
+
+    Used for fast correctness validation under HELION_NKI_SIMULATE=1. Casts
+    int64->int32 (NKI does not support int64) to mirror the XLA launcher, and
+    applies the same LNC auto-bump for dynamic_range kernels.
+    """
+    import nki
+
+    sim_args: list[object] = []
+    first_tensor_device: torch.device | None = None
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            if first_tensor_device is None:
+                first_tensor_device = arg.device
+            if arg.dtype == torch.int64:
+                arg = arg.to(torch.int32)
+            sim_args.append(arg.cpu())
+        else:
+            sim_args.append(arg)
+
+    lnc = int(os.environ.get("HELION_NKI_LNC", "1"))
+    try:
+        import inspect as _inspect
+
+        if "dynamic_range" in _inspect.getsource(nki_kernel) and lnc < 2:
+            lnc = 2
+    except (TypeError, OSError):
+        pass
+    sim_kernel = nki_kernel[lnc] if lnc != 1 else nki_kernel
+    result = nki.simulate(sim_kernel)(*sim_args, **kwargs)
+
+    from torch.utils._pytree import tree_map
+
+    def _to_tensor(x: object) -> object:
+        if isinstance(x, torch.Tensor):
+            return x if first_tensor_device is None else x.to(first_tensor_device)
+        try:
+            import numpy as _np
+
+            if isinstance(x, _np.ndarray):
+                t = torch.from_numpy(x)
+                return t if first_tensor_device is None else t.to(first_tensor_device)
+        except Exception:
+            pass
+        return x
+
+    return tree_map(_to_tensor, result)
+
+
 def default_nki_launcher(
     nki_kernel: object,
     grid: tuple[int, ...],
     *args: object,
     **kwargs: object,
 ) -> object:
-    """Default launcher for NKI kernels on Trainium/XLA."""
+    """Default launcher for NKI kernels on Trainium/XLA.
+
+    With ``HELION_NKI_SIMULATE=1`` the kernel runs on the CPU via
+    ``nki.simulate`` instead of compiling through neuronx-cc and executing on
+    Trainium. This is much faster than a real compile (no neuronx-cc) and is
+    used for correctness validation; it bypasses XLA entirely.
+    """
     from torch.utils._pytree import tree_map
+
+    if os.environ.get("HELION_NKI_SIMULATE", "0") not in ("0", "false", ""):
+        return _nki_simulate_launcher(nki_kernel, *args, **kwargs)
 
     try:
         from torch_xla.core import xla_model as xm

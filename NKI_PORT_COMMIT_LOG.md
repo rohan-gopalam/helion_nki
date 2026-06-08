@@ -43,3 +43,24 @@ gate passes.
 - Regression: `import helion` still OK; backends unchanged `['triton','pallas','cute','tileir','metal']` (nki not yet registered — correct, that's P1.5/P1.6).
 
 **Deviations/follow-ups:** none.
+
+## P1.2 — Add record_fx_node_ast / ast_for_fx_node to CodegenInterface
+
+**File:** `helion/_compiler/helper_function.py`
+
+**What & why:** The NKI load/store codegen in `memory_ops.py` calls `ast_for_fx_node`/`record_fx_node_ast`
+on the codegen interface 32 times (all inside function bodies — import-safe). Upstream's `CodegenInterface`
+does not define them. Added both methods verbatim from the reference, immediately after `lift()`.
+Both are no-op defaults on the base (record = pass, ast_for = return None); the real recording is wired in
+`generate_ast.py` (P1.10). Kept upstream's `statement_owner_node` (and its `contextlib`/`Iterator`/`Node`
+imports) untouched — the reference branch predates that method, but all three coexist cleanly.
+
+**Insertion point:** after `CodegenInterface.lift`, before the module-level `extract_helper_function`.
+
+**Verification (gate passed):**
+- Inserted text is byte-identical to `fix-nki-kernel-compilation:helper_function.py` for both methods.
+- Gate: `CodegenInterface` has all of `record_fx_node_ast`, `ast_for_fx_node`, `statement_owner_node`.
+- Regression: `import helion` OK.
+
+**Deviations/follow-ups:** none. (Note: did NOT port the reference's removal of `statement_owner_node` —
+that method is upstream-new and orthogonal; keeping it is correct.)

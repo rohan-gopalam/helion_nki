@@ -858,3 +858,29 @@ triage status:
 Running reference-helion-on-hardware to confirm pre-existing status. (First reference sweep hit transient
 NRT_FAILURE on all 9 — invalid; device confirmed healthy via port `add` PASS; re-running reference cleanly
 with inter-example settle delay.)
+
+## P2.2d — Reference baseline + diagnosed the layer_norm-class regression
+
+**Reference-on-hardware baseline** (clean rerun, NRT-settled): layer_norm PASS, rms_norm PASS, long_sum PASS,
+low_mem_dropout PASS, split_k_barrier PASS, psum_reuse_test FAIL. So **5 are PORT REGRESSIONS** (pass on
+reference, fail on port): layer_norm, rms_norm, long_sum, low_mem_dropout, split_k_barrier. (int4_gemm,
+gdn_fwd_h, jagged_hstu_attn confirmed pre-existing per memory; psum_reuse_test fails on ref too +
+harness-artifact.)
+
+**DIAGNOSED (layer_norm / rms_norm — likely same root):** the per-block return-buffer store
+(`grad_weight_blocks[mb_cta.id, :]`) computes its DST row index by **folding `offset_0 // 128` to the
+constant `8192`** (the loop offset's size_hint / `create_unbacked_symint` default). Result: every block
+writes to the same wrong row → wrong gradient. The reference keeps it symbolic (`offset_0 // 128`).
+- 100% of the layer_norm_bwd port-vs-ref diff is exactly `offset_0 // 128`↔`8192` (32 lines, nothing else).
+- Bisected: NOT caused by today's P1.3/P1.3b/P1.4 (reverted each individually; 8192 persists). Present at
+  the Phase-1 commit 5813c8c6 — a Phase-1 port regression in the memory_ops store codegen.
+- Localized: the reference reaches the `_is_tile_id_s` slice path (offset_var='offset_0', emits
+  `offset_0 // 128`); the port does NOT reach it — its return-buffer store path resolves the row via
+  `_bs_subs`/`_resolve_dim`/size_hint, folding the offset symbol to its hint.
+- Tracked as task #3. NOT fixed yet — deep in the 5700-line store codegen; needs careful tracing to avoid
+  breaking the 37 passing kernels (per user's "minimal changes" guidance). Repro: /tmp/gen_lnbwd.py.
+
+**Current hardware tally: ~37 pass** (after the where fix recovered concatenate + jagged_mean, and db8ce151
+recovered fused_nki_ops/jagged_layer_norm/jagged_sum). Remaining: 3 diagnosed-regressions (layer_norm,
+rms_norm + the same store-folding class), 2 to-recheck (long_sum, low_mem_dropout, split_k_barrier may share
+the offset-folding or be separate), 3 pre-existing, 1 harness-artifact, 4 blocked-as-expected.

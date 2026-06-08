@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import operator
 from typing import TYPE_CHECKING
 from typing import cast
@@ -7,6 +8,8 @@ from typing import cast
 import torch
 from torch.fx import Node
 
+from .._compiler.ast_extension import expr_from_string
+from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.host_function import HostFunction
 from .._compiler.rng_utils import BOX_MULLER_MIN
@@ -872,6 +875,80 @@ def _rand_fake(
         dtype=torch.float32,
         device=rng_device,
     )
+
+
+@_decorators.codegen(rand, "nki")
+def _rand_nki_codegen(state: CodegenState) -> ast.AST:
+    fake_value = state.fake_value
+    assert isinstance(fake_value, torch.Tensor)
+
+    env = CompileEnvironment.current()
+    shape_dims = state.device_function.tile_strategy.shape_dims(fake_value.size())
+    if not shape_dims:
+        raise ValueError("hl.rand() requires at least one dimension")
+
+    # NKI loads 1D HBM tiles as [1, block] SBUF values, so match that layout
+    # for rand([tile]) to keep elementwise operations shape-compatible.
+    if len(shape_dims) == 1:
+        nki_shape_dims = ["1", shape_dims[0]]
+    else:
+        nki_shape_dims = list(shape_dims)
+        while len(nki_shape_dims) > 2:
+            try:
+                if int(nki_shape_dims[0]) == 1:
+                    nki_shape_dims = nki_shape_dims[1:]
+                    continue
+            except (TypeError, ValueError):
+                pass
+            leading = nki_shape_dims[:-1]
+            nki_shape_dims = [
+                " * ".join(f"({dim})" for dim in leading),
+                nki_shape_dims[-1],
+            ]
+
+    seed_expr = ast.unparse(state.ast_arg(1))
+    seed_terms: list[str] = [seed_expr]
+    for block_id in sorted(state.codegen.active_device_loops):
+        seed_terms.append(state.codegen.offset_var(block_id))
+    seed_offset = " + ".join(f"({term})" for term in seed_terms)
+
+    var = state.device_function.new_var("_nki_rand", dce=True)
+    seed_var = state.device_function.new_var("_nki_seed", dce=True)
+    state.device_function._nki_sbuf_shapes[seed_var] = [1, 1]
+    state.device_function._nki_sbuf_dtypes[seed_var] = "nl.int32"
+    state.add_statement(
+        statement_from_string(
+            f"{seed_var} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+        )
+    )
+    state.add_statement(statement_from_string(f"nisa.memset({seed_var}, value=0)"))
+    state.add_statement(
+        statement_from_string(
+            f"nisa.tensor_scalar(dst={seed_var}, data={seed_var}, "
+            f"op0=nl.add, operand0={seed_offset}, op1=None)"
+        )
+    )
+    state.add_statement(statement_from_string(f"nisa.set_rng_seed({seed_var})"))
+    state.add_statement(
+        statement_from_string(
+            f"{var} = nl.rand([{', '.join(nki_shape_dims)}], dtype=nl.float32)"
+        )
+    )
+
+    def _resolve_shape_dim(dim: str) -> int:
+        for (block_id,), var_name in state.device_function.block_size_var_cache.items():
+            if var_name == dim:
+                return int(env.block_sizes[block_id].from_config_assert(state.config))
+        return int(dim)
+
+    try:
+        state.device_function._nki_sbuf_shapes[var] = [
+            _resolve_shape_dim(dim) for dim in nki_shape_dims
+        ]
+        state.device_function._nki_sbuf_dtypes[var] = "nl.float32"
+    except (TypeError, ValueError):
+        pass
+    return expr_from_string(var)
 
 
 @_decorators.get_masked_value(rand)

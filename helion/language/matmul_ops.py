@@ -1014,3 +1014,333 @@ def _(
     if acc is not None:
         return acc + result
     return result
+
+
+# --- NKI codegen (ported from fix-nki-kernel-compilation) ---
+@_decorators.codegen(dot, "nki")
+def _(state: CodegenState) -> object:
+    from .._compiler.ast_extension import expr_from_string
+    from .._compiler.ast_extension import statement_from_string
+    from .._compiler.ast_extension import create
+
+    import sympy as _sympy
+
+    lhs_ast = state.ast_arg(0)
+    rhs_ast = state.ast_arg(1)
+    acc_ast = state.ast_arg(2)
+
+    lhs_proxy = state.proxy_args[0]
+    rhs_proxy = state.proxy_args[1]
+    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
+    assert isinstance(lhs_proxy, FakeTensor)
+    assert isinstance(rhs_proxy, FakeTensor)
+
+    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
+
+    env = CompileEnvironment.current()
+    _bs_subs: dict[_sympy.Symbol, int] = {}
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+    def _to_int(s: int | torch.SymInt) -> int:
+        if isinstance(s, int):
+            return s
+        return int(s._sympy_().subs(_bs_subs))
+
+    lhs_shape = list(lhs_proxy.shape)
+    rhs_shape = list(rhs_proxy.shape)
+    # Squeeze leading batch dims for 3D+ shapes (batch_block=1)
+    while len(lhs_shape) > 2:
+        lhs_shape = lhs_shape[1:]
+    while len(rhs_shape) > 2:
+        rhs_shape = rhs_shape[1:]
+    M_tile = _to_int(lhs_shape[0])
+    K_tile = _to_int(lhs_shape[1])
+    N_tile = _to_int(rhs_shape[-1])
+
+    TILE_M = 128
+    TILE_K = 128
+    TILE_N = 512
+
+    assert M_tile % TILE_M == 0 or M_tile < TILE_M, (
+        f"M_tile={M_tile} must be <= {TILE_M} or a multiple of {TILE_M}"
+    )
+    assert K_tile % TILE_K == 0 or K_tile < TILE_K, (
+        f"K_tile={K_tile} must be <= {TILE_K} or a multiple of {TILE_K}"
+    )
+
+    actual_tile_m = min(M_tile, TILE_M)
+    actual_tile_k = min(K_tile, TILE_K)
+    N_sub = min(TILE_N, N_tile)
+    n_sub_m = max(1, M_tile // TILE_M)
+    n_sub_k = max(1, K_tile // TILE_K)
+    n_sub_n = max(1, N_tile // N_sub) if N_tile > TILE_N else 1
+
+    # NKI nc_transpose requires dst.dtype == data.dtype (validated on gen3+).
+    # We therefore allocate the transpose-result PSUM tile with the lhs dtype
+    # (not fp32 hardcoded). When lhs and rhs differ, the transposed
+    # stationary operand is explicitly cast to the rhs (moving) dtype for
+    # nc_matmul.
+    lhs_dtype = lhs_proxy.dtype
+    rhs_dtype = rhs_proxy.dtype
+    matmul_dtype_str = env.backend.dtype_str(rhs_dtype)
+    transpose_dtype_str = env.backend.dtype_str(lhs_dtype)
+    need_cast_after_transpose = lhs_dtype != rhs_dtype
+
+    lhs_name = ast.unparse(lhs_ast)
+    rhs_name = ast.unparse(rhs_ast)
+    device_fn = state.device_function
+
+    lhs_tile_vars = device_fn.get_tile_list_vars(lhs_name)
+    rhs_tile_vars = device_fn.get_tile_list_vars(rhs_name)
+    lhs_is_list = lhs_tile_vars is not None
+    rhs_is_list = rhs_tile_vars is not None
+    result_is_list = n_sub_m > 1
+
+    # PSUM-reuse fusion: if this hl.dot node was tagged by nki_fusion and
+    # the result is a single tile with no accumulator, skip the final
+    # PSUM→SBUF copy below and let the downstream Vector/Scalar consumer
+    # read from the PSUM buffer directly.
+    _fx_node = state.fx_node
+    _keep_in_psum = bool(
+        _fx_node is not None
+        and _fx_node.meta.get("nki_keep_in_psum", False)
+        and is_acc_none
+        and not result_is_list
+        and n_sub_n == 1
+    )
+
+    mm_result = device_fn.new_var("_nki_dot_result")
+    mm_result_tile_vars: list[str] = []
+    if result_is_list:
+        for i in range(n_sub_m):
+            rv = device_fn.new_var(f"{mm_result}_{i}")
+            mm_result_tile_vars.append(rv)
+            state.add_statement(
+                statement_from_string(
+                    f"{rv} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+        device_fn.register_tile_list(mm_result, mm_result_tile_vars)
+    elif not _keep_in_psum:
+        state.add_statement(
+            statement_from_string(
+                f"{mm_result} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+
+    sub_k_var = device_fn.new_var("_dot_sub_k")
+    lhs_t_psum = device_fn.new_var("_dot_lhs_t_psum")
+    lhs_t_sbuf = device_fn.new_var("_dot_lhs_t_sbuf")
+    lhs_t_cast = device_fn.new_var("_dot_lhs_t_cast") if need_cast_after_transpose else None
+    mm_psum = device_fn.new_var("_dot_mm_psum")
+    # stationary operand for nc_matmul: cast buffer if dtype cast needed
+    _stationary = lhs_t_cast if need_cast_after_transpose else lhs_t_sbuf
+
+    def _lhs_k_slice(m_i: int, k_expr: str) -> str:
+        if lhs_is_list:
+            assert lhs_tile_vars is not None
+            if n_sub_k > 1:
+                return (
+                    f"{lhs_tile_vars[m_i]}[0:{actual_tile_m}, "
+                    f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+                )
+            return lhs_tile_vars[m_i]
+        if n_sub_m > 1:
+            return (
+                f"{lhs_name}[{m_i} * {actual_tile_m} : ({m_i} + 1) * {actual_tile_m}, "
+                f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+            )
+        if n_sub_k > 1:
+            return f"{lhs_name}[0:{actual_tile_m}, {k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+        return lhs_name
+
+    def _rhs_ref(k_expr: str, n_expr: str) -> str:
+        if rhs_is_list:
+            assert rhs_tile_vars is not None
+            idx = int(k_expr) if k_expr.isdigit() else 0
+            if n_sub_n > 1:
+                return (
+                    f"{rhs_tile_vars[idx]}[0:{TILE_K}, "
+                    f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                )
+            return rhs_tile_vars[idx]
+        if n_sub_k > 1 or n_sub_n > 1:
+            return (
+                f"{rhs_name}[{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}, "
+                f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            )
+        return rhs_name
+
+    def _result_ref(m_i: int, n_expr: str) -> str:
+        if result_is_list:
+            rv = mm_result_tile_vars[m_i]
+            if n_sub_n > 1:
+                return f"{rv}[0:{actual_tile_m}, {n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            return rv
+        if n_sub_n > 1:
+            return f"{mm_result}[0:{actual_tile_m}, {n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+        return mm_result
+
+    def _emit_one_m_stripe(m_i: int, n_expr: str) -> None:
+        mm_sbuf_tmp = device_fn.new_var("_dot_sbuf_tmp")
+        state.add_statement(
+            statement_from_string(
+                f"{mm_psum} = nl.ndarray([{actual_tile_m}, {N_sub}], nl.float32, buffer=nl.psum)"
+            )
+        )
+
+        def _transpose_body(k_expr: str) -> list[ast.AST]:
+            return [
+                statement_from_string(
+                    f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.psum)"
+                ),
+                statement_from_string(
+                    f"nisa.nc_transpose(dst={lhs_t_psum}, data={_lhs_k_slice(m_i, k_expr)})"
+                ),
+                statement_from_string(
+                    f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.sbuf)"
+                ),
+                statement_from_string(
+                    f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
+                ),
+                *(
+                    [
+                        statement_from_string(
+                            f"{lhs_t_cast} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {matmul_dtype_str}, buffer=nl.sbuf)"
+                        ),
+                        statement_from_string(
+                            f"nisa.tensor_copy(dst={lhs_t_cast}, src={lhs_t_sbuf})"
+                        ),
+                    ]
+                    if need_cast_after_transpose
+                    else []
+                ),
+            ]
+
+        if n_sub_k > 1 and rhs_is_list:
+            for k_i in range(n_sub_k):
+                for stmt in _transpose_body(str(k_i)):
+                    state.add_statement(stmt)
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref(str(k_i), n_expr)})"
+                    )
+                )
+        elif n_sub_k > 1:
+            state.add_statement(
+                create(
+                    ast.For,
+                    target=create(ast.Name, id=sub_k_var, ctx=ast.Store()),
+                    iter=expr_from_string(f"nl.affine_range({n_sub_k})"),
+                    body=[
+                        *_transpose_body(sub_k_var),
+                        statement_from_string(
+                            f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref(sub_k_var, n_expr)})"
+                        ),
+                    ],
+                    orelse=[],
+                )
+            )
+        else:
+            for stmt in _transpose_body("0"):
+                state.add_statement(stmt)
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref('0', n_expr)})"
+                )
+            )
+        if _keep_in_psum:
+            # PSUM reuse: downstream Vector/Scalar consumer reads mm_psum
+            # directly, so we skip the PSUM→SBUF copies entirely.
+            return
+        state.add_statement(
+            statement_from_string(
+                f"{mm_sbuf_tmp} = nl.ndarray([{actual_tile_m}, {N_sub}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={mm_sbuf_tmp}, src={mm_psum})"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={_result_ref(m_i, n_expr)}, src={mm_sbuf_tmp})"
+            )
+        )
+
+    def _emit_all_m_stripes(n_expr: str) -> None:
+        for m_i in range(n_sub_m):
+            _emit_one_m_stripe(m_i, n_expr)
+
+    if n_sub_n > 1:
+        sub_n_var = device_fn.new_var("_dot_sub_n")
+        inner_body: list[ast.AST] = []
+        orig_stmts = state.codegen.statements_stack[-1]
+        state.codegen.statements_stack[-1] = inner_body
+        _emit_all_m_stripes(sub_n_var)
+        state.codegen.statements_stack[-1] = orig_stmts
+        state.add_statement(
+            create(
+                ast.For,
+                target=create(ast.Name, id=sub_n_var, ctx=ast.Store()),
+                iter=expr_from_string(f"nl.affine_range({n_sub_n})"),
+                body=inner_body,
+                orelse=[],
+            )
+        )
+    else:
+        _emit_all_m_stripes("0")
+
+    # Register PSUM alias so downstream Vector/Scalar ops read from PSUM.
+    if _keep_in_psum:
+        device_fn._nki_psum_aliases[mm_result] = mm_psum
+        device_fn._nki_fx_matmul_vars[_fx_node.name] = mm_result
+        device_fn._nki_sbuf_shapes[mm_result] = [actual_tile_m, N_tile]
+        device_fn._nki_sbuf_shapes[mm_psum] = [actual_tile_m, N_tile]
+
+    if is_acc_none:
+        return expr_from_string(mm_result)
+
+    assert acc_proxy is not None and isinstance(acc_proxy, FakeTensor)
+    acc_name = ast.unparse(acc_ast)
+    acc_tile_vars = device_fn.get_tile_list_vars(acc_name)
+    out_result = device_fn.new_var("_nki_dot_acc_result")
+
+    if result_is_list:
+        out_tile_vars: list[str] = []
+        for i in range(n_sub_m):
+            ov = device_fn.new_var(f"{out_result}_{i}")
+            out_tile_vars.append(ov)
+            state.add_statement(
+                statement_from_string(
+                    f"{ov} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+        for i in range(n_sub_m):
+            acc_ref = acc_tile_vars[i] if acc_tile_vars else acc_name
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={out_tile_vars[i]}, "
+                    f"data1={mm_result_tile_vars[i]}, data2={acc_ref}, op=nl.add)"
+                )
+            )
+        device_fn.register_tile_list(out_result, out_tile_vars)
+    else:
+        state.add_statement(
+            statement_from_string(
+                f"{out_result} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={out_result}, data1={mm_result}, "
+                f"data2={{acc}}, op=nl.add)",
+                acc=acc_ast,
+            )
+        )
+    return expr_from_string(out_result)
+
+

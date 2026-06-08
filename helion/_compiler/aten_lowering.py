@@ -3591,3 +3591,478 @@ def codegen_iota_nki(ctx: LoweringContext, node: Node) -> object:
     state.device_function._nki_sbuf_shapes[dst_var] = [1, length]
     state.device_function._nki_sbuf_dtypes[dst_var] = dtype_str
     return expr_from_string(dst_var)
+
+
+# --- NKI matmul helpers (referenced by the mm/addmm/bmm/baddbmm nki handlers) ---
+def _nki_copy_psum_to_sbuf(
+    state: object,
+    psum_var: str,
+    shape_str: str,
+    dtype_str: str,
+    *,
+    prefix: str = "_nki_psum_copy",
+) -> str:
+    """Allocate an SBUF tile and copy a PSUM tile into it via nisa.tensor_copy.
+
+    NKI Tensor Engine ops (nc_transpose, nc_matmul) write to PSUM.
+    All subsequent Vector Engine / ISA ops expect SBUF inputs, so every
+    PSUM result must be copied back to SBUF before further use.
+    """
+    sbuf_var = state.device_function.new_var(prefix)
+    state.add_statement(
+        statement_from_string(
+            f"{sbuf_var} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
+        )
+    )
+    state.add_statement(
+        statement_from_string(f"nisa.tensor_copy(dst={sbuf_var}, src={psum_var})")
+    )
+    return sbuf_var
+
+
+def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
+    """Generate nisa.nc_matmul for NKI backend with automatic sub-tiling.
+
+    When user tile sizes exceed hardware limits, this emits nested loops
+    that break the matmul into hardware-native sub-tiles:
+      - stationary (LHS^T): [K=128, M=128]
+      - moving (RHS):       [K=128, N<=512]
+      - result (PSUM):      [M=128, N<=512]
+
+    nc_matmul accumulates into PSUM across calls within the inner K loop,
+    so no explicit PSUM zeroing or summation is needed per sub_k iteration.
+
+    When inputs are tile lists (partition dim > 128), uses list indexing
+    to select [128,...] sub-tiles, keeping all NKI allocations within the
+    128-partition hardware limit.
+    """
+    TILE_M = 128  # stationary free dim (gemm_stationary_fmax)
+    TILE_K = 128  # partition dim (pmax)
+    TILE_N = 512  # moving free dim max (gemm_moving_fmax)
+
+    env = CompileEnvironment.current()
+    state = getattr(env, "_codegen_state", None)
+    if state is None:
+        raise exc.BackendUnsupported(
+            "nki", "nc_matmul requires active codegen state"
+        )
+
+    if with_acc:
+        acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert isinstance(acc, ast.AST)
+        lhs_node = node.args[1]
+        rhs_node = node.args[2]
+    else:
+        lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        lhs_node = node.args[0]
+        rhs_node = node.args[1]
+        acc = None
+
+    assert isinstance(lhs, ast.AST)
+    assert isinstance(rhs, ast.AST)
+
+    lhs_shape = list(lhs_node.meta["val"].size())  # [M_tile, K_tile] or [B, M_tile, K_tile]
+    rhs_shape = list(rhs_node.meta["val"].size())  # [K_tile, N_tile] or [B, K_tile, N_tile]
+
+    import sympy as _sympy
+
+    _bs_subs: dict[_sympy.Symbol, int] = {}
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+    def _to_int(s: int | torch.SymInt) -> int:
+        if isinstance(s, int):
+            return s
+        return int(s._sympy_().subs(_bs_subs))
+
+    # Squeeze leading batch dimensions (size 1) from 3D+ shapes.
+    # The SBUF operands are already 2D (load codegen flattened them),
+    # so we just need the last 2 dims for tile size computation.
+    while len(lhs_shape) > 2:
+        lhs_shape = lhs_shape[1:]
+    while len(rhs_shape) > 2:
+        rhs_shape = rhs_shape[1:]
+
+    M_tile = _to_int(lhs_shape[0])
+    K_tile = _to_int(lhs_shape[1])
+    N_tile = _to_int(rhs_shape[-1])
+
+    # Determine input dtype for nc_matmul — both operands must match.
+    # NKI nc_transpose requires dst.dtype == data.dtype (validated on gen3+).
+    # We therefore allocate the transpose-result PSUM tile with the lhs dtype
+    # (not always fp32 as before). When lhs and rhs dtypes differ, the
+    # transposed stationary operand must be explicitly cast to match the
+    # moving operand's dtype before nc_matmul.
+    lhs_dtype = lhs_node.meta["val"].dtype
+    rhs_dtype = rhs_node.meta["val"].dtype
+    matmul_dtype = rhs_dtype  # moving operand dtype; stationary will match
+    matmul_dtype_str = env.backend.dtype_str(matmul_dtype)
+    transpose_dtype_str = env.backend.dtype_str(lhs_dtype)
+    # Need an explicit cast between the transpose result and the matmul input
+    # whenever their dtypes differ (e.g. lhs fp32, rhs bf16, or vice versa).
+    need_cast_after_transpose = (lhs_dtype != matmul_dtype)
+
+    if M_tile % TILE_M != 0 and M_tile > TILE_M:
+        raise exc.BackendUnsupported("nki", f"M_tile must be <= {TILE_M} or a multiple of {TILE_M}, got {M_tile}")
+    if K_tile % TILE_K != 0 and K_tile > TILE_K:
+        raise exc.BackendUnsupported("nki", f"K_tile must be <= {TILE_K} or a multiple of {TILE_K}, got {K_tile}")
+    N_sub = min(TILE_N, N_tile)
+    if N_tile > TILE_N and N_tile % TILE_N != 0:
+        raise exc.BackendUnsupported("nki", f"N_tile must be <= {TILE_N} or a multiple of {TILE_N}, got {N_tile}")
+
+    actual_tile_m = min(M_tile, TILE_M)
+    actual_tile_k = min(K_tile, TILE_K)
+    n_sub_m = max(1, M_tile // TILE_M)
+    n_sub_k = max(1, K_tile // TILE_K)
+    n_sub_n = max(1, N_tile // N_sub)
+
+    # From here on, use actual tile sizes for all allocations and slicing
+    TILE_M = actual_tile_m
+    TILE_K = actual_tile_k
+
+    _is_transpose_mode = TILE_K > TILE_M
+    # Note: is_transpose=True causes correctness issues on some kernels;
+    # leave it at default (False) for now. matmul_split_k stays broken.
+    _nc_matmul_transpose_arg = ""
+
+    lhs_name = ast.unparse(lhs)
+    rhs_name = ast.unparse(rhs)
+
+    lhs_tile_vars = state.device_function.get_tile_list_vars(lhs_name)  # list[str] or None
+    rhs_tile_vars = state.device_function.get_tile_list_vars(rhs_name)  # list[str] or None
+    lhs_is_list = lhs_tile_vars is not None
+    rhs_is_list = rhs_tile_vars is not None
+    result_is_list = n_sub_m > 1
+
+    # PSUM-reuse fusion: if the fusion pass tagged this matmul node and the
+    # result is a single tile (no M/N sub-tiling, no bias add), skip the
+    # final PSUM→SBUF copy and expose the PSUM buffer via an alias. The
+    # single downstream Vector/Scalar consumer will read from PSUM directly.
+    _keep_in_psum = bool(
+        node.meta.get("nki_keep_in_psum", False)
+        and not result_is_list
+        and n_sub_n == 1
+        and not with_acc
+    )
+
+    # Allocate result buffer(s) in SBUF — fully unrolled, no list comprehension.
+    # Skip the SBUF allocation entirely when we're keeping the result in PSUM;
+    # consumers resolve the name through device_function._nki_psum_aliases.
+    mm_result = state.device_function.new_var("_nki_mm_result")
+    mm_result_tile_vars: list[str] = []
+    _mm_result_dtype = "nl.float32"
+    if result_is_list:
+        for i in range(n_sub_m):
+            rv = state.device_function.new_var(f"{mm_result}_{i}")
+            mm_result_tile_vars.append(rv)
+            state.add_statement(
+                statement_from_string(
+                    f"{rv} = nl.ndarray([{TILE_M}, {N_tile}], {_mm_result_dtype}, buffer=nl.sbuf)"
+                )
+            )
+        state.device_function.register_tile_list(mm_result, mm_result_tile_vars)
+    elif not _keep_in_psum:
+        state.add_statement(
+            statement_from_string(
+                f"{mm_result} = nl.ndarray([{TILE_M}, {N_tile}], {_mm_result_dtype}, buffer=nl.sbuf)"
+            )
+        )
+
+    sub_k_var = state.device_function.new_var("_sub_k")
+    lhs_t_psum = state.device_function.new_var("_lhs_t_psum")
+    lhs_t_sbuf = state.device_function.new_var("_lhs_t_sbuf")
+    lhs_t_cast = state.device_function.new_var("_lhs_t_cast") if need_cast_after_transpose else None
+    mm_psum = state.device_function.new_var("_mm_psum")
+
+    def _transpose_stmts(lhs_slice: str) -> list[ast.AST]:
+        """Generate transpose + optional cast statements for one LHS sub-tile.
+        Returns statements that leave the transposed data in lhs_t_sbuf (or
+        lhs_t_cast if a dtype cast is needed for nc_matmul compatibility).
+        The final variable name to use as stationary is _stationary_var.
+
+        nc_transpose requires dst.dtype == data.dtype, so we allocate the
+        PSUM buffer in the input dtype. When the resulting stationary dtype
+        differs from the matmul (moving) dtype, an additional tensor_copy
+        cast step produces the nc_matmul-compatible stationary tile.
+        """
+        stmts = [
+            statement_from_string(
+                f"{lhs_t_psum} = nl.ndarray([{TILE_K}, {TILE_M}], {transpose_dtype_str}, buffer=nl.psum)"
+            ),
+            statement_from_string(
+                f"nisa.nc_transpose(dst={lhs_t_psum}, data={lhs_slice})"
+            ),
+            statement_from_string(
+                f"{lhs_t_sbuf} = nl.ndarray([{TILE_K}, {TILE_M}], {transpose_dtype_str}, buffer=nl.sbuf)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
+            ),
+        ]
+        if need_cast_after_transpose:
+            # Cast transposed-input dtype to matmul's moving-operand dtype
+            # (e.g. fp32 → bf16 if lhs is fp32 but rhs is bf16).
+            stmts.extend([
+                statement_from_string(
+                    f"{lhs_t_cast} = nl.ndarray([{TILE_K}, {TILE_M}], {matmul_dtype_str}, buffer=nl.sbuf)"
+                ),
+                statement_from_string(
+                    f"nisa.tensor_copy(dst={lhs_t_cast}, src={lhs_t_sbuf})"
+                ),
+            ])
+        return stmts
+
+    # The variable name to use as the stationary operand for nc_matmul
+    _stationary_var = lhs_t_cast if need_cast_after_transpose else lhs_t_sbuf
+
+    def _lhs_ref(m_i: int) -> str:
+        """Get the concrete SBUF tile name for LHS partition index m_i."""
+        if lhs_is_list:
+            assert lhs_tile_vars is not None
+            return lhs_tile_vars[m_i]
+        return f"{lhs_name}[{m_i} * {TILE_M} : ({m_i} + 1) * {TILE_M}, 0:{K_tile}]"
+
+    def _lhs_k_slice(m_i: int, k_expr: str) -> str:
+        """Get LHS slice for partition m_i and K sub-tile k_expr."""
+        if lhs_is_list:
+            assert lhs_tile_vars is not None
+            if n_sub_k > 1:
+                return (
+                    f"{lhs_tile_vars[m_i]}[0:{TILE_M}, "
+                    f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+                )
+            return lhs_tile_vars[m_i]
+        return (
+            f"{lhs_name}[{m_i} * {TILE_M} : ({m_i} + 1) * {TILE_M}, "
+            f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+        )
+
+    def _rhs_ref(k_i: int, n_expr: str) -> str:
+        """Get RHS reference for K partition k_i and N sub-tile n_expr."""
+        if rhs_is_list:
+            assert rhs_tile_vars is not None
+            if n_sub_n > 1:
+                return (
+                    f"{rhs_tile_vars[k_i]}[0:{TILE_K}, "
+                    f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                )
+            return rhs_tile_vars[k_i]
+        return (
+            f"{rhs_name}[{k_i} * {TILE_K} : ({k_i} + 1) * {TILE_K}, "
+            f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+        )
+
+    def _result_ref(m_i: int, n_expr: str) -> str:
+        """Get result buffer reference for partition m_i."""
+        if result_is_list:
+            rv = mm_result_tile_vars[m_i]
+            if n_sub_n > 1:
+                return (
+                    f"{rv}[0:{TILE_M}, "
+                    f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                )
+            return rv
+        if n_sub_n > 1:
+            return (
+                f"{mm_result}[{m_i} * {TILE_M} : ({m_i} + 1) * {TILE_M}, "
+                f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            )
+        return mm_result
+
+    def _make_k_body_for_m(m_i: int, n_expr: str, k_expr: str) -> list[ast.AST]:
+        """Statements for one K-sub-tile within one M-stripe."""
+        stmts = _transpose_stmts(_lhs_k_slice(m_i, k_expr))
+        stmts.append(
+            statement_from_string(
+                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
+                f"moving={_rhs_ref(0, n_expr) if not rhs_is_list else _rhs_ref(0, n_expr)})"
+            ),
+        )
+        return stmts
+
+    def _make_k_body_rhs_loop(m_i: int, n_expr: str, k_expr: str) -> list[ast.AST]:
+        """Statements for one K-sub-tile, with rhs indexed by k_expr (affine loop var)."""
+        if rhs_is_list:
+            assert rhs_tile_vars is not None
+            if n_sub_n > 1:
+                rhs_ref = (
+                    f"{rhs_tile_vars[0]}[0:{TILE_K}, "  # placeholder; use k_expr below
+                    f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                )
+            else:
+                rhs_ref = rhs_tile_vars[0]
+        else:
+            rhs_ref = (
+                f"{rhs_name}[{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}, "
+                f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            )
+        stmts = _transpose_stmts(_lhs_k_slice(m_i, k_expr))
+        stmts.append(
+            statement_from_string(
+                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
+                f"moving={rhs_ref})"
+            ),
+        )
+        return stmts
+
+    def _emit_one_m_stripe(m_i: int, n_expr: str) -> None:
+        """Emit all statements for a single M-stripe (fully unrolled, no sub_m loop)."""
+        mm_sbuf_tmp = state.device_function.new_var("_mm_sbuf_tmp")
+        _psum_dtype = "nl.float32"
+        state.add_statement(
+            statement_from_string(
+                f"{mm_psum} = nl.ndarray([{TILE_M}, {N_sub}], {_psum_dtype}, buffer=nl.psum)"
+            )
+        )
+        if n_sub_k > 1 and rhs_is_list:
+            # Unroll K loop with concrete rhs tile var per iteration
+            assert rhs_tile_vars is not None
+            for k_i in range(n_sub_k):
+                if n_sub_n > 1:
+                    rhs_ref = (
+                        f"{rhs_tile_vars[k_i]}[0:{TILE_K}, "
+                        f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                    )
+                else:
+                    rhs_ref = rhs_tile_vars[k_i]
+                for s in _transpose_stmts(_lhs_k_slice(m_i, str(k_i))):
+                    state.add_statement(s)
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
+                        f"moving={rhs_ref})"
+                    )
+                )
+        elif n_sub_k > 1:
+            # rhs is not a list; use affine_range for K loop
+            k_body = _transpose_stmts(_lhs_k_slice(m_i, sub_k_var))
+            k_body.append(
+                statement_from_string(
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
+                    f"moving={_rhs_ref(sub_k_var, n_expr)})"
+                ),
+            )
+            state.add_statement(
+                create(
+                    ast.For,
+                    target=create(ast.Name, id=sub_k_var, ctx=ast.Store()),
+                    iter=expr_from_string(f"nl.affine_range({n_sub_k})"),
+                    body=k_body,
+                    orelse=[],
+                )
+            )
+        else:
+            # Single K sub-tile: inline
+            rhs_ref_0 = _rhs_ref(0, n_expr) if not rhs_is_list else (
+                rhs_tile_vars[0] if not n_sub_n > 1 else  # type: ignore[index]
+                f"{rhs_tile_vars[0]}[0:{TILE_K}, "  # type: ignore[index]
+                f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            )
+            for s in _transpose_stmts(_lhs_k_slice(m_i, '0')):
+                state.add_statement(s)
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}{_nc_matmul_transpose_arg}, "
+                    f"moving={rhs_ref_0})"
+                )
+            )
+        if _keep_in_psum:
+            # PSUM-reuse: skip the PSUM→SBUF copies and let the single
+            # downstream Vector/Scalar consumer read from mm_psum directly.
+            # The alias registration below happens once, after all stripes.
+            return
+        state.add_statement(
+            statement_from_string(
+                f"{mm_sbuf_tmp} = nl.ndarray([{TILE_M}, {N_sub}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={mm_sbuf_tmp}, src={mm_psum})"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={_result_ref(m_i, n_expr)}, src={mm_sbuf_tmp})"
+            )
+        )
+
+    def _emit_all_m_stripes(n_expr: str) -> None:
+        for m_i in range(n_sub_m):
+            _emit_one_m_stripe(m_i, n_expr)
+
+    if n_sub_n > 1:
+        sub_n_var = state.device_function.new_var("_sub_n")
+        inner_body: list[ast.AST] = []
+        orig_stmts = state.codegen.statements_stack[-1]
+        state.codegen.statements_stack[-1] = inner_body
+        _emit_all_m_stripes(sub_n_var)
+        state.codegen.statements_stack[-1] = orig_stmts
+        state.add_statement(
+            create(
+                ast.For,
+                target=create(ast.Name, id=sub_n_var, ctx=ast.Store()),
+                iter=expr_from_string(f"nl.affine_range({n_sub_n})"),
+                body=inner_body,
+                orelse=[],
+            )
+        )
+    else:
+        _emit_all_m_stripes("0")
+
+    # If this matmul was tagged for PSUM reuse, register the alias so
+    # downstream Vector/Scalar consumers read from PSUM instead of SBUF.
+    if _keep_in_psum:
+        state.device_function._nki_psum_aliases[mm_result] = mm_psum
+        state.device_function._nki_fx_matmul_vars[node.name] = mm_result
+        # Register the shape under BOTH the SBUF virtual name and the PSUM
+        # name so shape lookups succeed whether the consumer sees the
+        # original operand or the alias-resolved PSUM name.
+        state.device_function._nki_sbuf_shapes[mm_result] = [TILE_M, N_tile]
+        state.device_function._nki_sbuf_shapes[mm_psum] = [TILE_M, N_tile]
+
+    if not with_acc:
+        return expr_from_string(mm_result)
+
+    # addmm: add bias + mm result → output, fully unrolled
+    assert acc is not None
+    acc_name = ast.unparse(acc)
+    acc_tile_vars = state.device_function.get_tile_list_vars(acc_name)
+    out_result = state.device_function.new_var("_nki_addmm_result")
+
+    if result_is_list:
+        out_tile_vars: list[str] = []
+        for i in range(n_sub_m):
+            ov = state.device_function.new_var(f"{out_result}_{i}")
+            out_tile_vars.append(ov)
+            state.add_statement(
+                statement_from_string(
+                    f"{ov} = nl.ndarray([{TILE_M}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+        for i in range(n_sub_m):
+            acc_ref = acc_tile_vars[i] if acc_tile_vars else acc_name
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={out_tile_vars[i]}, "
+                    f"data1={mm_result_tile_vars[i]}, data2={acc_ref}, op=nl.add)"
+                )
+            )
+        state.device_function.register_tile_list(out_result, out_tile_vars)
+    else:
+        state.add_statement(
+            statement_from_string(
+                f"{out_result} = nl.ndarray([{M_tile}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={out_result}, data1={mm_result}, "
+                f"data2={{acc}}, op=nl.add)",
+                acc=acc,
+            )
+        )
+    return expr_from_string(out_result)
+
+

@@ -61,3 +61,13 @@ def _(state: CodegenState) -> object:
 def _() -> None:
     # No-op in ref/interpret mode
     return None
+
+
+# --- NKI codegen (ported from fix-nki-kernel-compilation) ---
+@_decorators.codegen(barrier, "nki")
+def _(state: CodegenState) -> object:
+    # NKI lowering currently emits a single kernel with sequential top-level
+    # phases, so the barrier is represented by the host/device loop ordering.
+    return expr_from_string("None")
+
+

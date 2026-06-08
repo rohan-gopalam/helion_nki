@@ -314,3 +314,14 @@ def _(state: CodegenState) -> ast.AST:
 def _(tensor0: torch.Tensor, tensor1: torch.Tensor) -> torch.Tensor:
     left, right = torch.broadcast_tensors(tensor0, tensor1)
     return torch.stack((left, right), dim=-1)
+
+
+# --- NKI codegen (ported from fix-nki-kernel-compilation) ---
+@_decorators.codegen(subscript, "nki")
+def _(state: CodegenState) -> ast.AST:
+    # NKI tensors are already 2D (partition, free).
+    # Subscripts like [:, None] and [None, :] are no-ops since NKI
+    # handles broadcasting via partition/free axis semantics.
+    return state.ast_arg(0)
+
+

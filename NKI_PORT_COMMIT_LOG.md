@@ -562,3 +562,27 @@ def k(x, *, _launcher=_default_nki_launcher): ...
 **Verification (gate passed):** parses; 6 helpers import; `nki` in `load._codegen` and `store._codegen`;
 **NO Triton/`tl.` leakage**; full kernel has `@nki.jit`, `nl.affine_range`, `nisa.iota`, 2× `nisa.dma_copy`,
 bounds guard, and the host launcher. `import helion` OK.
+
+## P1.18 — language op codegens + P1.14 fix (_nki_dot helpers)
+
+**Files:** `matmul_ops.py`, `scan_ops.py`, `_tracing_ops.py`, `random_ops.py`, `barrier.py`, `view_ops.py`,
+and a fix to `aten_lowering.py`.
+
+**Applied (all purely additive):**
+- 4 single-hunk files (matmul_ops/scan_ops/barrier/view_ops): appended their `@_decorators.codegen(<op>,"nki")`
+  blocks (327/213/7/8 lines) at EOF (position-independent decorator registration).
+- `_tracing_ops.py` (2 hunks): inserted the `@codegen(_mask_to,"nki")` codegen (106 lines, masked-fill via
+  tensor_copy_predicated) before `@get_masked_value(_mask_to)`; added the tile-list handling in `_new_var`'s
+  codegen (`get_tile_list_vars`→`register_tile_list`).
+- `random_ops.py` (2 hunks): added `import ast` + `expr_from_string`/`statement_from_string` imports; inserted
+  the `@codegen(rand,"nki")` codegen (72 lines, nl.rand + seed setup) before `@get_masked_value(rand)`.
+
+**P1.14 GAP FIXED (caught by matmul smoke):** The mm/addmm/bmm/baddbmm nki handlers call `_nki_dot`, a
+standalone (non-decorated) helper at reference aten_lowering L1291, plus `_nki_copy_psum_to_sbuf` (L1265).
+My P1.14 extraction only grabbed the `@register_codegen` blocks and missed these two helpers. Appended both
+(472 lines, L1265-1736) to aten_lowering.py. Matmul codegen now works.
+
+**Verification (gate passed):** all 6 language files parse; nki codegen registered on
+dot/_associative_scan/_mask_to/rand/barrier/subscript; `_nki_dot`+`_nki_copy_psum_to_sbuf` present;
+**matmul kernel now generates `nc_matmul` with zero Triton leakage**; copy kernel still generates; `import
+helion` OK.

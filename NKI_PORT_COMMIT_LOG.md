@@ -397,3 +397,18 @@ silu pop present; module AST-parses; `import helion` OK.
 elsewhere → inert); `cast_expr`/`full_expr`/`is_indexed_reduction`/`reduction_combine_expr` resolve;
 `import helion` OK; end-to-end smoke still fails at the SAME expected boundary (missing `load` codegen,
 P1.17) — no reduction-wiring regression.
+
+## P1.13 — creation_ops.py: NKI full() memset/transpose (guide-omitted; ~150 lines)
+
+**File:** `helion/language/creation_ops.py`
+
+**What & why:** Added an NKI branch at the top of `_full_codegen` (after `backend=`) that emits the NKI
+two-line `hl.full` pattern: `var = nl.ndarray(...)` then `nisa.memset(var, value=...)`, instead of the
+single `full_expr`. Gated by `getattr(backend,"full_memset_stmt",None)` (None for non-NKI → inert, like
+P1.12). Includes the accumulator-layout transpose heuristic (scans device_ir for reduction ops to decide
+whether a `[1,N]` full should be allocated `[N,1]`) and `_nki_sbuf_shapes` registration with block-size
+resolution. Returns early for NKI; upstream's literal/dynamic `full_expr` path is untouched for other
+backends. Added the `statement_from_string` import (was absent). Upstream's `_full_codegen` matched the
+reference's pre-edit form exactly, and `_full_codegen_pallas` is a separate variant (no conflict).
+
+**Verification (gate passed):** module AST-parses; `full` imports; `import helion` OK.

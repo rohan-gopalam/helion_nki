@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from .._compiler.ast_extension import expr_from_string
+from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from ..exc import NotInsideKernel
 from . import _decorators
@@ -132,7 +133,154 @@ def _full_codegen(state: CodegenState) -> ast.AST:
     fake_value = state.fake_value
     assert isinstance(fake_value, torch.Tensor)
     shape_dims = state.device_function.tile_strategy.shape_dims(fake_value.size())
-    backend = CompileEnvironment.current().backend
+    env = CompileEnvironment.current()
+    backend = env.backend
+
+    # NKI two-line pattern: ndarray then nisa.memset(dst, value=...)
+    nki_memset = getattr(backend, "full_memset_stmt", None)
+    if nki_memset is not None and shape_dims:
+        # 2D accumulator layout normalization for NKI. ``hl.full([1, N])``
+        # inside a tile loop is almost always a reduction accumulator
+        # (per-row scalars); reductions with keepdim=True produce [N, 1]
+        # SBUF layout. Transpose the allocation to [N, 1] so element-wise
+        # ops line up without a numpy-broadcast to [N, N].
+        #
+        # More aggressive guard: fire when users include a REDUCTION op
+        # (amax/amin/sum/mean/etc) which produces [N, 1] that we'd want
+        # to combine with this accumulator. Pure [1, N] broadcast vectors
+        # (e.g. bias for matmul) don't see reduction users.
+        fx_node = state.fx_node
+        if fx_node is not None and backend.name == "nki" and len(shape_dims) == 2:
+            try:
+                resolved = [int(d) for d in shape_dims]
+            except (TypeError, ValueError):
+                resolved = None
+            if resolved is not None and resolved[0] == 1 and resolved[1] > 1:
+                # Heuristic: if this hl.full is combined with a reduction
+                # result (amax/amin/sum/mean) anywhere in the kernel body
+                # (possibly in a nested _for_loop / _if subgraph), the
+                # reduction's SBUF layout will be [N, 1]. Scan the ENTIRE
+                # device_ir for reduction ops whose dim=-1 reduction target
+                # produces a [N] vector that would combine with our full.
+                _reduction_ops = (
+                    "amax", "amin", "max_dim", "min_dim",
+                    "sum.dim_intlist", "mean.dim",
+                )
+                transpose = False
+                try:
+                    from .._compiler.host_function import HostFunction as _HF
+                    import sympy as _sp_r
+                    device_ir = _HF.current().device_ir
+                    env = CompileEnvironment.current()
+                    _bs_subs: dict[_sp_r.Symbol, int] = {}
+                    if state.config is not None:
+                        for _bs in env.block_sizes:
+                            _cfg = _bs.from_config(state.config)
+                            if isinstance(_cfg, int):
+                                _bs_subs[_bs.symbol()] = _cfg
+                    for ginfo in device_ir.graphs:
+                        g = ginfo.graph
+                        for n in g.nodes:
+                            if n.op != "call_function":
+                                continue
+                            t_name = str(getattr(n.target, "__name__", n.target)).lower()
+                            if not any(r in t_name for r in _reduction_ops):
+                                continue
+                            # Resolve symbolic shape to concrete ints via
+                            # block-size substitution so we can compare
+                            # against resolved[1] (our N).
+                            val = n.meta.get("val")
+                            if not isinstance(val, torch.Tensor):
+                                continue
+                            import sympy as _sp_r
+                            vs: list[int] = []
+                            for d in val.shape:
+                                if isinstance(d, int):
+                                    vs.append(d)
+                                elif isinstance(d, torch.SymInt):
+                                    try:
+                                        vs.append(int(d._sympy_().subs(_bs_subs)))
+                                    except Exception:
+                                        try:
+                                            vs.append(env.size_hint(d))
+                                        except Exception:
+                                            vs.append(-1)
+                                else:
+                                    vs.append(-1)
+                            # If the reduction result is already the same
+                            # logical row tile as this accumulator ([1, N]),
+                            # keep the accumulator row-major.  Partition-axis
+                            # NKI reductions produce exactly this layout; the
+                            # old blanket transpose to [N, 1] caused later
+                            # binary ops to over-broadcast [N, 1] x [1, N].
+                            if (
+                                len(vs) == 2
+                                and resolved[0] == 1
+                                and vs[0] == 1
+                                and vs[1] == resolved[1]
+                            ):
+                                continue
+                            if resolved[1] in vs:
+                                transpose = True
+                                break
+                        if transpose:
+                            break
+                except Exception:
+                    pass
+
+                if transpose:
+                    shape_dims = [shape_dims[1], shape_dims[0]]
+
+        var = state.device_function.new_var("_nki_full", dce=True)
+        ndarray_expr = backend.full_expr(shape_dims, "0", fake_value.dtype)
+        state.add_statement(statement_from_string(f"{var} = {ndarray_expr}"))
+        proxy_value = state.proxy_arg(1)
+        if isinstance(proxy_value, (int, float, bool)):
+            value_str = state.device_function.literal_expr(proxy_value)
+            state.add_statement(statement_from_string(nki_memset(var, value_str)))
+        else:
+            value_ast = state.ast_arg(1)
+            state.add_statement(
+                statement_from_string(nki_memset(var, "{val}"), val=value_ast)
+            )
+        # Register SBUF shape for multi-user detection on copy vars
+        if hasattr(state.device_function, "_nki_sbuf_shapes"):
+
+            def _resolve_nki_shape_dim(dim: object) -> int:
+                if isinstance(dim, int):
+                    return dim
+                if isinstance(dim, torch.SymInt):
+                    import sympy as _sp_shape
+
+                    _shape_subs: dict[_sp_shape.Symbol, int] = {}
+                    if state.config is not None:
+                        for _bs_shape in env.block_sizes:
+                            _cfg_shape = _bs_shape.from_config(state.config)
+                            if isinstance(_cfg_shape, int):
+                                _shape_subs[_bs_shape.symbol()] = _cfg_shape
+                    return int(dim._sympy_().subs(_shape_subs))
+                if isinstance(dim, str):
+                    for (
+                        block_id,
+                    ), var_name in state.device_function.block_size_var_cache.items():
+                        if var_name == dim:
+                            return int(
+                                env.block_sizes[block_id].from_config_assert(
+                                    state.config
+                                )
+                            )
+                    return int(dim)
+                return int(dim)
+
+            try:
+                resolved = [_resolve_nki_shape_dim(d) for d in shape_dims]
+                if len(resolved) == 1:
+                    resolved.append(1)  # full_expr adds trailing 1 for 1D
+                if len(resolved) >= 2:
+                    state.device_function._nki_sbuf_shapes[var] = resolved
+            except (TypeError, ValueError):
+                pass
+        return expr_from_string(var)
 
     # Check if the value is static (literal) or dynamic (node)
     proxy_value = state.proxy_arg(1)

@@ -23,3 +23,23 @@ gate passes.
 - Working tree clean apart from the two planning docs.
 
 ---
+
+## P1.1 — Copy NKI-only support files
+
+**Files:** `helion/_compiler/nki_fusion.py` (NEW), `helion/language/_nki_dim_access.py` (NEW)
+
+**What & why:** Copied both verbatim from the reference via `git checkout fix-nki-kernel-compilation -- …`
+(no manual edits). These have no upstream equivalent, so there is no conflict surface.
+- `_nki_dim_access.py` defines the `DimAccess` hierarchy (Contiguous/Scalar/Indirect/Dynamic/FullSlice/StridedGather)
+  plus the `IndirectAP`/`DynamicAP` dataclasses (the post-sentinel-refactor representation) used by
+  `memory_ops.py` and `atomic_ops.py` load/store codegen.
+- `nki_fusion.py` provides the FX-graph fusion passes (`annotate_psum_reuse`, `annotate_tensor_scalar_reduce`,
+  `annotate_activation_reduce`, `annotate_fx_graph`) that mark matmul→activation patterns for PSUM reuse.
+  Its `matmul_ops` import is lazy (inside a function body) so no circular import at load time.
+
+**Verification (gate passed):**
+- `git diff fix-nki-kernel-compilation -- <both files>` → empty (byte-identical to reference).
+- `from helion._compiler.nki_fusion import annotate_fx_graph; from helion.language._nki_dim_access import DimAccess, IndirectAP, DynamicAP` → OK.
+- Regression: `import helion` still OK; backends unchanged `['triton','pallas','cute','tileir','metal']` (nki not yet registered — correct, that's P1.5/P1.6).
+
+**Deviations/follow-ups:** none.

@@ -586,3 +586,16 @@ My P1.14 extraction only grabbed the `@register_codegen` blocks and missed these
 dot/_associative_scan/_mask_to/rand/barrier/subscript; `_nki_dot`+`_nki_copy_psum_to_sbuf` present;
 **matmul kernel now generates `nc_matmul` with zero Triton leakage**; copy kernel still generates; `import
 helion` OK.
+
+## P1.19 — atomic_ops.py: NKI atomic_add codegen
+
+**File:** `helion/language/atomic_ops.py`
+
+**What & why:** Added `from ._nki_dim_access import IndirectAP` import + appended the
+`@_decorators.codegen(atomic_add, "nki")` handler (363 lines). The handler builds synthetic load/store
+states and calls `load._codegen["nki"](load_state)` and `store._codegen["nki"](store_state)` for the
+read-modify-write — which is why P1.17 (memory_ops) STRICTLY precedes this step (those KeyError otherwise).
+Purely additive (+349/-0).
+
+**Verification (gate passed):** parses; `nki` in `atomic_add._codegen`; `load`/`store` nki codegen present
+(dependency satisfied); copy + matmul kernels still generate; `import helion` OK.

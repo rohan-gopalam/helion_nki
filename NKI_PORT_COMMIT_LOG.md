@@ -168,3 +168,20 @@ renamed/reorganized it to **`TensorType.propagate_setitem`** (L429). The Callabl
 `size_hint` has the `hinted_expr` fallback; module AST-parses; `import helion` OK.
 
 **Open follow-up:** ensure P1.6 adds `NKIBackend.static_rdim_size(numel) -> numel`.
+
+## P1.5 — backend_registry.py: lazy _maybe_register_nki hook
+
+**File:** `helion/_compiler/backend_registry.py` (existing file; appended after the builtin-register loop).
+
+**What & why:** NKI is an optional plugin. Added `_maybe_register_nki()` which imports `nki_backend`
+(side-effect: that module calls `register_compiler_backend(NKIBackend)` at load). The import is lazy/guarded
+so on a non-Trainium box (no torch_xla) NKI is simply absent rather than breaking `import helion`. Did NOT
+touch `_BUILTIN_BACKENDS` — NKI is not a builtin; it self-registers on import.
+
+**Dev-time choice:** the except clause is intentionally widened to also catch non-ImportError (SyntaxError,
+circular import) and log a warning, so a broken `nki_backend.py` surfaces instead of silently leaving NKI
+unregistered. To be narrowed to `except ImportError` once nki_backend.py is stable (tracked for post-P1.6).
+
+**Verification (gate passed):** `nki_backend.py` does not exist yet, so `'nki' not in list_backends()` and
+`import helion` still works (ImportError swallowed). `_maybe_register_nki()` is idempotent. backends =
+`['triton','pallas','cute','tileir','metal']` (nki appears only after P1.6).

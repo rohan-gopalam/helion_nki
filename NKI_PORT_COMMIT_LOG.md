@@ -949,3 +949,24 @@ nvfp4_gemm. fused_linear_jsd unexpectedly PASSES (bonus).
 All fixes were minimal, hardware-verified, and confirmed not to regress the passing set, per the
 "minimal changes / don't break working kernels" directive. Deeper regressions left precisely diagnosed and
 tracked rather than risk-fixed blind.
+
+## P2 FINAL — authoritative full hardware sweep (all fixes in)
+
+`HW SWEEP (2130s)`: **38 PASS**, 8 fail (non-blocked), 3 blocked-as-expected (mamba2_chunk_scan,
+mamba2_chunk_state, nvfp4_gemm), 2 blocked-but-PASSED (fused_linear_jsd, grpo_loss — bonus).
+
+**38 PASS:** add aot_example attention batch_softmax bf16xint16_gemm blackwell_attention bmm broadcast_matmul
+concatenate cross_entropy embedding exp fp8_gemm fused_nki_ops gather_gemv geglu grouped_gemm jagged_dense_add
+jagged_layer_norm jagged_mean jagged_softmax jagged_sum jsd kl_div layer_norm layer_norm_f32 matmul
+matmul_layernorm matmul_split_k moe_matmul_ogs psum_reuse_minimal segment_reduction softmax softmax_decomposed
+squeeze_and_excitation_net sum swiglu welford
+
+**Net this session: 32 → 38 PASS (+6), 0 regressions to the passing set.** Confirmed holding on the full
+sweep: concatenate, jagged_mean (where fix); fused_nki_ops, jagged_layer_norm, jagged_sum (import/shim/.values
+fix); layer_norm (block_id-recovery fix).
+
+**8 remaining fails:**
+- Pre-existing (fail on reference too): gdn_fwd_h, int4_gemm, jagged_hstu_attn, psum_reuse_test (harness).
+- Open regressions (diagnosed, tasks #4/#5): long_sum, low_mem_dropout, rms_norm, split_k_barrier.
+
+This is the authoritative Phase-2 end state for the autonomous session.

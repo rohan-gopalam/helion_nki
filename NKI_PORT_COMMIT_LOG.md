@@ -1061,3 +1061,11 @@ untouched):**
 **Verification:** rms_norm sim_sweep PASS with **0 "search failed" fallbacks** (was 4 before); standalone
 autotune at quick AND full effort runs to completion (`RAN OK`) with default fork precompile. Regression
 spot check: cross_entropy/sum still PASS. No codegen touched → parity baseline intact.
+
+## split_k_barrier (#6) — FIXED by the same get_num_sm cpu branch (commit 12bfbc5b)
+
+split_k_barrier uses `pid_type="persistent_blocked"`, whose codegen emits
+`helion.runtime.get_num_sm(<device>)` into the kernel (program_id.py:771). On NKI's
+cpu-typed XLA device this hit the same `AssertionError: TODO: implement for other devices`
+as rms_norm failure #2. The `get_num_sm` cpu branch (returns torch.get_num_threads())
+resolves it — no separate change needed. Verified: split_k_barrier sim_sweep PASS.

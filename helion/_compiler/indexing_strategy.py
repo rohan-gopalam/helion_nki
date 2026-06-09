@@ -976,12 +976,12 @@ class SubscriptIndexing(NamedTuple):
                 if slice_size != 1:
                     if (
                         isinstance(slice_size, int)
-                        and not env.backend.pad_factory_tensors_to_power_of_2
+                        and env.backend.preserve_concrete_slice_dims
                     ):
-                        # On backends that don't pad factory ops to
-                        # power-of-2, keep concrete dims concrete so shape
-                        # inference can prove equality with concretely-sized
-                        # buffers (matches _device_indexing_size).
+                        # On backends that preserve concrete slice dims, keep
+                        # concrete dims concrete so shape inference can prove
+                        # equality with concretely-sized buffers (matches
+                        # _device_indexing_size).
                         output_size.append(slice_size)
                     else:
                         rdim = env.allocate_reduction_dimension(slice_size)

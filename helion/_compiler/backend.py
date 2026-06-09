@@ -110,6 +110,20 @@ class Backend(abc.ABC):
         return True
 
     @property
+    def preserve_concrete_slice_dims(self) -> bool:
+        """Whether a slice with a concrete int size (e.g. ``x[tile, :]`` over a
+        statically-sized axis) should keep that concrete int as its output
+        dim instead of allocating a reduction-dimension block for it.
+
+        Pallas sets this True so shape inference can prove equality with other
+        concretely-sized buffers (host-allocated accumulators via ``new_zeros``).
+        Other backends (Triton/CuTe/Metal/NKI) leave this False so the axis is
+        bound to a reduction-dim block, which is what lets reduction rolling
+        tile a ``[..., :].sum(-1)`` load inside its ``reduction_loops`` loop.
+        """
+        return False
+
+    @property
     def codegen_name(self) -> str:
         """Backend name used to look up registered codegen functions."""
         return self.name
@@ -1475,6 +1489,10 @@ class PallasBackend(Backend):
     @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         return False
+
+    @property
+    def preserve_concrete_slice_dims(self) -> bool:
+        return True
 
     def max_reduction_threads(self) -> int | None:
         return None

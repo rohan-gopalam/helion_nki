@@ -985,3 +985,47 @@ INSIDE the reduction loop scope). This is a device_ir graph-traversal / two-pass
 port the load node is codegen'd outside the ReductionLoopGraphInfo's add_device_loop scope. Fixing it means
 changing reduction-graph traversal/ordering — HIGH RISK to the 38 passing (reduction-heavy) kernels, so
 DEFERRED with full diagnosis rather than risk a regression (per the minimal-change directive).
+
+## long_sum (#4) — FIXED (the ordering theory above was a SYMPTOM, not the cause)
+
+Re-debugged manually (gen codegen for all 3 variants on port vs ref worktree, with a probe in
+`ReductionRoller.process`). The real divergence is in TYPE PROPAGATION, upstream of roll_reduction:
+
+- The `x[tile_m, :]` load's reduction-axis fake shape was `(u0, 130000)` on the port but `(u0, u1)` on
+  the reference. With a concrete `130000`, `get_block_id(130000)` is `None`, so
+  `ReductionRoller.should_go_in_inner_graph(load)` returns False → the load stays in the OUTER graph at
+  full width (SBUF overflow / dst≠src), instead of being rolled into the tiled reduction loop. The
+  "load codegen'd before add_device_loop" probe was just the downstream effect of the load living in the
+  outer graph.
+- Cause: `type_info.py` `TensorType._getitem` (and the mirror in `indexing_strategy.py SubscriptIndexing`)
+  had an upstream Pallas block (PR #2477 "[Pallas] Disable factory padding and preserve concrete dims")
+  that, for `not pad_factory_tensors_to_power_of_2`, keeps a concrete-int slice dim concrete and SKIPS
+  `allocate_reduction_dimension`. NKI overrides `pad_factory_tensors_to_power_of_2=False` (for the
+  factory-pad behavior it genuinely needs) and so got swept into the Pallas concrete-dim path it does
+  NOT want. The reference (commit 3056e85c) predates PR #2477 entirely and always allocates the rdim.
+
+**Fix (minimal, 3 files):** decoupled the two conflated behaviors. New `Backend.preserve_concrete_slice_dims`
+property (default `False`), overridden `True` only in `PallasBackend`. The two slice-dim-allocation sites
+(`type_info.py` + `indexing_strategy.py`) now key off `preserve_concrete_slice_dims` instead of
+`not pad_factory_tensors_to_power_of_2`. The factory-padding sites (`type_propagation.py:907`
+patch_tensor_factories guard, `kernel_compiler.py:154`) are UNCHANGED and still key off
+`pad_factory_tensors_to_power_of_2`. Truth table: Triton/CuTe/Metal default False (already allocated rdim
+→ byte-identical); Pallas True (preserves concrete dims → byte-identical); NKI now False (allocates rdim →
+restores reference behavior).
+
+**Verification:**
+- Codegen-parity sweep after fix: 48 identical to ref, 0 differ, 0 cosmetic, 0 port-error regressions
+  (long_sum now in the identical set).
+- Pre-fix vs post-fix port codegen diff across all 48 captured examples: only long_sum's behavior changed;
+  every other kernel byte-IDENTICAL (layer_norm_manual_nki "change" was NCCL log noise, a both-error kernel).
+- CPU-sim (HELION_NKI_SIMULATE=1): long_sum PASSES all 3 variants (naive/loop/manual). The port's
+  run_example codegen for the looped variant is byte-identical to the reference — same content-hashed cache
+  filename `ccs7fosz5...`. Reduction-heavy spot check (cross_entropy/softmax/sum/welford) all PASS.
+- Full sim sweep: long_sum PASS; the 14 sim-FAILs are all pre-existing (byte-unchanged by the fix:
+  matmul/jsd/kl_div/jagged_*/int4_gemm/low_mem_dropout confirmed IDENTICAL pre/post) — sim is stricter than
+  hardware; hardware remains authoritative for those.
+
+NOTE: the port's `examples/long_sum.py` is still the upstream/Triton version (`reduction_loops=[None]`,
+`32768`, `check(4, 130000)`); like all port example files it is intentionally NOT NKI-adapted — the
+harness runs the port compiler against the NKI-adapted `/tmp/ref_wt/examples`. The compiler fix is the fix;
+no example file was changed (would be a lone inconsistent artifact among 50+ unadapted examples).

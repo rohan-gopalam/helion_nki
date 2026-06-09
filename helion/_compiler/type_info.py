@@ -368,16 +368,16 @@ class TensorType(TypeInfo):
                         ):
                             output_sizes.append(output_size)
                             continue
-                    # On backends that don't pad factory ops to power-of-2,
-                    # concrete int dims must stay concrete so subsequent shape
-                    # inference can prove equality with other concretely-sized
-                    # buffers (e.g. host-allocated accumulators via new_zeros).
+                    # On backends that preserve concrete slice dims, a concrete
+                    # int dim must stay concrete so subsequent shape inference
+                    # can prove equality with other concretely-sized buffers
+                    # (e.g. host-allocated accumulators via new_zeros).
                     # Allocating a reduction-dim block here would introduce a
                     # fresh unbacked symbol that does not unify with the int
                     # even when the hint matches.
                     if (
                         isinstance(output_size, int)
-                        and not env.backend.pad_factory_tensors_to_power_of_2
+                        and env.backend.preserve_concrete_slice_dims
                     ):
                         output_sizes.append(output_size)
                         continue

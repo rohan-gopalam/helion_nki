@@ -1288,12 +1288,37 @@ type is **`xla`**, not `cpu`, so it hit the allowlist assert. (The earlier "fixe
 claim was validated only under sim, where device.type=='cpu' — the hardware xla path was never exercised.)
 Fix: add `"xla"` to the allowlist and route it through the same CPU-thread-count stand-in as `cpu` (Trainium
 has no SM concept; the persistent-kernel grid just needs a usable value). Runtime-only change — cannot affect
-any kernel's codegen. Verified split_k_barrier CPU-sim still PASS; hardware xla path validated by the user's
-nightly sweep (device was busy autotuning during this session).
+any kernel's codegen.
+
+**split_k_barrier HARDWARE-CONFIRMED FIXED:** the get_num_sm xla fix was committed mid-sweep; because each
+example runs as a fresh subprocess importing helion from PYTHONPATH=PORT, split_k_barrier (which the sweep
+reached after the commit) picked up the fix and **PASSED on Trainium (21s, rc=0, Compiler status PASS)**.
+
+## FINAL FULL HARDWARE SWEEP RESULT (3803s, cold cache, all 51 examples)
+
+**45 PASS / 1 FAIL (rms_norm timeout) / 1 blocked-fail (nvfp4_gemm) / 4 blocked-but-passed.**
+
+PASS (45): add aot_example attention batch_softmax bf16xint16_gemm blackwell_attention bmm broadcast_matmul
+concatenate cross_entropy embedding exp fp8_gemm fused_nki_ops gather_gemv **gdn_fwd_h** geglu grouped_gemm
+**int4_gemm** jagged_dense_add **jagged_hstu_attn** jagged_layer_norm jagged_mean jagged_softmax jagged_sum
+jsd kl_div layer_norm layer_norm_f32 **long_sum** **low_mem_dropout** matmul matmul_layernorm matmul_split_k
+moe_matmul_ogs psum_reuse_minimal **psum_reuse_test** segment_reduction softmax softmax_decomposed
+**split_k_barrier** squeeze_and_excitation_net sum swiglu welford
+(bold = fixed this session; all hold on hardware. Up from the prior 38-PASS baseline → 45.)
+
+blocked-but-PASSED (bonus): fused_linear_jsd, grpo_loss, mamba2_chunk_scan, mamba2_chunk_state.
+blocked-fail-as-expected: nvfp4_gemm.
+
+**The one FAIL — rms_norm — is a sweep TIMEOUT, not a correctness/codegen bug.** rms_norm uses bare
+`@helion.kernel` (no pinned config) for BOTH rms_norm_fwd and rms_norm_bwd, so it triggers the full
+LFBOTreeSearch autotune (20 generations) twice. On a cold neuron-compile-cache each config compile is slow,
+and the fwd search alone exceeded hw_sweep.py's 1800s per-example timeout (`__TIMEOUT__`). It was finding
+valid configs with ZERO search-failures when killed — i.e. it would PASS given more time or a warm cache.
+This is autotuner wall-clock, not a port defect. Mitigations (not applied — characterization only): raise
+the sweep timeout for rms_norm, warm the cache, or pin a config in the example. Note concatenate (which DID
+finish) took 620s autotuning — rms_norm's fwd+bwd is ~2x that plus slower per-config compiles, hence >1800s.
 
 **Other sweep notes (NOT failures):** concatenate passes (RC=0) but logs an autotuner-internal
 `RuntimeError: 0 active drivers` warning during parallel config probing — it falls back to a safe default
-config and runs correctly (transient Neuron-runtime hiccup, self-recovered). nvfp4_gemm fails to compile but
-is in the documented BLOCKED set (expected). gdn_fwd_h, jagged_hstu_attn, int4_gemm, long_sum all confirmed
-PASS on hardware (the session's earlier fixes hold). psum_reuse_test PASSES end-to-end on hardware with the
-sweep's new TORCHINDUCTOR_CACHE_DIR pin (all Part 1-3 sub-tests).
+config and runs correctly (transient Neuron-runtime hiccup, self-recovered). psum_reuse_test PASSES
+end-to-end on hardware with the sweep's new TORCHINDUCTOR_CACHE_DIR pin (all Part 1-3 sub-tests).

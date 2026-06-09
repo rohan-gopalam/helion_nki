@@ -7170,53 +7170,58 @@ def _nki_as_uint32_p1_vector(
     if shape != [1, p_count]:
         return None
 
-    tr_psum = device_fn.new_var("_ig_tr_psum", dce=True)
     tr_sbuf = device_fn.new_var("_ig_tr_sbuf", dce=True)
     device_fn._nki_sbuf_shapes[tr_sbuf] = [p_count, 1]
     device_fn._nki_sbuf_dtypes[tr_sbuf] = "nl.uint32"
-
-    if dtype in int_dtypes or dtype == "nl.uint32":
-        cast_in = device_fn.new_var("_ig_cast_in", dce=True)
-        device_fn._nki_sbuf_shapes[cast_in] = [1, p_count]
-        device_fn._nki_sbuf_dtypes[cast_in] = "nl.float32"
-        state.codegen.add_statement(
-            statement_from_string(
-                f"{cast_in} = nl.ndarray([1, {p_count}], nl.float32, buffer=nl.sbuf)"
-            )
-        )
-        state.codegen.add_statement(
-            statement_from_string(
-                f"nisa.activation(dst={cast_in}, op=nl.copy, data={name})"
-            )
-        )
-        state.codegen.add_statement(
-            statement_from_string(
-                f"{tr_psum} = nl.ndarray([{p_count}, 1], nl.float32, buffer=nl.psum)"
-            )
-        )
-        state.codegen.add_statement(
-            statement_from_string(f"nisa.nc_transpose(dst={tr_psum}, data={cast_in})")
-        )
-    else:
-        state.codegen.add_statement(
-            statement_from_string(
-                f"{tr_psum} = nl.ndarray([{p_count}, 1], {dtype}, buffer=nl.psum)"
-            )
-        )
-        state.codegen.add_statement(
-            statement_from_string(f"nisa.nc_transpose(dst={tr_psum}, data={name})")
-        )
-
     state.codegen.add_statement(
         statement_from_string(
             f"{tr_sbuf} = nl.ndarray([{p_count}, 1], nl.uint32, buffer=nl.sbuf)"
         )
     )
-    state.codegen.add_statement(
-        statement_from_string(
-            f"nisa.tensor_scalar(dst={tr_sbuf}, data={tr_psum}, op0=nl.add, operand0=0.0)"
+
+    # nc_transpose is capped at 128 partitions, so a [1, p_count] -> [p_count, 1]
+    # transpose must be tiled into <=128-row chunks when p_count > 128 (e.g. a
+    # gather over a chunk_size=256 tile). Each chunk transposes columns
+    # [c0:c0+w] of the row vector into rows [c0:c0+w] of the destination.
+    NKI_PARTITION_MAX = 128
+    needs_cast = dtype in int_dtypes or dtype == "nl.uint32"
+    for _c0 in range(0, p_count, NKI_PARTITION_MAX):
+        _w = min(NKI_PARTITION_MAX, p_count - _c0)
+        tr_psum = device_fn.new_var("_ig_tr_psum", dce=True)
+        if needs_cast:
+            cast_in = device_fn.new_var("_ig_cast_in", dce=True)
+            device_fn._nki_sbuf_shapes[cast_in] = [1, _w]
+            device_fn._nki_sbuf_dtypes[cast_in] = "nl.float32"
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"{cast_in} = nl.ndarray([1, {_w}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"nisa.activation(dst={cast_in}, op=nl.copy, "
+                    f"data={name}[0:1, {_c0}:{_c0 + _w}])"
+                )
+            )
+            tr_src = cast_in
+            tr_dtype = "nl.float32"
+        else:
+            tr_src = f"{name}[0:1, {_c0}:{_c0 + _w}]"
+            tr_dtype = dtype
+        state.codegen.add_statement(
+            statement_from_string(
+                f"{tr_psum} = nl.ndarray([{_w}, 1], {tr_dtype}, buffer=nl.psum)"
+            )
         )
-    )
+        state.codegen.add_statement(
+            statement_from_string(f"nisa.nc_transpose(dst={tr_psum}, data={tr_src})")
+        )
+        state.codegen.add_statement(
+            statement_from_string(
+                f"nisa.tensor_scalar(dst={tr_sbuf}[{_c0}:{_c0 + _w}, 0:1], "
+                f"data={tr_psum}, op0=nl.add, operand0=0.0)"
+            )
+        )
     return tr_sbuf
 
 

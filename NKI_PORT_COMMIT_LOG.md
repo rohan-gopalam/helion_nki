@@ -1251,3 +1251,27 @@ warning. nki_backend now imports cleanly (verified: `list_backends()` includes '
 was removed — only the benign `ImportError` (torch_xla absent on non-Trainium) is swallowed; any real bug
 in nki_backend.py now propagates instead of being silently downgraded to a warning. Removed the now-unused
 local `import logging` / warning block.
+
+## Multi-size sweep — gather/scatter index transpose now tiles for p_count > 128
+
+Built a multi-size CPU-sim sweep (`/home/ubuntu/multisize_sweep.py`) running the parametrizable examples
+(attention, gdn_fwd_h, jagged_hstu_attn) at several shape points to catch shape-dependent codegen bugs the
+single-size sweeps miss. Findings:
+- attention: PASS at all 3 sizes. gdn_fwd_h: PASS at chunk_size=128 sizes.
+- jagged_hstu_attn multi-size "failures" are the SAME requires_grad harness limitation (nki.simulate can't
+  `copy_` into leaf grad tensors) — the example's test() sets requires_grad=True; not a codegen bug.
+
+**Real bug found + fixed (general):** `_nki_as_uint32_p1_vector` builds the `[P,1]` vector-offset for
+gather/scatter by `nc_transpose`-ing a `[1, P]` row of indices. `nc_transpose` is capped at 128 partitions,
+so any gather/scatter over a tile with P>128 (e.g. gdn at chunk_size=256) crashed with
+`Tensor engine transpose requires shape <= [128, 128]`. Fixed by **tiling the transpose into <=128-column
+chunks** — each chunk transposes `name[0:1, c0:c0+w]` into `tr_sbuf[c0:c0+w, 0:1]`. Verified byte-identical
+codegen for the common P<=128 path (gdn_fwd_h, jagged_hstu_attn, embedding, gather_gemv, moe_matmul_ogs) and
+P<=128 sim still PASS; the loop is single-iteration and equivalent there.
+
+**Known limitation (documented, NOT a regression):** gdn_fwd_h at **chunk_size > 128** still fails — after
+the gather-index transpose is fixed, it hits a *second* independent >128 transpose (the `torch.where`
+mask-broadcast `nc_transpose(_nki_bcast_tr_psum, _nki_where_out)` on a `[1,256]` predicate). Full
+chunk_size>128 support would require tiling every >128 transpose site (a multi-site feature the reference
+never supported — its example uses chunk_size=128). Left as a precisely-diagnosed limitation rather than a
+broad speculative change. chunk_size<=128 (all shipped configs) is unaffected.

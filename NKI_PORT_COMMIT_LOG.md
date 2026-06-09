@@ -970,3 +970,18 @@ fix); layer_norm (block_id-recovery fix).
 - Open regressions (diagnosed, tasks #4/#5): long_sum, low_mem_dropout, rms_norm, split_k_barrier.
 
 This is the authoritative Phase-2 end state for the autonomous session.
+
+## long_sum (#4) — ROOT CAUSE PINPOINTED (ordering), fix deferred
+
+Probe of add_device_loop vs load ordering on the PORT:
+```
+ORD LOAD  slice(None) bid=None active=[0]      <- load codegen'd FIRST, block 1 not yet active
+ORD ENTER add_device_loop block_ids=[1] active_before=[0]   <- reduction loop registers AFTER
+```
+So the `x[tile_m, :]` load is emitted BEFORE the reduction loop's `add_device_loop` registers block 1 →
+the reduction-block slice match (memory_ops L7690, needs `_bid in active_device_loops`) fails → loads full
+131072 width → SBUF overflow. On the reference, active_device_loops=[0,1] at the load (the load is processed
+INSIDE the reduction loop scope). This is a device_ir graph-traversal / two-pass ordering difference: on the
+port the load node is codegen'd outside the ReductionLoopGraphInfo's add_device_loop scope. Fixing it means
+changing reduction-graph traversal/ordering — HIGH RISK to the 38 passing (reduction-heavy) kernels, so
+DEFERRED with full diagnosis rather than risk a regression (per the minimal-change directive).

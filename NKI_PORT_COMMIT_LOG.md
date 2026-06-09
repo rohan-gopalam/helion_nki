@@ -1029,3 +1029,35 @@ NOTE: the port's `examples/long_sum.py` is still the upstream/Triton version (`r
 `32768`, `check(4, 130000)`); like all port example files it is intentionally NOT NKI-adapted — the
 harness runs the port compiler against the NKI-adapted `/tmp/ref_wt/examples`. The compiler fix is the fix;
 no example file was changed (would be a lone inconsistent artifact among 50+ unadapted examples).
+
+## rms_norm (#5) — FIXED (config-less autotuner was aborting; "load list index out of range" was a red herring)
+
+The real failure chain (each masked by NKIBackend.autotune's broad `except → _safe_default_config`
+fallback, so it silently "passed" on a default config and never actually autotuned):
+1. `local_cache.py _generate_key` asserts `hardware is not None and runtime_name is not None`. NKI runs on
+   XLA tensors that surface as device type `cpu`, and there was no NKI branch → empty `AssertionError` →
+   autotune aborts before trying any config.
+2. With (1) fixed, the search starts but `get_num_sm` (runtime/__init__.py) asserted device.type in
+   {cuda,xpu,mtia,mps} → `AssertionError: TODO: implement for other devices` for cpu/NKI (same TODO as
+   split_k_barrier #6 — shared root cause).
+3. With (2) fixed, the default fork/spawn autotune-precompile path is Triton-specific
+   (precompile_shim.make_precompiler drives triton.JITFunction .debug/.device_caches/.compile) →
+   `AttributeError: 'Kernel' object has no attribute 'debug'` for NKI's neuronx-cc/XLA launcher.
+4. With (3) fixed, individual invalid candidate configs (e.g. block_size 1024 > partition-dim max 128,
+   SBUF overflow, an unsupported codegen path) raised out of the search and aborted it, instead of being
+   skipped.
+
+**Fixes (4 files, all autotune-infra — ZERO codegen changes, so the 48-kernel byte-parity baseline is
+untouched):**
+- `local_cache.py`: NKI cache-key branch keyed on `get_neuron_target()` (hardware=`neuron_<target>`,
+  runtime=`<target>`), mirroring the existing Pallas `cpu` branch.
+- `runtime/__init__.py get_num_sm`: add a `cpu` branch returning `torch.get_num_threads()` (fallback
+  `os.cpu_count()`). This is the reference's exact delta. ALSO fixes split_k_barrier (#6).
+- `settings.py __init__`: when backend=="nki" and the user hasn't explicitly set HELION_AUTOTUNE_PRECOMPILE,
+  force `autotune_precompile=None` (benchmark in-process). The fork/spawn path cannot work for NKI.
+- `nki_backend.py`: implement `classify_autotune_exception` returning "debug" for any Exception (mirrors
+  PallasBackend) so invalid configs are skipped and the search keeps the configs that do compile.
+
+**Verification:** rms_norm sim_sweep PASS with **0 "search failed" fallbacks** (was 4 before); standalone
+autotune at quick AND full effort runs to completion (`RAN OK`) with default fork precompile. Regression
+spot check: cross_entropy/sum still PASS. No codegen touched → parity baseline intact.

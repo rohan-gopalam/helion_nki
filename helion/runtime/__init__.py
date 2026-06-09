@@ -129,8 +129,19 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         "xpu",
         "mtia",
         "mps",
+        "cpu",
     ], "TODO: implement for other devices"
-    if device.type == "cuda":
+    if device.type == "cpu":
+        # NKI runs on XLA tensors that surface as ``cpu`` here (and pure-CPU
+        # backends land here too). There is no SM concept; use the CPU thread
+        # count as a stand-in grid size so persistent-kernel codegen and the
+        # autotuner have a usable value instead of asserting.
+        try:
+            num_threads = int(torch.get_num_threads())
+        except Exception:
+            num_threads = 0
+        available_sms = num_threads if num_threads > 0 else int(os.cpu_count() or 1)
+    elif device.type == "cuda":
         available_sms = torch.cuda.get_device_properties(
             device.index
         ).multi_processor_count

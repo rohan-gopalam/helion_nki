@@ -6695,6 +6695,18 @@ class NKIBackend(Backend):
 
         return do_bench_generic
 
+    def classify_autotune_exception(self, err: BaseException) -> str | None:
+        # During autotuning many candidate configs are invalid for NKI (e.g. a
+        # block size whose partition dim exceeds 128, an SBUF overflow, or a
+        # config that exercises an unsupported codegen path). These are config
+        # incompatibilities, not fatal errors: the search should skip the
+        # config and keep the ones that do compile, rather than abort the whole
+        # search. Mirror the Pallas backend and treat any Exception as benign
+        # (logged at debug); only KeyboardInterrupt/SystemExit propagate.
+        if isinstance(err, Exception):
+            return "debug"
+        return None
+
     def autotune(
         self,
         bound_kernel: BoundKernel[Any],

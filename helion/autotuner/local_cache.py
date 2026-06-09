@@ -175,6 +175,18 @@ class LocalAutotuneCache(AutotuneCacheBase):
         elif dev.type == "cpu" and self.kernel.kernel.settings.backend == "pallas":
             hardware = "pallas_interpret"
             runtime_name = "interpret"
+        elif self.kernel.kernel.settings.backend == "nki":
+            # NKI runs on XLA tensors that surface as ``cpu`` here, so
+            # ``get_device_name`` returns None. Key the cache on the Neuron
+            # target (trn2/trn3/...) so the autotuner's local-cache lookup is
+            # well-formed instead of aborting on the assertion below.
+            from ..runtime.settings import get_neuron_target
+
+            neuron_target = get_neuron_target(
+                getattr(self.kernel.kernel.settings, "platform_target", None)
+            )
+            hardware = f"neuron_{neuron_target}"
+            runtime_name = neuron_target
         elif dev.type == "mtia":
             hardware = hardware or "mtia"
             try:

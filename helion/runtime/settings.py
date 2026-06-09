@@ -855,6 +855,19 @@ class Settings(_Settings):
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
 
+        # The fork/spawn autotune-precompile path is Triton-specific: it extracts
+        # a triton.JITFunction and drives its .compile()/.device_caches machinery
+        # (see runtime/precompile_shim.make_precompiler). NKI compiles via
+        # neuronx-cc/XLA, so that path raises (e.g. 'Kernel' object has no
+        # attribute 'debug'). Benchmark in-process instead unless the user has
+        # explicitly chosen a precompile mode via the env var.
+        if (
+            self.backend == "nki"
+            and self.autotune_precompile
+            and "HELION_AUTOTUNE_PRECOMPILE" not in os.environ
+        ):
+            self.autotune_precompile = None
+
         if self.autotune_best_of_k < 1:
             raise ValueError(
                 f"autotune_best_of_k must be >= 1, got {self.autotune_best_of_k!r}; "

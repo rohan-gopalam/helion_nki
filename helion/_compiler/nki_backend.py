@@ -5126,9 +5126,15 @@ class NKIOpOverrides:
             allow_tensor_tensor=True,
         )
 
-    @staticmethod
-    def lshift(a: object, b: object) -> str:
-        return NKIOpOverrides._nki_binary_op(
+    @classmethod
+    def lshift(cls, a: object, b: object) -> str:
+        # Two host scalars (e.g. the Philox seed/offset 64-bit split
+        # ``seed64 >> 32`` / ``<< 32``) are a host-side compute; emit plain
+        # Python like the other bitwise ops (and_/or_/xor) rather than an SBUF
+        # op, which _nki_binary_op rejects for both-scalar operands.
+        if cls._is_scalar_operand(a) and cls._is_scalar_operand(b):
+            return f"{a} << {b}"
+        return cls._nki_binary_op(
             a,
             b,
             op_tensor_tensor="nl.left_shift",
@@ -5136,9 +5142,11 @@ class NKIOpOverrides:
             allow_tensor_tensor=True,
         )
 
-    @staticmethod
-    def rshift(a: object, b: object) -> str:
-        return NKIOpOverrides._nki_binary_op(
+    @classmethod
+    def rshift(cls, a: object, b: object) -> str:
+        if cls._is_scalar_operand(a) and cls._is_scalar_operand(b):
+            return f"{a} >> {b}"
+        return cls._nki_binary_op(
             a,
             b,
             op_tensor_tensor="nl.right_shift",
@@ -5992,10 +6000,19 @@ class NKIBackend(Backend):
             and _no_brackets
             and src_name in getattr(state.device_function, "_nki_scalar_arg_names", set())
         )
+        # ``indices_*`` come from nisa.iota (e.g. hl.rand's tile index) and are
+        # int32 SBUF *tensors*, not scalars — they carry no _nki_sbuf_shapes
+        # entry (their extent lives in _nki_iota_block_sizes) so the integer-dtype
+        # heuristic would otherwise misclassify them and emit
+        # ``nisa.memset(dst, value=<tensor>)`` (memset needs a scalar fill).
+        _is_iota_tensor = src_name.startswith("indices_") or (
+            src_name in getattr(state.device_function, "_nki_iota_block_sizes", {})
+        )
         src_is_scalar = (
             src_tile_vars is None
             and _no_sbuf_shape
             and _no_brackets
+            and not _is_iota_tensor
             and (_is_integer_dtype or _is_numeric_literal or _is_scalar_arg)
         )
         if _is_scalar_arg:

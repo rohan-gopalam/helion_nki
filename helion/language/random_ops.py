@@ -623,7 +623,15 @@ def _random_rewrite_nodes(graph: torch.fx.Graph) -> list[Node]:
 
 
 def rewrite_implicit_random_ops(graph: torch.fx.Graph) -> None:
+    # The NKI backend lowers ``hl.rand`` natively to nisa.set_rng_seed + nl.rand
+    # (see _rand_nki_codegen). Decomposing it into the software Philox subgraph
+    # here would bypass that native lowering and emit host-scalar Philox bit
+    # math the NKI codegen can't express. Keep ``rand`` nodes intact for NKI;
+    # rand4x/randint (no native NKI codegen) still decompose.
+    _nki_native_rand = CompileEnvironment.current().backend.name == "nki"
     for node in _random_rewrite_nodes(graph):
+        if node.target is rand and _nki_native_rand:
+            continue
         if node.target is rand:
             shape_arg = node.args[0]
             descriptors, shape_desc = _shape_rewrite_desc(shape_arg)

@@ -1069,3 +1069,29 @@ split_k_barrier uses `pid_type="persistent_blocked"`, whose codegen emits
 cpu-typed XLA device this hit the same `AssertionError: TODO: implement for other devices`
 as rms_norm failure #2. The `get_num_sm` cpu branch (returns torch.get_num_threads())
 resolves it — no separate change needed. Verified: split_k_barrier sim_sweep PASS.
+
+## low_mem_dropout (#5) — FIXED (keep hl.rand native for NKI; harden Philox bit-ops)
+
+Root cause: `device_ir.lower_to_device_ir` calls `rewrite_implicit_random_ops` unconditionally,
+which decomposes `hl.rand` into the upstream software-Philox FX subgraph. For NKI that bypasses the
+native `_rand_nki_codegen` (nisa.set_rng_seed + nl.rand) lowering and emits Philox bit-math the NKI
+codegen can't express. The decomposition surfaced two NKI-codegen gaps in sequence:
+- `(seed64 >> 32)` / `<< 32` on two host scalars hit NKIOpOverrides.rshift/lshift, which (unlike
+  and_/or_/xor) had no both-host-scalar fast path → `BackendUnsupported: both operands are host scalars`.
+- the iota tile index (`indices_*`, int32, no _nki_sbuf_shapes entry) was misclassified as a host scalar
+  in the to_dtype cast → `nisa.memset(dst, value=<tensor>)` (memset needs a scalar).
+
+**Fixes (2 files, no codegen-parity impact — the 48-kernel baseline is untouched; these only affect the
+RNG-decompose path which none of the 48 exercise):**
+- `random_ops.py rewrite_implicit_random_ops`: when backend=="nki", skip decomposing `rand` nodes (keep
+  them native; rand4x/randint, which have no native NKI codegen, still decompose). This alone fixes
+  low_mem_dropout — the port now emits `nisa.set_rng_seed(_nki_seed)` + `nl.rand(...)` with ZERO Philox
+  leftovers, byte-for-byte the reference's native approach (verified on a fresh cache).
+- `nki_backend.py`: (1) lshift/rshift now emit plain Python `<<`/`>>` for two host scalars (mirrors
+  and_/or_/xor); (2) the to_dtype cast excludes `indices_*` iota tensors from the host-scalar
+  classification so they go through tensor_copy, not memset. Both are defensive — they keep the still-
+  decomposing rand4x/randint paths correct on NKI.
+
+**Verification:** low_mem_dropout sim_sweep PASS (was FAIL); fresh-cache codegen shows native
+set_rng_seed+nl.rand, 0 Philox leftovers. Regression spot check: add/cross_entropy/embedding/softmax/sum
+all PASS.

@@ -3590,6 +3590,14 @@ def codegen_iota_nki(ctx: LoweringContext, node: Node) -> object:
     )
     state.device_function._nki_sbuf_shapes[dst_var] = [1, length]
     state.device_function._nki_sbuf_dtypes[dst_var] = dtype_str
+    # Record the iota's affine start so a load that uses this iota as a column
+    # subscript can recover the true slice start. Without this, a shifted
+    # contiguous index like ``A[:, K_half + k_begin : ...]`` (which lowers to an
+    # iota with offset=K_half+k_begin) would be DMA'd from the plain block
+    # offset, dropping the K_half shift (int4_gemm a_hi bug). Only record the
+    # unit-step case — a non-unit step is not a contiguous slice.
+    if step_op == "1":
+        state.device_function._nki_iota_offsets[dst_var] = start_op
     return expr_from_string(dst_var)
 
 

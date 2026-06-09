@@ -7992,6 +7992,27 @@ def _(state: CodegenState) -> ast.AST:
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
             if tdi == 0:
                 partition_offset_var = offset_var
+            # A contiguous shifted index like ``A[:, K_half + k_begin : ...]``
+            # lowers to an iota whose affine start is ``K_half + offset_var``
+            # (recorded in _nki_iota_offsets by codegen_iota_nki), NOT the plain
+            # block offset. If this subscript is such an iota and its recorded
+            # offset differs from offset_var, slice from the iota's true start so
+            # the DMA reads the shifted columns (int4_gemm a_hi bug).
+            if isinstance(fx_node_tdi_check, torch.fx.Node):
+                _iota_ast = state.codegen.ast_for_fx_node(fx_node_tdi_check)
+                if isinstance(_iota_ast, ast.AST):
+                    _iota_nm = ast.unparse(_iota_ast)
+                    _iota_off = getattr(
+                        state.device_function, "_nki_iota_offsets", {}
+                    ).get(_iota_nm)
+                    if _iota_off is not None and _iota_off != offset_var:
+                        _shifted_iota = f"{_iota_off}:{_iota_off}+{int(block_size)}"
+                        if tdi == 0:
+                            partition_offset_var = f"({_iota_off})"
+                        slice_parts.append(_shifted_iota)
+                        used_shifted_subscript = True
+                        is_scalar_dim.append(False)
+                        continue
             # Check if the subscript FX node is a SHIFTED tile (e.g.
             # tile_k.index + tile_c.begin * chunk_size). If so, emit the
             # shifted slice instead of the plain offset:offset+block range.

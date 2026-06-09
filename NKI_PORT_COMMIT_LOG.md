@@ -1095,3 +1095,27 @@ RNG-decompose path which none of the 48 exercise):**
 **Verification:** low_mem_dropout sim_sweep PASS (was FAIL); fresh-cache codegen shows native
 set_rng_seed+nl.rand, 0 Philox leftovers. Regression spot check: add/cross_entropy/embedding/softmax/sum
 all PASS.
+
+## int4_gemm (#7, pre-existing fail on ref too) — FIXED (shifted-iota column slice dropped its offset)
+
+Symptom: compiles+runs but 95.9% numerical mismatch. Root cause: the second A load
+``a_hi = A[tile_m, K_half + k_begin : K_half + k_begin + k_packed]`` is a contiguous slice
+whose start is shifted by ``K_half``. It lowers to a ``prims.iota.default`` with
+``offset = offset_0 + K//2`` (correctly emitted as ``add_2`` into the iota), but the NKI load's
+slice-building second pass (memory_ops, block-id branch) emitted the plain
+``offset_0:offset_0+block`` for ANY block-id-resolved subscript — dropping the ``+K_half`` shift.
+So a_hi DMA'd the SAME columns as a_lo. (Verified by isolating the int4 shift-unpack in a standalone
+nki.simulate probe — that part was correct; the bug was purely the A-column slice offset.)
+
+Fix (2 files, +29 lines):
+- ``aten_lowering.codegen_iota_nki``: record the iota's affine start in ``_nki_iota_offsets[dst_var]``
+  (unit-step only — a non-unit step isn't a contiguous slice).
+- ``memory_ops`` load second pass: when a block-id-resolved free subscript is an iota whose recorded
+  offset differs from ``offset_var``, slice from the iota's true start (``add_2:add_2+block``) instead
+  of the plain block offset. Guarded on ``!= offset_var`` so the common ``tile.index`` case (offset ==
+  offset_var) is inert.
+
+Verification: int4_gemm sim PASS ("Test passed for shapes: M=128,K=512,N=256"); executed kernel shows
+``src=A[..., add_2:add_2+32]``. Regression: before/after codegen snapshot across all 49 emitting
+examples — 48 byte-identical, only layer_norm_manual_nki differs (NCCL-log/PID noise, a stderr-only
+both-error kernel). No other kernel's codegen changed.

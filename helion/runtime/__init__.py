@@ -130,12 +130,14 @@ def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
         "mtia",
         "mps",
         "cpu",
+        "xla",
     ], "TODO: implement for other devices"
-    if device.type == "cpu":
-        # NKI runs on XLA tensors that surface as ``cpu`` here (and pure-CPU
-        # backends land here too). There is no SM concept; use the CPU thread
-        # count as a stand-in grid size so persistent-kernel codegen and the
-        # autotuner have a usable value instead of asserting.
+    if device.type in ("cpu", "xla"):
+        # NKI runs on XLA tensors — ``xla`` on Trainium hardware, ``cpu`` under
+        # nki.simulate (and pure-CPU backends land here too). Trainium has no SM
+        # concept; use the CPU thread count as a stand-in grid size so
+        # persistent-kernel codegen and the autotuner have a usable value
+        # instead of asserting.
         try:
             num_threads = int(torch.get_num_threads())
         except Exception:

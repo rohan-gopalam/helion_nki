@@ -1275,3 +1275,25 @@ mask-broadcast `nc_transpose(_nki_bcast_tr_psum, _nki_where_out)` on a `[1,256]`
 chunk_size>128 support would require tiling every >128 transpose site (a multi-site feature the reference
 never supported — its example uses chunk_size=128). Left as a precisely-diagnosed limitation rather than a
 broad speculative change. chunk_size<=128 (all shipped configs) is unaffected.
+
+## Full hardware sweep — split_k_barrier get_num_sm xla branch (FIXED)
+
+Ran the full cold-cache hardware sweep (hw_sweep.py, all 51 examples, autotuning). Result: all pass except
+the documented BLOCKED set, with ONE genuine remaining failure surfaced:
+
+**split_k_barrier — `AssertionError: TODO: implement for other devices` in `helion.runtime.get_num_sm`.**
+The kernel (pid_type="persistent_blocked") emits `helion.runtime.get_num_sm(a.device)`. A prior fix added a
+`"cpu"` branch (XLA tensors surface as cpu under nki.simulate). But on REAL Trainium hardware the device
+type is **`xla`**, not `cpu`, so it hit the allowlist assert. (The earlier "fixed by get_num_sm cpu branch"
+claim was validated only under sim, where device.type=='cpu' — the hardware xla path was never exercised.)
+Fix: add `"xla"` to the allowlist and route it through the same CPU-thread-count stand-in as `cpu` (Trainium
+has no SM concept; the persistent-kernel grid just needs a usable value). Runtime-only change — cannot affect
+any kernel's codegen. Verified split_k_barrier CPU-sim still PASS; hardware xla path validated by the user's
+nightly sweep (device was busy autotuning during this session).
+
+**Other sweep notes (NOT failures):** concatenate passes (RC=0) but logs an autotuner-internal
+`RuntimeError: 0 active drivers` warning during parallel config probing — it falls back to a safe default
+config and runs correctly (transient Neuron-runtime hiccup, self-recovered). nvfp4_gemm fails to compile but
+is in the documented BLOCKED set (expected). gdn_fwd_h, jagged_hstu_attn, int4_gemm, long_sum all confirmed
+PASS on hardware (the session's earlier fixes hold). psum_reuse_test PASSES end-to-end on hardware with the
+sweep's new TORCHINDUCTOR_CACHE_DIR pin (all Part 1-3 sub-tests).

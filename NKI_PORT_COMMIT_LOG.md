@@ -1119,3 +1119,90 @@ Verification: int4_gemm sim PASS ("Test passed for shapes: M=128,K=512,N=256"); 
 ``src=A[..., add_2:add_2+32]``. Regression: before/after codegen snapshot across all 49 emitting
 examples — 48 byte-identical, only layer_norm_manual_nki differs (NCCL-log/PID noise, a stderr-only
 both-error kernel). No other kernel's codegen changed.
+
+## gdn_fwd_h (#8, pre-existing fail on ref too) — FIXED at the ROOT (tile.id subscripts → block_id)
+
+Symptom: `IndexError: list index out of range` in the NKI **load** codegen for
+`g[i_b, t_i_last, i_h]` (a fully-scalar index on 3D `g[B,S,H]`), at the `free_dims =
+[_resolve_dim(output_shape[-1])]` squeeze — `output_shape` was empty.
+
+**Root cause (traced with port-vs-reference probes on the SAME pinned config):** the load's
+`subscript_block_ids` came out `[None, None, None]` on the port vs `[1, None, 2]` on the reference,
+so the empty-`output_shape` reconstruction (which re-inserts dropped block dims) had no block_ids to
+re-insert → empty shape → crash. The byte-identical reconstruction code and `_nki_subscript_block_id`
+both behave correctly *given the right block_ids* — the divergence was one step earlier, in
+`env.get_block_id(<tile.id symbol>)`:
+
+- The `tile.id` symbol `u4`/`u5` resolves via `HostFunction.expr_to_origin`. On the **reference** its
+  origin is `GridOrigin(block_id=1/2)`; on the **port** upstream introduced a dedicated
+  `TileIdOrigin` (a *subclass* of `GridOrigin`) for `tile.id`.
+- `CompileEnvironment.get_block_id` matches origins with an **exact-type check**
+  `type(origin) is GridOrigin`, which deliberately rejects the subclasses (`tile.end`/`tile.count`
+  need different math — see indexing_strategy.py:158). So `get_block_id(tile.id)` returns `None` on
+  the port. The reference predates `TileIdOrigin`, so its `tile.id` was a plain `GridOrigin` and
+  resolved fine. This is the same bug class as the layer_norm store-fold regression (P2.2e).
+
+**Fix (1 file, +13 lines, NKI-scoped):** in `_nki_subscript_block_id` (the canonical NKI
+subscript→block_id resolver shared by load AND store), after `get_block_id` returns None for a bare
+symbol, consult `expr_to_origin` and resolve `TileIdOrigin`/`TileBeginOrigin` to their `block_id`.
+Did NOT touch the backend-agnostic `get_block_id` — its exact-type check is intentional and other
+backends rely on it (changing it risks Triton/CuTe/Pallas). The NKI load/store codegen already emits
+the correct `offset` / `offset // block_size` for these tile subscripts downstream, so resolving the
+block_id is all that was missing.
+
+**This REPLACED two in-progress band-aids** that had compensated downstream of the bad block_ids
+(a `_slice_width` free-dim parse in the load squeeze, and an ast_for_fx_node scalar-expr branch in the
+store) — both reverted; the fix is now a single 13-line root-cause change.
+
+**Verification:**
+- After the fix the port's `subscript_block_ids` / `output_shape` are byte-identical to the reference
+  for every g/w/u/k load (probed: `[1,None,2]`→`[u2,u3]`, `[1,3,2]`→`[u2,u6,u3]`, etc.).
+- gdn_fwd_h CPU-sim (HELION_NKI_SIMULATE=1) **PASS** (correctness assert passed; was IndexError).
+- Regression (compare-codegen, no full sweep): layer_norm, layer_norm_f32, rms_norm, int4_gemm,
+  matmul_split_k, split_k_barrier codegen **byte-identical** with vs without the fix. layer_norm
+  full sim PASS. (The fix only adds a fallback reached when `get_block_id` already returned None and
+  the origin is a tile.id/begin — inert for every currently-passing path.)
+- BONUS: jagged_hstu_attn (#9, the other pre-existing fail) now reaches full codegen with the fix
+  (previously errored) — needs separate correctness validation.
+
+## jagged_hstu_attn (#9, pre-existing fail on ref too) — FIXED (store row-scatter for `out[vec+starts, head, :]`)
+
+After the gdn tile.id fix unblocked codegen, jagged_hstu_attn compiled but crashed in CPU-sim with
+`TypeError: unsupported operand type(s) for +: 'NkiTensor' and 'int'` at
+`nisa.iota(dst=_ss_iota, ..., offset=_nki_sbuf_1_copy_0 + offset_2, ...)`.
+
+**Root cause:** the store `out[tile_q.index + starts, tile_h.begin, :]` (out is [L,H,D], reshaped to
+[L*H,D]) has a leading subscript `tile_q.index + starts` where `starts = seq_offsets[tile_b.begin]` is
+a **runtime SBUF scalar** (loaded tensor `_nki_sbuf_1_copy_0`), not a compile-time int. Because the
+subscript resolves the tile_q block_id, the store took the `block_id is not None` branch and built a
+string slice via the inline AST-add fallback (`{scalar_expr} + {offset_var} : ...`). That string fed
+the strided-scatter path, which emitted `nisa.iota(offset=<tensor>)` — but iota's `offset=` only
+accepts a scalar int. (`_nki_shifted_tile_subscript` correctly rejects SBUF-tensor shifts via its
+`_is_sbuf_tile` guard and returned None; the inline fallback had no such guard.)
+
+The **load** of the mirror pattern `q[tile.index + starts, head, :]` already handles this correctly
+via a 3D row-gather early-exit (`_nki_row_index_gather` builds the row vector with
+broadcast+tensor_tensor, then `flat = vec*H + head` → indirect `.ap(vector_offset=...)`). The store
+*had* the same 3D-gather logic but only in its `block_id is None` else-branch — unreachable here
+because `tile_q.index + starts` resolves the block_id.
+
+**Fix (1 file):**
+- Extracted the store's inline 3D `[vec+starts, head, :]` scatter logic into a reusable helper
+  `_nki_store_3d_row_scatter` (no behavior change to the existing else-branch — it now calls the
+  helper).
+- Call the helper at the top of the `block_id is not None` branch too, so the runtime-`+starts` case
+  routes to the row-gather scatter instead of folding the SBUF tensor into a scalar iota offset. The
+  helper self-guards: it only fires when `_nki_row_index_gather` returns an IndirectAP (a genuine
+  add-gather), so plain contiguous tiled stores are unaffected.
+
+The store now emits the same indirect scatter as the load: `_row_idx_add = indices + broadcast(starts)`
+→ transpose → `_3d_flat_idx_store = vec*H + head` → `dma_copy(nki_return_buf.ap(vector_offset=...))`.
+
+**Verification:**
+- jagged_hstu_attn CPU-sim **PASS** (correctness assert passed at the pinned config
+  block_sizes=[128,128], requires_grad=False — the upstream example sets requires_grad=True which
+  nki.simulate can't copy_ into, a harness limitation orthogonal to codegen).
+- Regression (compare-codegen, no full sweep): grouped_gemm, moe_matmul_ogs, embedding, jagged_mean,
+  jagged_sum, jagged_dense_add, gather_gemv, segment_reduction, layer_norm, gdn_fwd_h all
+  **byte-identical** with vs without the change. embedding/gather_gemv full sim PASS. (jagged_dense_add
+  fails sim identically pre/post — pre-existing `Unknown reduction operator: max`, unrelated.)

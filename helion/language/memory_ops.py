@@ -7220,6 +7220,118 @@ def _nki_as_uint32_p1_vector(
     return tr_sbuf
 
 
+def _nki_store_3d_row_scatter(
+    state: "CodegenState",
+    tensor: torch.Tensor,
+    subscript: "list | tuple",
+    fx_subscript: object,
+    i: int,
+    fx_node_i: object,
+    value: object,
+) -> tuple[list, list[str]] | None:
+    """Build the scatter index for a 3D store ``out[vec + starts, head, :]``.
+
+    Mirrors the load's 3D row-gather early-exit (`q[tile.index + starts,
+    tile_h.begin, :]`): the kernel reshapes ``out`` from ``[L, H, D]`` to
+    ``[L*H, D]``, so the flat row is ``(tile.index + starts) * H + head``.
+    The row vector is built by ``_nki_row_index_gather`` (which handles the
+    runtime ``+ starts`` SBUF tensor via broadcast+tensor_tensor), then scaled
+    by ``H`` and offset by the scalar head. Returns ``(slice_parts,
+    hbm_dim_size_strs)`` for the flat 2D scatter, or None if the pattern
+    doesn't apply.
+
+    This is reached for both the block-id-resolved subscript (``tile.index +
+    starts`` carries the tile_q block) and the unresolved case, so the runtime
+    offset is never folded into a scalar ``nisa.iota`` offset (which only
+    accepts a compile-time int).
+    """
+    if not (
+        tensor.dim() == 3
+        and isinstance(subscript[i], torch.Tensor)
+        and len(subscript) >= 3
+        and isinstance(fx_node_i, torch.fx.Node)
+    ):
+        return None
+    # Look ahead: next subscript must be scalar, then slice.
+    _remaining = [s for j, s in enumerate(subscript) if j > i and s is not None]
+    if len(_remaining) < 2:
+        return None
+    _next_sub, _next_next_sub = _remaining[0], _remaining[1]
+    if isinstance(_next_sub, (slice, torch.Tensor)) or not isinstance(
+        _next_next_sub, slice
+    ):
+        return None
+
+    env = CompileEnvironment.current()
+    device_fn = state.device_function
+    import sympy as _sp_store3d
+
+    _bs_subs: dict[_sp_store3d.Symbol, int] = {}
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+    def _dim_int(s: object) -> int:
+        return int(s._sympy_().subs(_bs_subs)) if isinstance(s, torch.SymInt) else int(s)
+
+    h_int = _dim_int(tensor.size(1))
+    d_int = _dim_int(tensor.size(2))
+
+    # Scalar head expression (next subscript).
+    _head_expr: str | None = None
+    _next_fx_idx = i + 1
+    while _next_fx_idx < len(subscript) and subscript[_next_fx_idx] is None:
+        _next_fx_idx += 1
+    _next_fx = (
+        fx_subscript[_next_fx_idx]
+        if fx_subscript is not None and _next_fx_idx < len(fx_subscript)
+        else None
+    )
+    if isinstance(_next_fx, torch.fx.Node):
+        _next_ast = state.codegen.ast_for_fx_node(_next_fx)
+        if isinstance(_next_ast, ast.AST):
+            _head_expr = ast.unparse(_next_ast)
+    if _head_expr is None and isinstance(_next_sub, (int, bool)):
+        _head_expr = str(int(_next_sub))
+    elif _head_expr is None and isinstance(_next_sub, torch.SymInt):
+        _head_expr = str(_dim_int(_next_sub))
+    if _head_expr is None:
+        return None
+
+    # Partition count from the value being stored.
+    _val_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
+    _val_shape = device_fn._nki_sbuf_shapes.get(_val_name)
+    _p_count = _val_shape[0] if _val_shape and len(_val_shape) >= 1 else None
+
+    _row_scatter = _nki_row_index_gather(fx_node_i, state, _p_count)
+    if not isinstance(_row_scatter, IndirectAP):
+        return None
+
+    _flat_var = device_fn.new_var("_3d_flat_idx_store", dce=True)
+    device_fn._nki_sbuf_shapes[_flat_var] = [_p_count, 1]
+    device_fn._nki_sbuf_dtypes[_flat_var] = "nl.uint32"
+    from .._compiler.ast_extension import statement_from_string
+
+    state.codegen.add_statement(statement_from_string(
+        f"{_flat_var} = nl.ndarray([{_p_count}, 1], nl.uint32, buffer=nl.sbuf)"
+    ))
+    state.codegen.add_statement(statement_from_string(
+        f"nisa.tensor_copy(dst={_flat_var}, src={_row_scatter.vec_var})"
+    ))
+    if h_int != 1:
+        state.codegen.add_statement(statement_from_string(
+            f"nisa.tensor_scalar(dst={_flat_var}, data={_flat_var}, "
+            f"op0=nl.multiply, operand0={h_int}, op1=None)"
+        ))
+    state.codegen.add_statement(statement_from_string(
+        f"nisa.tensor_scalar(dst={_flat_var}, data={_flat_var}, "
+        f"op0=nl.add, operand0={_head_expr}, op1=None)"
+    ))
+    slice_parts = [IndirectAP(vec_var=_flat_var, p_count=_p_count, pattern=None), f"0:{d_int}"]
+    total_rows = int(tensor.numel()) // d_int
+    return slice_parts, [str(total_rows), str(d_int)]
+
+
 def _nki_row_index_gather(
     fx_node: object,
     state: "CodegenState",
@@ -7508,6 +7620,19 @@ def _nki_subscript_block_id(
             bid = env.get_block_id(sym_expr)
             if bid is not None:
                 return bid
+            # ``tile.id`` / ``tile.begin`` symbols carry a TileIdOrigin /
+            # TileBeginOrigin (subclasses of GridOrigin). ``get_block_id``
+            # only resolves exact GridOrigin (upstream keeps the subclasses
+            # distinct because tile.end/count need different math), so a
+            # tile.id subscript like ``h[tile_b.id, ...]`` would otherwise
+            # not map to its block. Recover the block_id from the origin —
+            # the NKI load/store codegen already emits the correct
+            # ``offset`` / ``offset // block_size`` for these downstream.
+            origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
+            if origin_info is not None and isinstance(
+                origin_info.origin, (TileIdOrigin, TileBeginOrigin)
+            ):
+                return origin_info.origin.block_id
 
     # 1b. FakeTensor subscript (1D tile): look at size(0) for the block_id.
     # Handles compound subscripts like "tile_c * chunk_size + tile_m.index"
@@ -11122,6 +11247,21 @@ def _(state: CodegenState) -> None:
         elif block_id is not None and block_id in state.codegen.active_device_loops:
             offset_var = state.codegen.offset_var(block_id)
             block_size = env.block_sizes[block_id].from_config_assert(state.config)
+            # 3D store ``out[tile.index + starts, head, :]``: the leading
+            # subscript carries the tile block_id, but ``+ starts`` is a runtime
+            # SBUF scalar that cannot be folded into a contiguous slice offset
+            # (the strided-scatter path below would emit ``nisa.iota(offset=
+            # <tensor>)``, which only accepts a compile-time int). Route to the
+            # row-gather scatter, exactly as the load does for the mirror case.
+            if tensor_dim_idx == 0:
+                _scatter_3d = _nki_store_3d_row_scatter(
+                    state, tensor, subscript, fx_subscript, i, fx_node_i, value
+                )
+                if _scatter_3d is not None:
+                    slice_parts, hbm_dim_size_strs_s = _scatter_3d
+                    is_scalar_dim_s = [False, False]
+                    partition_offset_var = None
+                    break
             # For 1D tensors, don't set partition_offset_var here.
             # The partition vs free layout decision is deferred to HBM
             # allocation based on the value's SBUF shape.
@@ -11246,78 +11386,16 @@ def _(state: CodegenState) -> None:
                     continue
 
             # 3D tensor with pattern [vec + starts, scalar_head, :] — same as load.
-            if (
-                tensor_dim_idx == 0
-                and tensor.dim() == 3
-                and isinstance(sub_val, torch.Tensor)
-                and len(subscript) >= 3
-            ):
-                # Look ahead: next subscript must be scalar, then slice
-                _remaining_subs = [s for j, s in enumerate(subscript) if j > i and s is not None]
-                if len(_remaining_subs) >= 2:
-                    _next_sub = _remaining_subs[0]
-                    _next_next_sub = _remaining_subs[1]
-                    _next_is_scalar = not isinstance(_next_sub, (slice, torch.Tensor))
-                    _next_next_is_slice = isinstance(_next_next_sub, slice)
-                    if _next_is_scalar and _next_next_is_slice and isinstance(fx_node_i, torch.fx.Node):
-                        import sympy as _sp_store3d
-                        _bs_subs_store3d: dict[_sp_store3d.Symbol, int] = {}
-                        for _bid in range(len(env.block_sizes)):
-                            _bs = env.block_sizes[_bid]
-                            _bs_subs_store3d[_bs.symbol()] = int(_bs.from_config_assert(state.config))
-                        h_size = tensor.size(1)
-                        d_size = tensor.size(2)
-                        h_int = int(h_size._sympy_().subs(_bs_subs_store3d)) if isinstance(h_size, torch.SymInt) else int(h_size)
-                        d_int = int(d_size._sympy_().subs(_bs_subs_store3d)) if isinstance(d_size, torch.SymInt) else int(d_size)
-                        # Get scalar head expression
-                        _head_expr_s: str | None = None
-                        # Find the FX node for the next subscript
-                        _next_fx_idx = i + 1
-                        while _next_fx_idx < len(subscript) and subscript[_next_fx_idx] is None:
-                            _next_fx_idx += 1
-                        _next_fx = fx_subscript[_next_fx_idx] if fx_subscript and _next_fx_idx < len(fx_subscript) else None
-                        if isinstance(_next_fx, torch.fx.Node):
-                            _next_ast = state.codegen.ast_for_fx_node(_next_fx)
-                            if isinstance(_next_ast, ast.AST):
-                                _head_expr_s = ast.unparse(_next_ast)
-                        if _head_expr_s is None and isinstance(_next_sub, (int, bool)):
-                            _head_expr_s = str(int(_next_sub))
-                        elif _head_expr_s is None and isinstance(_next_sub, torch.SymInt):
-                            _head_expr_s = str(int(_next_sub._sympy_().subs(_bs_subs_store3d)))
-                        # Get row-gather sentinel for vec index
-                        _p_count_s = None
-                        # Determine partition_dim from the value being stored
-                        val_name = ast.unparse(value) if isinstance(value, ast.AST) else str(value)
-                        val_shape = device_fn._nki_sbuf_shapes.get(val_name)
-                        if val_shape and len(val_shape) >= 1:
-                            _p_count_s = val_shape[0]
-                        _row_scatter_3d = _nki_row_index_gather(fx_node_i, state, _p_count_s)
-                        if _row_scatter_3d is not None and _head_expr_s is not None:
-                            if isinstance(_row_scatter_3d, IndirectAP):
-                                _vec_var_s = _row_scatter_3d.vec_var
-                                _flat_var_s = device_fn.new_var("_3d_flat_idx_store", dce=True)
-                                device_fn._nki_sbuf_shapes[_flat_var_s] = [_p_count_s, 1]
-                                device_fn._nki_sbuf_dtypes[_flat_var_s] = "nl.uint32"
-                                state.codegen.add_statement(statement_from_string(
-                                    f"{_flat_var_s} = nl.ndarray([{_p_count_s}, 1], nl.uint32, buffer=nl.sbuf)"
-                                ))
-                                state.codegen.add_statement(statement_from_string(
-                                    f"nisa.tensor_copy(dst={_flat_var_s}, src={_vec_var_s})"
-                                ))
-                                if h_int != 1:
-                                    state.codegen.add_statement(statement_from_string(
-                                        f"nisa.tensor_scalar(dst={_flat_var_s}, data={_flat_var_s}, op0=nl.multiply, operand0={h_int}, op1=None)"
-                                    ))
-                                state.codegen.add_statement(statement_from_string(
-                                    f"nisa.tensor_scalar(dst={_flat_var_s}, data={_flat_var_s}, op0=nl.add, operand0={_head_expr_s}, op1=None)"
-                                ))
-                                slice_parts = [IndirectAP(vec_var=_flat_var_s, p_count=_p_count_s, pattern=None), f"0:{d_int}"]
-                                is_scalar_dim_s = [False, False]
-                                total_rows_s = int(tensor.numel()) // d_int
-                                hbm_dim_size_strs_s = [str(total_rows_s), str(d_int)]
-                                partition_offset_var = None
-                                # Skip remaining dims
-                                break
+            if tensor_dim_idx == 0:
+                _scatter_3d = _nki_store_3d_row_scatter(
+                    state, tensor, subscript, fx_subscript, i, fx_node_i, value
+                )
+                if _scatter_3d is not None:
+                    slice_parts, hbm_dim_size_strs_s = _scatter_3d
+                    is_scalar_dim_s = [False, False]
+                    partition_offset_var = None
+                    # Skip remaining dims — the flat scatter covers them all.
+                    break
 
             size_i = tensor.size(tensor_dim_idx) if tensor_dim_idx < tensor.dim() else sub_val
             size_str = (

@@ -1206,3 +1206,48 @@ The store now emits the same indirect scatter as the load: `_row_idx_add = indic
   jagged_sum, jagged_dense_add, gather_gemv, segment_reduction, layer_norm, gdn_fwd_h all
   **byte-identical** with vs without the change. embedding/gather_gemv full sim PASS. (jagged_dense_add
   fails sim identically pre/post — pre-existing `Unknown reduction operator: max`, unrelated.)
+
+## psum_reuse_test (#10) — CONFIRMED harness artifact, NOT a port bug (sweep tooling fixed)
+
+The "no generated kernel source found" failure is purely a test-environment assumption. The test does
+`_CACHE_DIR = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_ubuntu")` and then greps that
+dir for the generated NKI source to assert PSUM-reuse codegen. But PyTorch's inductor writes to
+`{tempfile.gettempdir()}/torchinductor_<user>`, and this session sets `TMPDIR=/tmp/claude-1000`, so the
+real cache is `/tmp/claude-1000/torchinductor_ubuntu` while the test looks in `/tmp/torchinductor_ubuntu`
+(absent) → empty `src` → assert. The kernel itself compiles and is numerically correct (Parts 1-3 all
+PASS; the two numeric checks before the assert print PASS).
+
+**Verification:** with `TORCHINDUCTOR_CACHE_DIR=/tmp/claude-1000/torchinductor_ubuntu` the entire test
+passes RC=0 (all of Part 1 fusion-pass unit tests, Part 2 end-to-end + codegen-introspection, Part 3
+y[:, tile_n] regression).
+
+**Fix (sweep tooling only, not repo code):** `sim_sweep.py` and `hw_sweep.py` now export
+`TORCHINDUCTOR_CACHE_DIR={tempfile.gettempdir()}/torchinductor_ubuntu` so cache-introspecting tests find
+their source regardless of TMPDIR. No port/codegen change — the example is correct as-is.
+
+## Follow-ups resolved (cross-backend changes + backend_registry narrowing)
+
+**(1) "mean" in ReductionLowering.get_masked_value (inductor_lowering.py) — VERIFIED inert for Triton.**
+This is a real divergence from upstream (upstream has `{sum,prod,min,max}`; the port adds `mean`,
+unconditionally). It feeds the mask-optimization pass (whether a masked reduction can skip an explicit
+mask because the masked lanes are already 0). Verified by generating Triton `to_triton_code` for
+reduce_kernel with mean/sum/amax at a masked non-power-of-2 size (500x500), with vs without the `mean`
+entry: **byte-identical**. Type-prop `_debug_str` also identical. Safe to keep — only NKI relies on it.
+
+**(2) int → SymIntType in tunable_ops._register_tunable_type — VERIFIED inert for Triton.**
+For int-typed `register_tunable`, the port returns `SymIntType(origin, create_unbacked_symint(default))`
+instead of `NumericType.subtype(int).new_unbacked(origin)` (so NKI tile/loop bounds derived from tunables
+get a size hint). Verified by generating Triton code for an IntegerFragment kernel (`x * multiplier`) and a
+PowerOfTwoFragment split-k matmul, with vs without the int branch: **byte-identical** (default_config and
+all generated code). Safe to keep.
+
+(Methodology note: both comparisons MUST run with `PYTHONPATH=/home/ubuntu/helion_port` — `helion` is
+pip-installed editable from `/home/ubuntu/helion_nki` (the old reference fork) via a site-packages .pth, so
+without the PYTHONPATH override `import helion` silently resolves to helion_nki, not the port tree.)
+
+**(3) backend_registry `_maybe_register_nki` — narrowed `except Exception` → `except ImportError`.**
+During the port the catch was widened to surface SyntaxError/circular-import in nki_backend.py as a
+warning. nki_backend now imports cleanly (verified: `list_backends()` includes 'nki'), so the broad catch
+was removed — only the benign `ImportError` (torch_xla absent on non-Trainium) is swallowed; any real bug
+in nki_backend.py now propagates instead of being silently downgraded to a warning. Removed the now-unused
+local `import logging` / warning block.

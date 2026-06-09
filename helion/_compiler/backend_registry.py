@@ -78,18 +78,12 @@ def _maybe_register_nki() -> None:
     ``register_compiler_backend(NKIBackend)`` call. NKI depends on torch_xla,
     which is absent on non-Trainium machines, so a missing import is benign.
     """
-    # NOTE: during the NKI port this is intentionally widened to surface
-    # SyntaxError/circular-import in nki_backend.py instead of silently
-    # leaving NKI unregistered. Narrow back to ``except ImportError`` once
-    # nki_backend.py is stable.
+    # Only a missing import is benign (torch_xla absent off-Trainium); any other
+    # error (e.g. a real bug in nki_backend.py) is allowed to propagate.
     try:
         from . import nki_backend  # noqa: F401  (import registers NKIBackend)
     except ImportError:
         pass
-    except Exception as e:  # pragma: no cover - dev-time diagnostics
-        import logging
-
-        logging.getLogger(__name__).warning("NKI backend registration failed: %r", e)
 
 
 _maybe_register_nki()

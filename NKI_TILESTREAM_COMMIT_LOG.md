@@ -204,3 +204,12 @@ can gate); `NKIBackend.use_tilestream` now delegates to it. Added compact-blas e
 `_nkitile.blas.transpose(dst=tr_sbuf, src=...)` under `_nki_use_tilestream()`; legacy retained in else.
 **Verify:** reduce kernel (`x[tm,:].sum(-1)`, exercises the [N,1]↔[1,N] reconcile) — sim flag ON/OFF both PASS;
 **REAL HW flag-ON: Compiler status PASS, sum 256×512 / 128×512 PASS**. Flag-off 4/4 codegen tests pass.
+
+### S5.2 — Matmul transpose → blas.transpose (flag-gated)
+**Files:** `aten_lowering.py:3786` (`_transpose_stmts`, the mm/addmm path — the one ACTUALLY used by
+`torch.addmm`; `matmul_ops.py` `_nki_dot` is `hl.dot` and also converted for completeness).
+**Finding:** the matmul transpose for `torch.addmm`/`mm` lives in `aten_lowering.py`, NOT `matmul_ops.py`
+(var names `_lhs_t_psum` vs `_dot_lhs_t_psum` gave it away). Converted `_transpose_stmts`: blas.transpose folds
+PSUM+nc_transpose+copy AND the dtype-cast (via dst dtype) into one statement.
+**Verify:** codegen flag-ON → `blas.transpose: 1, nc_transpose: 0, nc_matmul: 1` (transpose fully delegated).
+sim 256³/128³ PASS; **REAL HW flag-ON Compiler status PASS, mm PASS** (err ~1.7-4.4e-5). Flag-off tests 4/4.

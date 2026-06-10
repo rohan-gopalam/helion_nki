@@ -3794,6 +3794,21 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         differs from the matmul (moving) dtype, an additional tensor_copy
         cast step produces the nc_matmul-compatible stationary tile.
         """
+        from .nki_backend import _nki_use_tilestream
+        if _nki_use_tilestream():
+            # blas.transpose folds PSUM alloc + nc_transpose + copy-back (and the
+            # dtype cast, via the dst dtype) into one call. The stationary target
+            # is lhs_t_cast when a cast is needed, else lhs_t_sbuf.
+            out_buf = lhs_t_cast if need_cast_after_transpose else lhs_t_sbuf
+            out_dtype = matmul_dtype_str if need_cast_after_transpose else transpose_dtype_str
+            return [
+                statement_from_string(
+                    f"{out_buf} = nl.ndarray([{TILE_K}, {TILE_M}], {out_dtype}, buffer=nl.sbuf)"
+                ),
+                statement_from_string(
+                    f"_nkitile.blas.transpose(dst={out_buf}, src={lhs_slice})"
+                ),
+            ]
         stmts = [
             statement_from_string(
                 f"{lhs_t_psum} = nl.ndarray([{TILE_K}, {TILE_M}], {transpose_dtype_str}, buffer=nl.psum)"

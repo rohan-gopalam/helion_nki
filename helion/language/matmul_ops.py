@@ -1192,6 +1192,21 @@ def _(state: CodegenState) -> object:
         )
 
         def _transpose_body(k_expr: str) -> list[ast.AST]:
+            if env.backend.use_tilestream:
+                # blas.transpose folds PSUM alloc + nc_transpose + copy-back into
+                # one call; it also casts to the dst dtype, so the separate cast
+                # buffer collapses into the final transpose target. _stationary is
+                # lhs_t_cast when a cast is needed, else lhs_t_sbuf.
+                out_buf = lhs_t_cast if need_cast_after_transpose else lhs_t_sbuf
+                out_dtype = matmul_dtype_str if need_cast_after_transpose else transpose_dtype_str
+                return [
+                    statement_from_string(
+                        f"{out_buf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {out_dtype}, buffer=nl.sbuf)"
+                    ),
+                    statement_from_string(
+                        f"_nkitile.blas.transpose(dst={out_buf}, src={_lhs_k_slice(m_i, k_expr)})"
+                    ),
+                ]
             return [
                 statement_from_string(
                     f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.psum)"

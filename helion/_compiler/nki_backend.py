@@ -405,17 +405,31 @@ class NKIOpOverrides:
             state.add_statement(statement_from_string(
                 f"{bcast_native} = nl.ndarray([{p_count}, {f_count}], {hbm_dtype_str}, buffer=nl.sbuf)"
             ))
-            p_loop_var = state.device_function.new_var("_p_bcast")
-            state.add_statement(_create(
-                ast.For,
-                target=_create(ast.Name, id=p_loop_var, ctx=ast.Store()),
-                iter=_efrom(f"nl.affine_range({p_count})"),
-                body=[statement_from_string(
-                    f"nisa.dma_copy(dst={bcast_native}[{p_loop_var}:{p_loop_var}+1, 0:{f_count}], "
-                    f"src={hbm_src})"
-                )],
-                orelse=[],
-            ))
+            if _nki_use_tilestream():
+                # v2 (E3): DMA the [1,F] HBM row once into partition 0, then
+                # replicate to all P partitions via blas.broadcast (partition
+                # replicate). Replaces the per-partition affine_range DMA loop.
+                # (TensorView.broadcast can't do this — it asserts on partition
+                # dim 0; blas.broadcast is the dedicated partition-replicate prim.)
+                state.add_statement(statement_from_string(
+                    f"nisa.dma_copy(dst={bcast_native}[0:1, 0:{f_count}], src={hbm_src})"
+                ))
+                state.add_statement(statement_from_string(
+                    f"_nkitile.blas.broadcast(dst={bcast_native}, src={bcast_native}[0:1, 0:{f_count}], "
+                    "src_partition=0)"
+                ))
+            else:
+                p_loop_var = state.device_function.new_var("_p_bcast")
+                state.add_statement(_create(
+                    ast.For,
+                    target=_create(ast.Name, id=p_loop_var, ctx=ast.Store()),
+                    iter=_efrom(f"nl.affine_range({p_count})"),
+                    body=[statement_from_string(
+                        f"nisa.dma_copy(dst={bcast_native}[{p_loop_var}:{p_loop_var}+1, 0:{f_count}], "
+                        f"src={hbm_src})"
+                    )],
+                    orelse=[],
+                ))
             if hbm_dtype_str == target_dtype_str:
                 return bcast_native
             bcast_final = state.device_function.new_var("_nki_bcast", dce=True)

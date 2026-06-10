@@ -308,3 +308,17 @@ This is the same TileStream-vs-raw-ndarray boundary that makes the loop scaffold
 conversion is therefore correctly scoped to the DATA-MOVEMENT ops (load/store/gather/transpose) whose
 primitives accept raw ndarrays and return nisa-usable views — not the compute/alloc ops that require
 TileStream-typed operands end-to-end.
+
+### E3 — partition broadcast via blas.broadcast (flag-gated)
+**File:** `nki_backend.py` `_emit_partition_broadcast`. Replaced the per-partition `affine_range` DMA loop
+(`for p: dma_copy(bcast[p:p+1], hbm_src)`) with: one DMA of `[1,F]` into partition 0 + `blas.broadcast(dst,
+src=bcast[0:1], src_partition=0)` (the dedicated partition-replicate primitive — TensorView.broadcast can't,
+asserts dim 0). **Verify:** bias-add kernel (`out[m,n]=x[m,n]+bias[n]`) codegen flag-ON → `blas.broadcast: 1`,
+per-partition loop gone. sim flag ON==OFF PASS; **real HW Compiler PASS + correct**; flag-off 4/4.
+
+### E4 — remaining nisa classification (established)
+Flag-ON kernels now emit: nkilib `dma.load`/`dma.store`/`blas.transpose`/`blas.activation`/`blas.broadcast`
+for data movement/transpose/unary/partition-bcast; raw `nisa` ONLY for bucket-3 (tensor_reduce, scan,
+tensor_copy_predicated, scalar_tensor_tensor, iota, memset) + tensor_tensor/nc_matmul (type-cascade/idiomatic,
+E1/E2/D1). This matches the structure of a hand-written nkilib kernel. No bucket-4 (unclassified) ops remain
+in the tested set.

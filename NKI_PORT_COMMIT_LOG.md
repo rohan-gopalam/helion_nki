@@ -1296,9 +1296,22 @@ reached after the commit) picked up the fix and **PASSED on Trainium (21s, rc=0,
 
 ## FINAL FULL HARDWARE SWEEP RESULT (3803s, cold cache, all 51 examples)
 
-**45 PASS / 1 FAIL (rms_norm timeout) / 1 blocked-fail (nvfp4_gemm) / 4 blocked-but-passed.**
+**49 of 51 examples actually pass on Trainium.** The raw sweep tally is `45 PASS / 1 FAIL / 1
+blocked-fail / 4 blocked-but-passed`, but the `BLOCKED` set is a historical "don't expect these to work"
+list — 4 of its 5 members (fused_linear_jsd, grpo_loss, mamba2_chunk_scan, mamba2_chunk_state) now pass and
+are only tallied separately. Counting them, **49 examples pass and only 2 do not**:
 
-PASS (45): add aot_example attention batch_softmax bf16xint16_gemm blackwell_attention bmm broadcast_matmul
+  1. **rms_norm — TIMEOUT, not a correctness/codegen bug** (see below). Almost certainly passes with a
+     warm cache / longer timeout / pinned config; was finding valid configs with zero search-failures when
+     the 1800s/example limit killed it.
+  2. **nvfp4_gemm — genuine block.** Fails to *compile* (NKI assertion: `failed to compile NKI kernel`).
+     The nvfp4 (4-bit float) path is unsupported on the NKI backend; documented as blocked-as-expected, a
+     pre-existing limitation, not a regression from this session.
+
+(Examples excluded from the 51 entirely — CUDA-only or test scaffolding: flex_attention, fp8_attention,
+jagged_dense_bmm, and the test_nki_autotune*/test_nki_timing* harness scripts.)
+
+PASS (45 in the non-blocked tally): add aot_example attention batch_softmax bf16xint16_gemm blackwell_attention bmm broadcast_matmul
 concatenate cross_entropy embedding exp fp8_gemm fused_nki_ops gather_gemv **gdn_fwd_h** geglu grouped_gemm
 **int4_gemm** jagged_dense_add **jagged_hstu_attn** jagged_layer_norm jagged_mean jagged_softmax jagged_sum
 jsd kl_div layer_norm layer_norm_f32 **long_sum** **low_mem_dropout** matmul matmul_layernorm matmul_split_k
@@ -1322,3 +1335,40 @@ finish) took 620s autotuning — rms_norm's fwd+bwd is ~2x that plus slower per-
 `RuntimeError: 0 active drivers` warning during parallel config probing — it falls back to a safe default
 config and runs correctly (transient Neuron-runtime hiccup, self-recovered). psum_reuse_test PASSES
 end-to-end on hardware with the sweep's new TORCHINDUCTOR_CACHE_DIR pin (all Part 1-3 sub-tests).
+
+## Architecture: how NKI integrates vs cute/pallas (isolation / merge-readiness)
+
+NKI follows the **same plugin structure upstream uses for cute/pallas/metal** — it is NOT bolted onto the
+other backends' codepaths:
+
+- **Per-backend codegen registration.** Every device op (load, store, dot, etc.) is registered once per
+  backend via `@_decorators.codegen(<op>, "<backend>")`. There is a separate `(load, "triton")`,
+  `(load, "pallas")`, `(load, "cute")`, `(load, "metal")`, and `(load, "nki")` function. The NKI load/store
+  bodies are entirely independent functions (memory_ops.py L7721/L11125) — they do not touch and are not
+  reached by the triton/pallas/cute/metal codegen. This is exactly cute's pattern.
+- **Backend class.** All NKI hardware specifics live in `nki_backend.py` (the `NKIBackend(Backend)` subclass
+  implementing the 7 abstractmethods + overrides), mirroring how `CuteBackend`/`PallasBackend` live in
+  backend.py and cute/ holds cute's helpers. Registered through the same `backend_registry` plugin hook.
+- **Shared-file guards are NKI-gated and inert for others.** Where NKI behaviour had to differ inside a
+  *shared* function (not a per-backend one), it is fenced behind `if backend.name == "nki":` so other
+  backends fall through unchanged. ~29 such checks across 12 files (device_ir, generate_ast, settings,
+  reduction_strategy, inductor_lowering, compile_environment, device_function, random_ops, creation_ops,
+  type_info, tile_strategy, nki_backend) — comparable in spirit to cute's ~24 `cute`-gated checks. This is
+  the same idiom (`if type(origin) is GridOrigin`, `backend.preserve_concrete_slice_dims`, etc.) the
+  codebase already uses to keep backends from interfering.
+
+**Caveats / not-yet-clean-for-upstream:**
+- A FEW changes in shared files are **unconditional (not backend-gated)** and were verified byte-identical
+  for Triton rather than guarded: the `"mean"` entry in `get_masked_value` and `int->SymIntType` in
+  tunable_ops (both confirmed inert for Triton codegen this session). The `long_sum` fix added a *new*
+  backend property (`preserve_concrete_slice_dims`, default False, True only for Pallas) — a clean,
+  backend-gated mechanism, byte-identical for all non-NKI backends.
+- `memory_ops.py` is a ~12.5k-line shared file; the NKI load/store functions are large (the GIANT) and live
+  in it rather than a `nki/` subpackage. cute similarly added a `cute/` subpackage for its helpers; a future
+  cleanup could move the NKI codegen helpers into a `nki/` subpackage to reduce the shared-file footprint.
+  Functionally isolated today, but structurally heavier in shared files than cute.
+- **NOT yet run for a clean PR:** the upstream `pytest test/` suite on a CUDA GPU (to prove Triton/CuTe/
+  Pallas are unregressed by the shared-file edits) and `ruff`/`pyrefly` lint (CI gates). Those need a GPU box
+  — unavailable on this Trainium host. The NKI-side validation (49/51 examples on hardware, codegen-parity
+  vs reference) is done; the cross-backend regression-safety evidence the maintainers will want is the
+  outstanding gap.

@@ -293,3 +293,18 @@ blas.transpose}, nisa={nc_matmul, tensor_copy, tensor_tensor, iota, memset}. Sim
 ### F2 — bucket-3 regression guard (PASSED)
 reduce(sum/amax via nisa.tensor_reduce), where (nisa.tensor_copy_predicated) flag-ON sim == flag-OFF, AND
 **real HW Compiler PASS + correct** — confirming bucket-3 nisa ops compose correctly with v2-converted loads.
+
+### E1/E2 — alloc_logical + blas.TensorTensor: TYPE-CASCADE wall (scoped out, documented)
+**Finding:** `alloc_logical` returns a **TensorView** (no `__getitem__`); `blas.TensorTensor` takes
+**TileStream** operands. Helion's body codegen allocates raw `nl.ndarray` and indexes them as `buf[i:j, k:l]`
+passing the result straight to `nisa.*`. Swapping alloc→alloc_logical or tensor_tensor→blas.TensorTensor
+would require rewriting EVERY downstream consumer (~80 tensor_tensor sites + every buffer index) to use
+`.get_view()`/`.tile_at()` — a type-contract cascade across the whole body, not a localized swap. And it
+buys nothing: the lowered SBUF alloc and `nisa.tensor_tensor` are identical (alloc_logical with
+collapse_trivial_p_tile=True is still just `[P,F]`; blas.TensorTensor wraps→single-tile→`nisa.tensor_tensor`).
+**Decision:** E1/E2 scoped OUT. Buffer allocation stays `nl.ndarray`; elementwise binary stays
+`nisa.tensor_tensor` (bucket-3-style: localized conversion impossible without a full body-rewrite, no benefit).
+This is the same TileStream-vs-raw-ndarray boundary that makes the loop scaffold stay (Finding A/B). The v2
+conversion is therefore correctly scoped to the DATA-MOVEMENT ops (load/store/gather/transpose) whose
+primitives accept raw ndarrays and return nisa-usable views — not the compute/alloc ops that require
+TileStream-typed operands end-to-end.

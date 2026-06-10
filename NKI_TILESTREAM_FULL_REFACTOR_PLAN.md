@@ -81,39 +81,49 @@ A satisfied); the body is now nkilib-native (Finding C matched).
 
 ---
 
-## 1b. Fallback policy: TOTAL v2, loud errors, no silent fallthrough (user decision 2026-06-10)
+## 1b. Coverage policy: convert what nkilib HAS a primitive for; legitimately keep nisa where it doesn't
 
-When `HELION_NKI_TILESTREAM=1`, the v2 path is **total**: every structured op routes to TensorView/TileStream.
-A shape that v2 does not yet cover raises `exc.BackendUnsupported(name, "v2: <case> not yet on tilestream")`
-— it MUST NOT silently fall through to legacy. This makes the experiment actually answer "can everything be
-done in nkilib terms," and makes every remaining gap loud and visible.
+> **Revised 2026-06-10 after auditing the full nkilib tree (the original "zero raw nisa / loud-error on
+> anything uncovered" target was WRONG — see Hole 1 below).**
 
-Legacy body-codegen stays **physically present but reachable only flag-OFF**, serving as the A/B correctness
-reference (sim + HW: v2 output must match legacy output for every test kernel). The S2.1/S2.2 `.slice`
-interception is REMOVED as a fallthrough — it becomes part of the total v2 path (it's the contiguous case).
+**Audit finding (decisive):** nkilib has **NO primitive** for reductions, scans, cumulative, predicated
+(masking), or index materialization. And nkilib's OWN composed kernels (`cross_entropy.py`,
+`ring_attention_bwd.py`, `foreach_norm.py`, `transformer_tkg.py`) **call `nisa.tensor_reduce` /
+`nisa.tensor_tensor_scan` / `nisa.tensor_copy` directly.** So "express everything in nkilib, zero raw nisa"
+is **not achievable and not idiomatic** — even AWS mixes. The real nkilib idiom is:
+`tile_stream`+`dma`+`blas` for **tiling / data movement / matmul / elementwise / transpose**, and **raw `nisa`
+for reductions / scans / predication / iota / memset** (no primitive exists).
 
-**Complete coverage inventory (every case v2 must handle — audited from `load_expr`/`store_stmt`/op handlers):**
+**Four buckets (every emitted op is in exactly one):**
 
-| Case | nkilib expression | Difficulty |
-|---|---|---|
-| contiguous tile (full / tail-overflow) | `TensorView.slice` (clamps) or `tile_hbm`+`tile_at` | done (S2.1/2.2) |
-| partition > 128 | `alloc_logical` split + `tile` | easy |
-| 1-D reshaped tensor | `reshape_dim` + `tile_hbm` | easy |
-| scalar index `x[5,:]` | `TensorView.select(dim, 5)` | easy |
-| **indirect gather** `table[idx[t]]` | `TensorView.vector_select` + `dma.Load(vector_index=, index_dim=)` | medium |
-| **scalar dynamic** `x[dyn_counter]` (dynamic_range) | `TensorView.select(dim, runtime_idx)` (scalar_offset) | medium |
-| **NEG_START / shifted** `x[i-pad]` | `dma.Load(..., oob_mode=skip)` — NOT `slice` (asserts start≥0) | hard (R-NEG) |
-| **partition broadcast** `[1,F]→[P,F]` | `blas.broadcast(dst, src, src_partition)` — NOT `TensorView.broadcast` (asserts dim 0) | hard (R-BC) |
-| matmul | `blas.Matmul` | Phase D |
-| elementwise binary | `blas.TensorTensor` over streams | Phase E2 |
-| elementwise unary / scalar | `blas.activation` / `blas.tensor_scalar` | done (S5.4) |
-| transpose | `blas.transpose` | done (S5.1/5.2) |
+1. **CONVERT — has a nkilib primitive (the refactor target):** tiling, `alloc_logical`, load/store
+   (`dma.Load`/`Store`), transpose (`blas.transpose`), matmul (`blas.Matmul`), elementwise unary/scalar
+   (`blas.activation`/`tensor_scalar`), elementwise binary (`blas.TensorTensor`), gather/dynamic
+   (`vector_select`/`select`+DGE `Load`).
+2. **HARD-CASE — convert, but with a DIFFERENT primitive than the analogous view op:**
+   - R-NEG (NEG_START / shifted `x[i-pad]`): `dma.Load(oob_mode=skip)` (TensorView.slice asserts start≥0).
+   - R-BC (partition broadcast `[1,F]→[P,F]`): `blas.broadcast` (TensorView.broadcast asserts dim 0).
+3. **STAYS nisa — LEGITIMATE, no nkilib primitive exists, idiomatic (nkilib does the same):**
+   `nisa.tensor_reduce`, `nisa.tensor_partition_reduce`, `nisa.tensor_scalar_reduce`,
+   `nisa.activation_reduce`, `nisa.tensor_tensor_scan` (scan), `nisa.tensor_scalar_cumulative` (cumsum),
+   `nisa.scalar_tensor_tensor`, `nisa.tensor_copy_predicated` (where/masking), `nisa.reduce_cmd`,
+   `nisa.register_load`, AND `nisa.iota`/`nisa.memset` (index/init materialization tied to the `indices_N`
+   contract — Finding A). **These are NOT failures and NOT fallthrough — they are the boundary of the
+   library.** ~38+ emission sites. Kernels exercising them (softmax, rms_norm, layernorm, cumsum, scan,
+   any `where()`) keep these nisa ops and still work.
+4. **LOUD ERROR — genuinely unexpected gap only:** an op that is neither convertible (bucket 1/2) nor a
+   known-legitimate nisa op (bucket 3) raises `exc.BackendUnsupported(name, "v2: <case>")`. This now fires
+   ONLY for true surprises (e.g. a new subscript shape we haven't classified), not for whole categories the
+   library doesn't cover.
 
-The two HARD cases each get a dedicated primitive that is NOT the one used elsewhere:
-- **R-NEG (NEG_START):** `TensorView.slice` cannot express negative start. Use `dma.Load` with
-  `oob_mode=skip` over a memset(0) buffer (S0.1 spike proved correct). Phase B3.
-- **R-BC (partition broadcast):** `TensorView.broadcast` asserts dim 0. Use `blas.broadcast` (partition
-  replicate). Phase E3.
+**Revised no-fallthrough meaning:** v2 still does NOT silently fall through to *legacy body-codegen* for
+bucket-1/2 ops — those MUST convert or loud-error. But bucket-3 ops legitimately emit raw `nisa` in BOTH the
+legacy and v2 paths (identical), because that's what nkilib itself does. Legacy body-codegen stays flag-OFF
+as the A/B correctness reference. The S2.1/S2.2 `.slice` interception folds into the total v2 path.
+
+**Goal restated honestly:** a flag-on kernel uses nkilib (`tile_stream`/`dma`/`blas`) for everything with a
+primitive, and raw `nisa` ONLY for reduce/scan/predicate/iota/memset — i.e. it matches the structure of a
+hand-written nkilib kernel, NOT "zero nisa."
 
 ## 2. Design: a parallel "v2 body codegen" behind the existing flag
 
@@ -150,10 +160,12 @@ The v2 module exposes, per structured op, an emitter that consumes the SAME inpu
   *Gate:* string-assert. Commit.
 
 ### PHASE B — Load path to TileStream objects (the core) — TOTAL, no fallthrough
-- **B0. Install the v2 dispatch + loud guard.** In `load_expr`, when `use_tilestream`, route ALL cases to
-  `v2_load`; `v2_load` raises `BackendUnsupported("v2 load: <case>")` for anything not yet implemented.
-  Remove the S2.1 `.slice` as a *fallthrough* (fold it into v2 as the contiguous case). *Gate:* a known
-  contiguous kernel works; an unimplemented case raises loudly (asserted in a test). Commit.
+- **B0. Install the v2 dispatch + bucket-aware guard.** In `load_expr`, when `use_tilestream`, route bucket-1/2
+  cases to `v2_load` (convert); bucket-3 ops that appear in a load context (e.g. a predicated/masked load) stay
+  nisa and are passed through unchanged; a bucket-4 (unclassified) case raises
+  `BackendUnsupported("v2 load: <case>")`. Remove the S2.1 `.slice` as a *fallthrough to legacy* (fold it into
+  v2 as the contiguous case). *Gate:* a contiguous kernel converts; a masked load still emits its
+  `tensor_copy_predicated`; an unclassified case raises loudly (asserted in a test). Commit.
 - **B1. Contiguous (full / tail-overflow).** Hoist `HBMStream` once; `alloc_logical` dst; `dma.Load(dst,
   src.tile_at(grid)).execute()`. *Gate:* copy+add, sim on==off, **real HW**; codegen shows
   `alloc_logical`/`tile_hbm`/`dma.Load`. Commit.
@@ -190,9 +202,12 @@ The v2 module exposes, per structured op, an emitter that consumes the SAME inpu
 - **E3. R-BC (partition broadcast `[1,F]→[P,F]`).** `blas.broadcast(dst, src, src_partition)` (NOT
   `TensorView.broadcast`, which asserts dim 0). Replaces `_emit_partition_broadcast`. *Gate:* a
   partition-broadcast kernel (e.g. bias add over rows), sim on==off + HW. Commit.
-- **E4. Sweep remaining `nisa.*` body emits** (tensor_scalar edge branches, masking predicated copies, iota
-  index materialization) → nkilib equivalents or explicit `BackendUnsupported`. Goal: ZERO raw `nisa.*` in a
-  flag-on generated kernel for the test set (except where nkilib genuinely has no primitive — documented).
+- **E4. Classify remaining `nisa.*` body emits into bucket 3 vs bucket 4.** For each remaining raw `nisa.*`
+  site reachable flag-on: if it's a bucket-3 op (reduce/scan/cumulative/predicated/scalar_tensor_tensor/
+  iota/memset) → **leave it as nisa, annotate `# v2: stays nisa — no nkilib primitive (idiomatic)`**. If it's
+  an unclassified op → raise `BackendUnsupported`. Goal: a flag-on kernel emits nkilib for all bucket-1/2 ops
+  and raw nisa ONLY for bucket-3 ops — matching a hand-written nkilib kernel's structure. Add a test that
+  asserts no UNCLASSIFIED nisa op survives flag-on for the example set.
 
 ### PHASE F — Dynamic/jagged loops — must be covered too (no fallthrough)
 - **F1.** Because there is no fallthrough, dynamic_range/jagged MUST either convert or raise loudly. Spike
@@ -201,11 +216,25 @@ The v2 module exposes, per structured op, an emitter that consumes the SAME inpu
   `BackendUnsupported("v2: nested jagged")` and record it as the one explicit gap (the experiment's honest
   answer: "everything EXCEPT X"). *Gate:* jagged_tile example sim+HW or documented loud gap. Commit.
 
+### PHASE F2 — Bucket-3 regression guard (reductions / scans / predication / masking)
+- **F2.** These have NO nkilib primitive (audited) and STAY nisa. The risk is not that they need converting —
+  it's that the Phase B/E changes (operands now arriving as v2 streams / alloc_logical buffers) must still feed
+  the existing `nisa.tensor_reduce`/`tensor_tensor_scan`/`tensor_copy_predicated` codegen correctly (shapes,
+  dtypes, `_nki_sbuf_shapes` registration). Verify the reduction/scan/where paths in `reduction_strategy.py`
+  and the `_setup_mask` jagged-mask path still work when their inputs are v2-produced.
+  *Gate:* softmax, rms_norm, layernorm, cumsum, a `where()`/masked kernel, and the jagged_tile example — sim
+  flag-ON must equal flag-OFF, AND real-HW compile+run. These exercise bucket-3 ops sitting next to converted
+  bucket-1 loads/stores; confirm the mix composes. Commit.
+
 ### PHASE G — Full validation + cleanup
 - **G1.** Run the example suite under sim (flag on) for the kernels that exercise B–E; A/B vs flag-off.
 - **G2.** Real-HW compile+run spot-checks across copy/add/matmul/reduce/sigmoid/gather + 2–3 fuller examples.
 - **G3.** Update `NKI_TILESTREAM_REFACTOR_PLAN.md` §Findings with the v2 results + a generated-kernel
-  before/after. Decide per-category what is production-recommendable. Commit.
+  before/after. Include the **definitive op coverage table**: which ops convert to nkilib (bucket 1/2) and the
+  exhaustive list that legitimately stays `nisa` because nkilib has no primitive (bucket 3) — the honest
+  answer to "can everything be done in nkilib?" is "yes for movement/tiling/matmul/elementwise; reductions/
+  scans/predication stay nisa, as they do in nkilib's own kernels." Decide per-category production
+  recommendation. Commit.
 
 ---
 
@@ -225,6 +254,10 @@ The v2 module exposes, per structured op, an emitter that consumes the SAME inpu
 | R8 | Autotuner composition (block sizes / loop order). | Scaffold still owns block sizes + loop order; `tile_at` just consumes `offset_N`. Validate one autotuned config in G. |
 | R9 | Generated-code bloat (alloc_logical + stream per tile inside loop). | Hoist streams outside loop (Finding C pattern); `alloc_logical` of the reused buffer can also hoist. Measure lines in G. |
 | R10 | nkilib `tile_at`/`alloc_logical` semantics differ from our spikes on real HW. | Every phase gates on real `/dev/neuron0` compile+run, not just sim. |
+| R-HOLE1 | nkilib has **no primitive** for reduce/scan/cumulative/predicated/iota/memset (~38 sites). | Bucket 3: these STAY nisa (nkilib's own kernels do the same). NOT loud-errors, NOT fallthrough — they're the library boundary. Phase F2 regression-guards them; E4 classifies them explicitly. |
+| R-HOLE3a | bucket-3 ops (esp. masking/`tensor_copy_predicated`, reductions) break when fed v2-produced stream/alloc_logical inputs. | Phase F2: dedicated regression gate on softmax/rms_norm/layernorm/cumsum/where/jagged, sim==legacy + HW, with converted loads feeding them. |
+| R-HOLE3b | `tile_at` grid-coord composition unverified for the 3-deep matmul loop (m×n×k + PSUM accumulate). | Phase D spike on a single matmul BEFORE broad conversion; generous legacy fall-through if K-axis/PSUM-reuse shapes don't map. |
+| R-HOLE3c | `nisa.iota`/`memset` are tied to the `indices_N` contract (Finding A); converting them risks the masking/index machinery. | Bucket 3: leave `iota`/`memset` as nisa (composed nkilib kernels emit 0 of them only because their index vectors come from `tile`/`affine_range` structure — Helion's `indices_N` contract still needs them). Do NOT convert; document. |
 
 ## 5. Do-NOT list
 - Do NOT remove the Python `for offset_N in affine_range` scaffold (Finding C: nkilib keeps it).
@@ -235,12 +268,14 @@ The v2 module exposes, per structured op, an emitter that consumes the SAME inpu
 - Do NOT `git push` / merge.
 
 ## 6. Execution checklist
-A1 stream registry → A2 grid-coord helper → B0 v2 dispatch + loud guard (remove .slice fallthrough) →
-B1 contiguous → B2 1-D/part>128/scalar-index → B3 NEG_START (oob_mode) → B4 gather+dynamic →
-C1 store contiguous → C2 store partial/1-D/scatter → D1 blas.Matmul → E1 alloc_logical → E2 blas.TensorTensor →
-E3 partition broadcast (blas.broadcast) → E4 nisa.* sweep-to-zero → F1 dynamic/jagged convert-or-loud-gap →
-G1 sim suite (v2==legacy) → G2 HW spot-checks → G3 findings (incl. the definitive list of any X that could NOT
-be expressed in nkilib).
+A1 stream registry → A2 grid-coord helper → B0 v2 dispatch + bucket-aware guard (convert bucket-1/2,
+pass-through bucket-3 nisa, loud-error bucket-4; remove .slice fallthrough) → B1 contiguous →
+B2 1-D/part>128/scalar-index → B3 NEG_START (oob_mode) → B4 gather+dynamic → C1 store contiguous →
+C2 store partial/1-D/scatter → D1 blas.Matmul → E1 alloc_logical → E2 blas.TensorTensor →
+E3 partition broadcast (blas.broadcast) → E4 classify remaining nisa (bucket-3 keep+annotate, bucket-4 error) →
+F1 dynamic/jagged convert-or-loud-gap → F2 bucket-3 regression guard (softmax/rms_norm/layernorm/cumsum/where/
+jagged: v2==legacy + HW) → G1 sim suite (v2==legacy) → G2 HW spot-checks → G3 findings (incl. the definitive
+list of which ops have NO nkilib primitive and legitimately stay nisa).
 
 Each step: flag-gated, sim A/B (on==off correctness), real-HW compile+run for the touched pattern,
 `test_nki_port_codegen.py` 4/4 flag-off, one commit. Log every step in `NKI_TILESTREAM_COMMIT_LOG.md`.

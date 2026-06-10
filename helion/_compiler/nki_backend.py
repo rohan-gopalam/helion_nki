@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import abc
 import ast
+import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -5223,6 +5224,17 @@ def _validate_nki_tensor_shape(shape: tuple, name: str, env: object) -> None:
 class NKIBackend(Backend):
     """NKI (Neural Kernel Interface) code generation backend for Trainium."""
 
+    @property
+    def use_tilestream(self) -> bool:
+        """EXPERIMENTAL: route tiling/load/store/matmul through nkilib TileStream.
+
+        Gated by ``HELION_NKI_TILESTREAM=1``. Default off — the hand-rolled
+        codegen (boundary-DMA enumeration, manual partition split, manual
+        matmul transpose) remains the production path. See
+        NKI_TILESTREAM_REFACTOR_PLAN.md.
+        """
+        return os.environ.get("HELION_NKI_TILESTREAM", "0") not in ("0", "false", "")
+
     def validate_nki_tensor_shapes(self, graph: torch.fx.Graph) -> None:
         """Run before NKI codegen: require partition dim % 128, free dim % 512."""
         from .compile_environment import CompileEnvironment
@@ -5639,7 +5651,7 @@ class NKIBackend(Backend):
 
     @property
     def library_imports(self) -> dict[str, str]:
-        return {
+        imports = {
             "math": "import math",
             "torch": "import torch",
             "helion": "import helion",
@@ -5649,6 +5661,13 @@ class NKIBackend(Backend):
             "nisa": "import nki.isa as nisa",
             "_default_nki_launcher": "from helion.runtime import default_nki_launcher as _default_nki_launcher",
         }
+        if self.use_tilestream:
+            # EXPERIMENTAL: nkilib TileStream/TensorView primitives. Only emitted
+            # when HELION_NKI_TILESTREAM=1, so legacy kernel headers are unchanged.
+            imports["_nkitile"] = (
+                "from nkilib.experimental import primitives as _nkitile"
+            )
+        return imports
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         if index_dtype != "nl.int32":

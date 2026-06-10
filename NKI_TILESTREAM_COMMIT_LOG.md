@@ -213,3 +213,23 @@ can gate); `NKIBackend.use_tilestream` now delegates to it. Added compact-blas e
 PSUM+nc_transpose+copy AND the dtype-cast (via dst dtype) into one statement.
 **Verify:** codegen flag-ON → `blas.transpose: 1, nc_transpose: 0, nc_matmul: 1` (transpose fully delegated).
 sim 256³/128³ PASS; **REAL HW flag-ON Compiler status PASS, mm PASS** (err ~1.7-4.4e-5). Flag-off tests 4/4.
+
+### S5.3 — Elementwise ops: surface analysis + decision
+
+**nkilib op split (verified by reading the primitive sources):**
+- **Compact, ndarray-friendly (clean statement-level drop-ins):** `transpose`✓, `tensor_scalar`, `activation`,
+  `reciprocal`, `broadcast` (free-dim only — asserts on partition dim 0).
+- **TileStream-only (no compact fn; takes `.get_name()` TileStream operands):** `tensor_tensor`, `Matmul`,
+  `Load`/`Store` iteration. Converting these would change the *type* of every operand variable across ~83
+  sites → high churn, high regression risk.
+
+**Key finding:** the compact fns (`blas.activation` etc.) just wrap the raw ndarray in a single-tile
+TileStream and call the SAME `nisa.*` op (e.g. `blas.activation` → `tile_stream.tile(dst,...)` →
+`nisa.activation`). So converting the 83 elementwise sites is a **pure textual rename** producing identical
+lowered NKI, plus a trace-time wrapping layer, with **zero functional/hardware-tuning benefit** (elementwise
+ops aren't tiled or gen-specific). This is the "metadata, nothing to inherit" category.
+
+**Decision:** convert the CENTRAL high-traffic compact-op emits (activation / tensor_scalar / reciprocal) so
+the common kernels read in nkilib style, via a shared `_emit_unary` helper — but do NOT chase all 83 scattered
+edge-case branches (diminishing returns, churn). `tensor_tensor`/`Matmul` stay nisa/legacy (TileStream-only,
+no benefit). This honors "looks nicer where it cleanly can" without destabilizing the backend.

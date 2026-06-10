@@ -1367,6 +1367,26 @@ other backends' codepaths:
   in it rather than a `nki/` subpackage. cute similarly added a `cute/` subpackage for its helpers; a future
   cleanup could move the NKI codegen helpers into a `nki/` subpackage to reduce the shared-file footprint.
   Functionally isolated today, but structurally heavier in shared files than cute.
+
+**Load/store size vs other backends — and why NKI's is in-file while pallas's isn't.**
+Inline load-codegen function sizes: triton ~79 lines, **pallas ~14**, metal ~66, cute ~325, **nki ~1046**.
+Pallas's 14 lines are a SHIM — it delegates to `helion/_compiler/pallas/{codegen,gather,plan_tiling}.py`
+(~1.5k lines total, handling the SAME hard cases: 25 gather + 14 scatter + broadcast markers). So pallas
+needs the same kind of indexing machinery; it just lives in a `pallas/` subpackage behind a one-line
+dispatch, whereas NKI's lives inline. This CONFIRMS the structural cleanup above: the right end-state is a
+`nki/` subpackage with the NKI load/store as a thin shim, exactly mirroring pallas. (cute is in-between:
+~325 inline + a `cute/` subpackage.) The complexity itself is inherent — any backend over a constrained
+memory model (Pallas/TPU, NKI/Trainium) needs explicit gather/scatter/flatten lowering — NKI is not an
+outlier in *amount* of logic, only in *where* it currently sits.
+
+**n-D support (correction to an earlier "3D/4D/5D" description).** The core leading-dim flattening is
+RANK-GENERIC: `for dim_i in range(tensor.dim() - 1)` folds all leading dims into one flat partition index
+under a plain `if tensor.dim() > 2` guard (memory_ops.py L10115/L11431) — so 3D, 4D, 5D, and higher all go
+through the same loop; there is no hardcoded rank cap on the contiguous/flatten path. The `== 3` checks that
+exist (L7254, L7929, L7933) are NOT a rank limit — they are fast-path detectors for one specific pattern
+(`[vec + starts, scalar, :]`, the gather seen in gdn/hstu) that only arises at 3D. Higher-rank gathers fall
+through to the generic flatten path. Practical caveat: "supported" = "the example suite exercises up to 5D
+and those pass"; arbitrary n-D is structurally handled but only validated up to the ranks the examples hit.
 - **NOT yet run for a clean PR:** the upstream `pytest test/` suite on a CUDA GPU (to prove Triton/CuTe/
   Pallas are unregressed by the shared-file edits) and `ruff`/`pyrefly` lint (CI gates). Those need a GPU box
   — unavailable on this Trainium host. The NKI-side validation (49/51 examples on hardware, codegen-parity

@@ -112,3 +112,14 @@ already in place: TileStream owns the FULL/TAIL_OVERFLOW contiguous case; legacy
 **Verify (sim):** elementwise `out[tm,tn]=x[tm,tn]+y[tm,tn]` (2 loads + store) flag-ON, M×N ∈
 {256×128, 500×128, 130×100} → all PASS, matches flag-OFF. No regression from the dual TensorView load + store.
 **Outcome:** NEG_START is OUT of TileStream scope by design — a clean boundary, not a gap.
+
+## S3.1 — Partition >128 split: already covered (scoped out)
+
+**Finding (no code change):** Helion's NDTileStrategy already caps the partition loop *step* at 128
+(`affine_range(0, 512, 128)` even when block_size=256), so each tile's partition dim is ≤128 and the S2.1/S2.2
+TensorView path handles it directly (verified: block_sizes=[256,64], 512×128 → SBUF `[128,64]`, single
+`.slice(`-based DMA, PASS). The dedicated `partition_dim > NKI_PARTITION_MAX` split branch in `load_expr`
+fires only for the rarer single-tile-logical-partition>128 case (flattened high-rank). `alloc_logical` would
+be the clean replacement there, but it's not on the common tiling path and is lower-value — **scoped out** for
+this feasibility pass.
+**Verify (sim):** bigP copy block[256,64] flag-ON M×N ∈ {256×64, 512×128, 500×64} PASS, matches flag-OFF.

@@ -276,3 +276,20 @@ x3, 8/8 run correct** (copy err 0, matmul ~2-4e-5). Flag-off 4/4 tests.
    where TensorView has no equivalent (it IS what nkilib's own DGE bottoms out to). NOT a failure.
 **Verify:** gather kernel sim flag ON==OFF PASS; flag-off 4/4 tests. Whole-row gathers can use vector_select;
 F-pattern gathers keep `.ap` (annotated in code).
+
+### D1 — matmul: transpose converted (blas.transpose); nc_matmul stays nisa (idiomatic)
+**Decision (spike-driven + idiom-confirmed):**
+- `blas.Matmul` as a full replacement for Helion's K-loop+PSUM-accumulate is finicky: spike `spike_d1.py`
+  fails with a dst tile-shape reshape error when fed Helion's per-K-iteration SBUF operands (Matmul wants to
+  own its K-grid; doesn't cleanly drop into the hand-emitted K-loop). Plan's R4/Finding-C risk realized.
+- **Idiom check (decisive):** composed nkilib kernels use BOTH `blas.Matmul` AND raw `nisa.nc_matmul` — and
+  MORE use raw `nc_matmul` (attention_block_tkg, conv1d/3d, scan/ssd, moe bwd, collectives). So keeping
+  `nc_matmul` is fully idiomatic, not a coverage gap.
+**Outcome:** matmul flag-ON converts the transpose (`blas.transpose`) + operand loads/stores
+(`dma.load`/`dma.store`); `nc_matmul` + PSUM evict (`tensor_copy`) + accumulate (`tensor_tensor`) stay nisa
+(bucket-3-style: idiomatic, nkilib does the same). matmul flag-ON inventory: nkilib={dma.load, dma.store,
+blas.transpose}, nisa={nc_matmul, tensor_copy, tensor_tensor, iota, memset}. Sim 256³/128³ + real HW PASS.
+
+### F2 — bucket-3 regression guard (PASSED)
+reduce(sum/amax via nisa.tensor_reduce), where (nisa.tensor_copy_predicated) flag-ON sim == flag-OFF, AND
+**real HW Compiler PASS + correct** — confirming bucket-3 nisa ops compose correctly with v2-converted loads.

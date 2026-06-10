@@ -48,12 +48,11 @@ def _nki_use_tilestream() -> bool:
 
 
 def _emit_activation_str(dst: str, op: str, data: str) -> str:
-    """EXPERIMENTAL: emit a unary activation as nkilib `blas.activation` when the
-    tilestream flag is on, else the legacy `nisa.activation`. Both lower to the
-    same nisa op; the blas form makes generated kernels read in nkilib style.
-    Drop-in (raw-ndarray dst/src), so no variable type changes."""
-    if _nki_use_tilestream():
-        return f"_nkitile.blas.activation(dst={dst}, src={data}, op={op})"
+    """Emit a unary activation. NOTE: blas.activation was tried (S5.4) but it wraps
+    operands in single-tile TileStreams that require 2D — and Helion applies
+    activation/reciprocal to rank-1 reduction results (e.g. softmax_decomposed's
+    sum_exp [P,1] reciprocal), which fail neuronx-cc's "needs partition+free" check.
+    The sweep caught this. Reverted to always nisa.activation (same lowering anyway)."""
     return f"nisa.activation(dst={dst}, op={op}, data={data})"
 
 
@@ -193,9 +192,13 @@ class NKIOpOverrides:
                         f"{dtype}, buffer=nl.sbuf)"
                     )
                 )
-                if _nki_use_tilestream():
-                    # blas.transpose folds the PSUM alloc + nc_transpose + copy-back
-                    # into one call (allocates its own PSUM internally).
+                # NOTE: blas.transpose was tried here (S5.1) but it asserts 2D-only
+                # src/dst tiles, and Helion's transpose operands are routinely rank-1
+                # at trace time (reduction results, [N]-vectors) even when their
+                # registered _nki_sbuf_shapes is 2D — so the registry can't gate it
+                # reliably. The sweep caught this (attention/cross_entropy regressions).
+                # Reverted to always-nc_transpose, which tolerates degenerate ranks.
+                if False:
                     state.add_statement(
                         _sfs(f"_nkitile.blas.transpose(dst={tr_sbuf}, src={transpose_src})")
                     )

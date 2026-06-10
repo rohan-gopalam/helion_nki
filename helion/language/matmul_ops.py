@@ -1192,7 +1192,7 @@ def _(state: CodegenState) -> object:
         )
 
         def _transpose_body(k_expr: str) -> list[ast.AST]:
-            if env.backend.use_tilestream:
+            if False and env.backend.use_tilestream and actual_tile_k > 1 and actual_tile_m > 1:  # blas.transpose reverted (2D-only vs rank-1 operands)
                 # blas.transpose folds PSUM alloc + nc_transpose + copy-back into
                 # one call; it also casts to the dst dtype, so the separate cast
                 # buffer collapses into the final transpose target. _stationary is

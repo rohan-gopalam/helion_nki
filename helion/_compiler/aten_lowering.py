@@ -3795,7 +3795,10 @@ def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         cast step produces the nc_matmul-compatible stationary tile.
         """
         from .nki_backend import _nki_use_tilestream
-        if _nki_use_tilestream():
+        # blas.transpose reverted (see nki_backend _layout_reconcile_transpose note):
+        # 2D-only assertion vs Helion's routinely rank-1 transpose operands. Sweep
+        # caught split_k_barrier regression. Always nc_transpose.
+        if False and _nki_use_tilestream() and TILE_K > 1 and TILE_M > 1:
             # blas.transpose folds PSUM alloc + nc_transpose + copy-back (and the
             # dtype cast, via the dst dtype) into one call. The stationary target
             # is lhs_t_cast when a cast is needed, else lhs_t_sbuf.

@@ -337,3 +337,28 @@ partials), add, sigmoid, matmul, sum-reduce, where, bias-bcast, gather.
 **G2 REAL HARDWARE** flag-ON: **10/10 PASS** through neuronx-cc on /dev/neuron0 — every bucket compiles + runs
 correct. (copy/add/sigmoid/matmul/bias-bcast/gather use converted nkilib ops; sum/where use bucket-3 nisa.)
 Flag-off `test_nki_port_codegen.py` 4/4 throughout.
+
+### S7 — CPU sweep across all examples caught 6 v2 regressions; fixed
+**Sweep harness:** `/home/ubuntu/sim_sweep_v2.py` (SWEEP_TS env → flag, separate log dirs). Legacy(effort=none)
+baseline = 40 PASS. First ts(effort=none) run: 6 regressions (attention, concatenate, cross_entropy,
+psum_reuse_test, softmax_decomposed, split_k_barrier — all PASS legacy, FAIL ts). **The sweep did its job.**
+
+**Root causes + fixes (all the S5 "cosmetic" conversions were fragile vs Helion's rank-1 operands):**
+1. **blas.transpose 2D-only** (attention/cross_entropy/split_k_barrier): asserts 2D src/dst, but Helion's
+   transpose operands are routinely rank-1 at trace time (reduction results, [N]-vectors) even when their
+   registered shape is 2D — registry can't gate it. → REVERTED S5.1/S5.2 transpose conversions to always
+   nc_transpose (matmul keeps converted dma/loads; transpose stays nisa).
+2. **blas.activation 2D-only** (softmax_decomposed): wraps operands in single-tile TileStreams needing 2D;
+   fails on rank-1 reduction results (sum_exp [P,1] reciprocal). → REVERTED S5.4; always nisa.activation.
+3. **dma.load/dma.store internal-tiling assert** (concatenate dst=1/src=2): the compact primitives do their
+   own tiling + assert equal tile counts, breaking on multi-region views. → REVERTED B1/C1 to raw
+   nisa.dma_copy ON the TensorView.slice view (the clamp — the real win — is preserved).
+4. **v2 contiguous guard too permissive**: let through shifted/masked/1-D/negative-extent slices. → TIGHTENED:
+   require extra_mask is None, ≥2 parts (2-D), and no '-' anywhere in any part.
+**Result:** 5/6 fixed to PASS. psum_reuse_test = source-inspection test (greps `dma_copy ... src=y[`); v2 moves
+`y[` to the `_ts_srcv = _nkitv(y).slice()` line → all 9 functional asserts PASS, only the legacy-source-pattern
+grep fails. Documented as expected v2-emission-shape mismatch (kernel is correct; test passes flag-off).
+
+**Net v2 conversions that SURVIVED the sweep (robust):** load/store via TensorView.slice clamp (the headline
+boundary-explosion win), partition broadcast via blas.broadcast, whole-row gather via vector_select. The
+transpose/activation "readability" conversions were reverted (2D-fragile, no functional benefit anyway).

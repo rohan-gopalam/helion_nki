@@ -3111,12 +3111,21 @@ def load_expr(
         # without any guard/branch explosion. Only fires for the clean contiguous
         # 2D case (hbm_base set, every part a plain "start:end" string); anything
         # else (indirect/dynamic/1D-reshape) falls through to the legacy path.
+        def _v2_simple_part(_p: str) -> bool:
+            # TensorView.slice asserts start>=0 and end>start. Only take the v2 fast
+            # path for a CLEARLY non-negative, non-shifted slice: NO subtraction
+            # anywhere in the part (a '-' means a shifted/NEG_START or computed
+            # range like 'offset-512:offset' that can yield a negative start OR a
+            # negative extent — those must use the legacy oob branches).
+            return "-" not in _p
         if (
             backend.use_tilestream
             and hbm_base is not None
             and parts is not None
-            and len(parts) >= 1
+            and extra_mask is None  # masked/shifted loads (concatenate) -> legacy
+            and len(parts) >= 2  # 2-D only: TensorView SBUF views need partition+free
             and all(isinstance(p, str) and ":" in p for p in parts)
+            and all(_v2_simple_part(p) for p in parts)
         ):
             # v2 (B1): nkilib-native contiguous load. Build a clamped TensorView
             # of the HBM source (slice clamps the tail to <= dim) and copy it into
@@ -3131,9 +3140,14 @@ def load_expr(
                 _tv_expr += f".slice({_d}, {_s.strip()}, {_e.strip()})"
             state.codegen.add_statement(statement_from_string(f"{_srcv} = {_tv_expr}"))
             _dst_idx = ", ".join(f"0:{_srcv}.shape[{_d}]" for _d in range(len(parts)))
+            # Use raw nisa.dma_copy on the TensorView, NOT the dma.load primitive:
+            # dma.load does its own internal tiling + asserts dst/src tile counts
+            # match, which breaks on multi-region/1-D views (sweep caught
+            # concatenate dst=1/src=2 + softmax_decomposed 1-D pattern). The
+            # TensorView.slice clamp (the nkilib-native part) is preserved.
             state.codegen.add_statement(
                 statement_from_string(
-                    f"_nkitile.dma.load({dst}[{_dst_idx}], {_srcv}.get_view())"
+                    f"nisa.dma_copy(dst={dst}[{_dst_idx}], src={_srcv}.get_view())"
                 )
             )
             return
@@ -4620,7 +4634,9 @@ def store_stmt(state: CodegenState) -> None:
             if (
                 env.backend.use_tilestream
                 and parts
+                and len(parts) >= 2  # 2-D only (TensorView SBUF views need partition+free)
                 and all(isinstance(p, str) and ":" in p for p in parts)
+                and all("-" not in p for p in parts)  # no shifted/computed-negative ranges
                 and all(_store_slice_info(p, i) is not None for i, p in enumerate(parts))
             ):
                 _dstv = device_fn.new_var("_ts_dstv")
@@ -4630,11 +4646,11 @@ def store_stmt(state: CodegenState) -> None:
                     _tv_expr += f".slice({_d}, {_s.strip()}, {_e.strip()})"
                 _src_idx = ", ".join(f"0:{_dstv}.shape[{_d}]" for _d in range(len(parts)))
                 state.codegen.add_statement(statement_from_string(f"{_dstv} = {_tv_expr}"))
-                # v2 (C1): nkilib-native store via dma.store primitive (clamped HBM
-                # dst view, SBUF src sliced to match). Lowers to the same nisa.dma_copy.
+                # Raw nisa.dma_copy on the clamped TensorView dst (NOT dma.store
+                # primitive — same internal-tiling-mismatch issue as dma.load).
                 state.codegen.add_statement(
                     statement_from_string(
-                        f"_nkitile.dma.store({_dstv}.get_view(), {{value}}[{_src_idx}])",
+                        f"nisa.dma_copy(dst={_dstv}.get_view(), src={{value}}[{_src_idx}])",
                         value=src_value,
                     )
                 )

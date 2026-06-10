@@ -360,6 +360,35 @@ def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
     return skipIfFn(lambda: _get_backend() != "tileir", reason)
 
 
+def skipUnlessNKI(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless the NKI backend can actually run.
+
+    NKI executes either on Trainium via ``torch_xla`` or, with
+    ``HELION_NKI_SIMULATE=1``, on CPU via the ``nki`` simulator. The test is
+    enabled only when the active backend is ``nki`` AND at least one of those
+    runtimes is importable, so the suite stays green on non-Trainium machines.
+    """
+
+    def _nki_runnable() -> bool:
+        if _get_backend() != "nki":
+            return False
+        if os.environ.get("HELION_NKI_SIMULATE", "0") not in ("0", "false", ""):
+            try:
+                import nki  # noqa: F401
+
+                return True
+            except ImportError:
+                return False
+        try:
+            import torch_xla  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+    return skipIfFn(lambda: not _nki_runnable(), reason)
+
+
 CUTE_MIN_CUDA_VERSION = "13"
 
 

@@ -81,6 +81,40 @@ A satisfied); the body is now nkilib-native (Finding C matched).
 
 ---
 
+## 1b. Fallback policy: TOTAL v2, loud errors, no silent fallthrough (user decision 2026-06-10)
+
+When `HELION_NKI_TILESTREAM=1`, the v2 path is **total**: every structured op routes to TensorView/TileStream.
+A shape that v2 does not yet cover raises `exc.BackendUnsupported(name, "v2: <case> not yet on tilestream")`
+— it MUST NOT silently fall through to legacy. This makes the experiment actually answer "can everything be
+done in nkilib terms," and makes every remaining gap loud and visible.
+
+Legacy body-codegen stays **physically present but reachable only flag-OFF**, serving as the A/B correctness
+reference (sim + HW: v2 output must match legacy output for every test kernel). The S2.1/S2.2 `.slice`
+interception is REMOVED as a fallthrough — it becomes part of the total v2 path (it's the contiguous case).
+
+**Complete coverage inventory (every case v2 must handle — audited from `load_expr`/`store_stmt`/op handlers):**
+
+| Case | nkilib expression | Difficulty |
+|---|---|---|
+| contiguous tile (full / tail-overflow) | `TensorView.slice` (clamps) or `tile_hbm`+`tile_at` | done (S2.1/2.2) |
+| partition > 128 | `alloc_logical` split + `tile` | easy |
+| 1-D reshaped tensor | `reshape_dim` + `tile_hbm` | easy |
+| scalar index `x[5,:]` | `TensorView.select(dim, 5)` | easy |
+| **indirect gather** `table[idx[t]]` | `TensorView.vector_select` + `dma.Load(vector_index=, index_dim=)` | medium |
+| **scalar dynamic** `x[dyn_counter]` (dynamic_range) | `TensorView.select(dim, runtime_idx)` (scalar_offset) | medium |
+| **NEG_START / shifted** `x[i-pad]` | `dma.Load(..., oob_mode=skip)` — NOT `slice` (asserts start≥0) | hard (R-NEG) |
+| **partition broadcast** `[1,F]→[P,F]` | `blas.broadcast(dst, src, src_partition)` — NOT `TensorView.broadcast` (asserts dim 0) | hard (R-BC) |
+| matmul | `blas.Matmul` | Phase D |
+| elementwise binary | `blas.TensorTensor` over streams | Phase E2 |
+| elementwise unary / scalar | `blas.activation` / `blas.tensor_scalar` | done (S5.4) |
+| transpose | `blas.transpose` | done (S5.1/5.2) |
+
+The two HARD cases each get a dedicated primitive that is NOT the one used elsewhere:
+- **R-NEG (NEG_START):** `TensorView.slice` cannot express negative start. Use `dma.Load` with
+  `oob_mode=skip` over a memset(0) buffer (S0.1 spike proved correct). Phase B3.
+- **R-BC (partition broadcast):** `TensorView.broadcast` asserts dim 0. Use `blas.broadcast` (partition
+  replicate). Phase E3.
+
 ## 2. Design: a parallel "v2 body codegen" behind the existing flag
 
 `HELION_NKI_TILESTREAM=1` already exists. We extend its meaning: when on, the NKI backend uses **v2
@@ -115,22 +149,27 @@ The v2 module exposes, per structured op, an emitter that consumes the SAME inpu
   grid coord for `tile_at`. Handle the partition-tile-step cap (Finding: Helion caps partition step at 128).
   *Gate:* string-assert. Commit.
 
-### PHASE B — Load path to TileStream objects (the core)
-- **B1. `v2_load` for the clean contiguous 2-D case.** In `nki/codegen.py` `load_expr`, when
-  `use_tilestream` AND contiguous, route to `v2_load`: hoist an `HBMStream` for the tensor (once),
-  `alloc_logical` the SBUF dst, build dst `TileStream`, emit `dma.Load(dst, src.tile_at(grid)).execute()`,
-  return the buf. This SUPERSEDES the S2.1 `.slice` interception for the contiguous case (keep `.slice` as the
-  fallback for shapes `v2_load` doesn't cover yet).
-  *Gate:* copy + add kernels, sim flag on/off identical; **real HW compile+run**; codegen shows
+### PHASE B — Load path to TileStream objects (the core) — TOTAL, no fallthrough
+- **B0. Install the v2 dispatch + loud guard.** In `load_expr`, when `use_tilestream`, route ALL cases to
+  `v2_load`; `v2_load` raises `BackendUnsupported("v2 load: <case>")` for anything not yet implemented.
+  Remove the S2.1 `.slice` as a *fallthrough* (fold it into v2 as the contiguous case). *Gate:* a known
+  contiguous kernel works; an unimplemented case raises loudly (asserted in a test). Commit.
+- **B1. Contiguous (full / tail-overflow).** Hoist `HBMStream` once; `alloc_logical` dst; `dma.Load(dst,
+  src.tile_at(grid)).execute()`. *Gate:* copy+add, sim on==off, **real HW**; codegen shows
   `alloc_logical`/`tile_hbm`/`dma.Load`. Commit.
-- **B2. Extend `v2_load` coverage:** tail-overflow (partial M/N — `tile_at` clamps natively), then 1-D
-  reshaped tensors, then partition>128 (now `alloc_logical` does the split). Each sub-step its own sim+HW
-  gate + commit. Anything still uncovered falls through to S2.1 `.slice` (correctness never regresses).
+- **B2. 1-D reshape + partition>128 + scalar index.** `reshape_dim`/`tile_hbm` for 1-D; `alloc_logical` split
+  for >128; `TensorView.select` for `x[5,:]`. Each sub-step sim+HW + commit.
+- **B3. R-NEG (NEG_START / shifted `x[i-pad]`).** `dma.Load(..., oob_mode=skip)` over memset(0) buffer (NOT
+  `slice`). *Gate:* a windowed/shifted kernel, sim on==off + HW. Commit.
+- **B4. Gather (`table[idx[t]]`, IndirectAP) + scalar-dynamic (DynamicAP).** `TensorView.vector_select` +
+  `dma.Load(vector_index=, index_dim=)`; dynamic via `select(runtime_idx)`. *Gate:* embedding/gather kernel
+  sim+HW. Commit. (Highest-risk load case; this is what makes "no fallback" real.)
 
-### PHASE C — Store path
-- **C1. `v2_store`** symmetric to B1 (`dma.Store(dst=out_hbm.tile_at(grid), src=buf_ts)`). Supersedes S2.2.
-  *Gate:* copy round-trip + add, sim + HW. Commit.
-- **C2.** Extend coverage (partial, 1-D, scatter falls through to legacy). Gate + commit per sub-step.
+### PHASE C — Store path — TOTAL, no fallthrough
+- **C1. Contiguous store** `dma.Store(dst=out_hbm.tile_at(grid), src=buf_ts)`. Loud guard for uncovered.
+  *Gate:* copy round-trip + add, sim on==off + HW. Commit.
+- **C2. Partial + 1-D + scatter.** scatter via `dma.Store`/DGE; loud guard otherwise. Gate + commit per
+  sub-step until store has zero `BackendUnsupported` on the test set.
 
 ### PHASE D — Matmul to blas.Matmul (now tractable — we own the body)
 - **D1.** In `aten_lowering.py` mm/addmm: when `use_tilestream`, build moving/stationary/dst TileStreams
@@ -141,19 +180,26 @@ The v2 module exposes, per structured op, an emitter that consumes the SAME inpu
   *Gate:* matmul 256³/128³/partial, sim + **HW**, vs `x@y`. Commit. (This is the riskiest phase — keep the
   legacy fall-through generous.)
 
-### PHASE E — Allocation + elementwise polish (make the whole body nkilib-native)
-- **E1.** Route accumulator/`full`/`hl.zeros` buffer allocs through `alloc_logical` (creation_ops.py,
-  matmul result bufs). *Gate:* reduction + matmul kernels sim+HW. Commit.
-- **E2.** Where operands are already TileStreams (post B/C), switch elementwise `nisa.tensor_tensor` →
-  `blas.TensorTensor` over those streams (now type-compatible, unlike the S5.3 blocker). Only where both
-  operands are v2 streams; else keep `nisa`. *Gate:* add/mul/where kernels. Commit.
+### PHASE E — Allocation + elementwise (make the whole body nkilib-native) — TOTAL
+- **E1.** Route accumulator/`full`/`hl.zeros`/matmul-result buffer allocs through `alloc_logical`. *Gate:*
+  reduction + matmul kernels sim+HW. Commit.
+- **E2.** Elementwise binary → `blas.TensorTensor` over streams (now type-compatible — the S5.3 blocker is
+  removed because v2 operands ARE streams). Under no-fallthrough this is REQUIRED, not optional: every
+  `nisa.tensor_tensor` site reachable flag-on must convert or raise. *Gate:* add/mul/sub/where/maximum
+  kernels, sim on==off + HW. Commit.
+- **E3. R-BC (partition broadcast `[1,F]→[P,F]`).** `blas.broadcast(dst, src, src_partition)` (NOT
+  `TensorView.broadcast`, which asserts dim 0). Replaces `_emit_partition_broadcast`. *Gate:* a
+  partition-broadcast kernel (e.g. bias add over rows), sim on==off + HW. Commit.
+- **E4. Sweep remaining `nisa.*` body emits** (tensor_scalar edge branches, masking predicated copies, iota
+  index materialization) → nkilib equivalents or explicit `BackendUnsupported`. Goal: ZERO raw `nisa.*` in a
+  flag-on generated kernel for the test set (except where nkilib genuinely has no primitive — documented).
 
-### PHASE F — Dynamic/jagged loops (decision phase)
-- **F1.** Assess whether `dma.Load` + `tile_at` compose with the `_nki_dyn_loops` counter mechanism and the
-  jagged nested-demotion logic. The dynamic path shares the `offset_N` slot (Finding A) and prepends a counter
-  increment. Likely outcome: **keep dynamic/jagged on legacy** (it's correct, isolated, and nkilib's static
-  `tile_at` doesn't model data-dependent bounds). Document the boundary. Spike before deciding. Commit (or
-  documented scope-out).
+### PHASE F — Dynamic/jagged loops — must be covered too (no fallthrough)
+- **F1.** Because there is no fallthrough, dynamic_range/jagged MUST either convert or raise loudly. Spike
+  whether `dma.Load(vector_index/scalar_offset)` + the `_nki_dyn_loops` counter compose. If they do → convert
+  (B4 mechanism extended to the counter offset). If a specific jagged nesting genuinely can't map → raise
+  `BackendUnsupported("v2: nested jagged")` and record it as the one explicit gap (the experiment's honest
+  answer: "everything EXCEPT X"). *Gate:* jagged_tile example sim+HW or documented loud gap. Commit.
 
 ### PHASE G — Full validation + cleanup
 - **G1.** Run the example suite under sim (flag on) for the kernels that exercise B–E; A/B vs flag-off.
@@ -173,7 +219,9 @@ The v2 module exposes, per structured op, an emitter that consumes the SAME inpu
 | R4 | Matmul stream orientation / PSUM-reuse / sub-tiling not expressible in blas.Matmul. | Generous legacy fall-through (D1); convert only the shapes that map; keep nc_matmul otherwise. |
 | R5 | HBMStream hoisting before the loop interacts badly with nested loops / multiple uses. | Dedup registry keyed on (name, tile_shape); hoist to `outer_prefix` of the OUTERMOST active loop; test nested (matmul has 3 loops). |
 | R6 | Dynamic/jagged counter mechanism (Finding: `_nki_dyn_loops`) incompatible with tile_at. | Phase F assesses; default = keep dynamic/jagged on legacy. Correctness preserved. |
-| R7 | Coverage gaps in v2_load/store silently wrong. | Every v2 path has an explicit guard; uncovered shapes FALL THROUGH to the S2.1/S2.2 `.slice` path (already HW-verified), never to broken code. |
+| R7 | Coverage gaps under NO-fallthrough policy = hard failures, not silent-correct. | Every uncovered shape raises a LOUD `BackendUnsupported("v2: <case>")` — never a wrong result. flag-OFF legacy is the A/B reference to prove each converted case matches. Gaps are visible work items, not hidden bugs. |
+| R-NEG | `TensorView.slice` refuses negative start (NEG_START/shifted). | Phase B3: `dma.Load(oob_mode=skip)` over memset(0) buffer (S0.1-proven), not slice. |
+| R-BC | `TensorView.broadcast` refuses partition dim 0. | Phase E3: `blas.broadcast` partition-replicate primitive. |
 | R8 | Autotuner composition (block sizes / loop order). | Scaffold still owns block sizes + loop order; `tile_at` just consumes `offset_N`. Validate one autotuned config in G. |
 | R9 | Generated-code bloat (alloc_logical + stream per tile inside loop). | Hoist streams outside loop (Finding C pattern); `alloc_logical` of the reused buffer can also hoist. Measure lines in G. |
 | R10 | nkilib `tile_at`/`alloc_logical` semantics differ from our spikes on real HW. | Every phase gates on real `/dev/neuron0` compile+run, not just sim. |
@@ -181,15 +229,18 @@ The v2 module exposes, per structured op, an emitter that consumes the SAME inpu
 ## 5. Do-NOT list
 - Do NOT remove the Python `for offset_N in affine_range` scaffold (Finding C: nkilib keeps it).
 - Do NOT touch `active_device_loops` / `add_device_loop` / `set_statements` (Finding B).
-- Do NOT convert dynamic/jagged loops without the Phase F spike.
-- Do NOT remove the S2.1/S2.2 `.slice` paths — they are the safety fall-through for uncovered shapes.
+- Do NOT let v2 silently fall through to legacy — uncovered shapes raise `BackendUnsupported` (§1b).
+- Do NOT delete the legacy body-codegen — it stays flag-OFF as the A/B correctness reference.
 - Do NOT break flag-off: legacy bodies stay byte-identical (gate: `test_nki_port_codegen.py` 4/4 every step).
 - Do NOT `git push` / merge.
 
 ## 6. Execution checklist
-A1 stream registry → A2 grid-coord helper → B1 v2_load contiguous → B2 v2_load coverage (partial/1-D/part>128)
-→ C1 v2_store → C2 store coverage → D1 blas.Matmul → E1 alloc_logical allocs → E2 blas.TensorTensor on streams
-→ F1 dynamic/jagged decision → G1 sim suite → G2 HW spot-checks → G3 findings + recommendation.
+A1 stream registry → A2 grid-coord helper → B0 v2 dispatch + loud guard (remove .slice fallthrough) →
+B1 contiguous → B2 1-D/part>128/scalar-index → B3 NEG_START (oob_mode) → B4 gather+dynamic →
+C1 store contiguous → C2 store partial/1-D/scatter → D1 blas.Matmul → E1 alloc_logical → E2 blas.TensorTensor →
+E3 partition broadcast (blas.broadcast) → E4 nisa.* sweep-to-zero → F1 dynamic/jagged convert-or-loud-gap →
+G1 sim suite (v2==legacy) → G2 HW spot-checks → G3 findings (incl. the definitive list of any X that could NOT
+be expressed in nkilib).
 
 Each step: flag-gated, sim A/B (on==off correctness), real-HW compile+run for the touched pattern,
 `test_nki_port_codegen.py` 4/4 flag-off, one commit. Log every step in `NKI_TILESTREAM_COMMIT_LOG.md`.

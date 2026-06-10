@@ -88,7 +88,7 @@ def load_expr(
     # input/output to the kernel), redirect reads to the return buffer so we
     # see the latest writes. Without this, reads go to the uninitialized
     # input parameter and produce NaN/garbage (e.g. SE net's c @ b chain).
-    _ret_bufs = getattr(device_fn, "_nki_return_buffers", {})
+    _ret_bufs = device_fn._nki_return_buffers
     _ret_info = _ret_bufs.get(id(tensor))
     if _ret_info is not None and "buf_name" in _ret_info:
         name = _ret_info["buf_name"]
@@ -455,9 +455,7 @@ def load_expr(
                 _iota_ast = state.codegen.ast_for_fx_node(fx_node_tdi_check)
                 if isinstance(_iota_ast, ast.AST):
                     _iota_nm = ast.unparse(_iota_ast)
-                    _iota_off = getattr(
-                        state.device_function, "_nki_iota_offsets", {}
-                    ).get(_iota_nm)
+                    _iota_off = state.device_function._nki_iota_offsets.get(_iota_nm)
                     if _iota_off is not None and _iota_off != offset_var:
                         _shifted_iota = f"{_iota_off}:{_iota_off}+{int(block_size)}"
                         if tdi == 0:
@@ -498,9 +496,7 @@ def load_expr(
                 ):
                     _ck_target_dyn = str(getattr(fx_node_tdi_check, "target", ""))
                     if "add.Tensor" in _ck_target_dyn or "sub.Tensor" in _ck_target_dyn:
-                        _sbuf_shapes_dyn = getattr(
-                            getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
-                        )
+                        _sbuf_shapes_dyn = state.device_function._nki_sbuf_shapes
                         for _dyn_ck_arg in fx_node_tdi_check.args[:2]:
                             if isinstance(_dyn_ck_arg, torch.fx.Node):
                                 _dyn_ck_ast = state.codegen.ast_for_fx_node(_dyn_ck_arg)
@@ -554,9 +550,7 @@ def load_expr(
                 # of an SBUF operand. If so, this needs the flat gather path (else
                 # branch below) — don't emit a plain slice. We detect this by
                 # checking if fx_node_tdi_check is an add/sub involving an SBUF tile.
-                _sbuf_shapes_ck = getattr(
-                    getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
-                )
+                _sbuf_shapes_ck = state.device_function._nki_sbuf_shapes
                 _needs_flat_gather = False
                 if isinstance(fx_node_tdi_check, torch.fx.Node):
                     _ck_target = str(getattr(fx_node_tdi_check, "target", ""))
@@ -775,7 +769,7 @@ def load_expr(
             if list(mask_shape) != list(sbuf_shape):
                 pred_src_name = device_fn.new_var("_nki_mask_bcast", dce=True)
                 device_fn._nki_sbuf_shapes[pred_src_name] = list(sbuf_shape)
-                mask_dtype = getattr(device_fn, "_nki_sbuf_dtypes", {}).get(
+                mask_dtype = device_fn._nki_sbuf_dtypes.get(
                     mask_name, "nl.int32"
                 )
                 device_fn._nki_sbuf_dtypes[pred_src_name] = mask_dtype
@@ -1015,7 +1009,7 @@ def load_expr(
             # For float buffers we use -inf fill so that:
             #   max(-inf, x) = x  (correct for amax reduction)
             #   exp(-inf)    = 0  (correct for exp-sum reduction)
-            _active_lps_fg = getattr(state.codegen, "active_device_loops", {})
+            _active_lps_fg = state.codegen.active_device_loops
             from ..compile_environment import CompileEnvironment as _CE_fg
             _env_fg = _CE_fg.current()
             _fg_jagged_mask: str | None = None
@@ -1422,7 +1416,7 @@ def load_expr(
                 # inside a second loop with the same block_idx but a different mask var.
                 _jagged_row_mask: str | None = None
                 _tile_dispatch = getattr(state, "tile_strategy", None)
-                _active_loops = getattr(state.codegen, "active_device_loops", {})
+                _active_loops = state.codegen.active_device_loops
                 if _tile_dispatch is not None:
                     # Upstream wraps block_id_to_strategy in a
                     # BlockIDStrategyMapping (no .values(); has .items());
@@ -1454,7 +1448,7 @@ def load_expr(
                     print(f"[JAGGED_DBG] jagged_row_mask={_jagged_row_mask}, strategies={[type(s).__name__ for s in _strategies] if _tile_dispatch else 'none'}, p_count={p_count}, k_count={k_count}")
                     print(f"  active_device_loops={list(getattr(state.codegen, 'active_device_loops', {}).keys())}")
                     # Show all registered SBUF shapes that match [p,k] or look like masks
-                    _sbuf = getattr(device_fn, "_nki_sbuf_shapes", {})
+                    _sbuf = device_fn._nki_sbuf_shapes
                     _matching = [(k, v) for k, v in _sbuf.items() if v == [p_count, k_count]]
                     print(f"  SBUF vars with shape [{p_count},{k_count}]: {_matching[:5]}")
                     _mask_like = [(k, v) for k, v in _sbuf.items() if ("cmp" in k or "mask" in k or "pred" in k)]
@@ -2067,7 +2061,7 @@ def load_expr(
                         _store_total_elems_scatter = int(_store_tensor_val.numel())
                         _store_tensor_id = id(_store_tensor_val)
                         # Check if the return buffer is already allocated
-                        _ret_bufs = getattr(device_fn, "_nki_return_buffers", {})
+                        _ret_bufs = device_fn._nki_return_buffers
                         if _store_tensor_id in _ret_bufs:
                             _store_out_buf = _ret_bufs[_store_tensor_id]["buf_name"]
                         else:
@@ -3412,7 +3406,7 @@ def load_expr(
         if list(mask_shape) != list(sbuf_shape):
             pred_src_name = device_fn.new_var("_nki_mask_bcast", dce=True)
             device_fn._nki_sbuf_shapes[pred_src_name] = list(sbuf_shape)
-            mask_dtype = getattr(device_fn, "_nki_sbuf_dtypes", {}).get(
+            mask_dtype = device_fn._nki_sbuf_dtypes.get(
                 mask_name, "nl.int32"
             )
             device_fn._nki_sbuf_dtypes[pred_src_name] = mask_dtype
@@ -3648,7 +3642,7 @@ def store_stmt(state: CodegenState) -> None:
                 ):
                     _ck_target_st = str(getattr(fx_node_i, "target", ""))
                     if "add.Tensor" in _ck_target_st or "sub.Tensor" in _ck_target_st:
-                        _sbuf_shapes_st = getattr(device_fn, "_nki_sbuf_shapes", {})
+                        _sbuf_shapes_st = device_fn._nki_sbuf_shapes
                         for _st_ck_arg in fx_node_i.args[:2]:
                             if isinstance(_st_ck_arg, torch.fx.Node):
                                 _st_ck_ast = state.codegen.ast_for_fx_node(_st_ck_arg)

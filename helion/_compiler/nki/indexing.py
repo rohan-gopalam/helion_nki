@@ -175,9 +175,7 @@ def _nki_shifted_tile_subscript(
                 # etc.) cannot be used as integer offsets in DMA slice
                 # expressions. Check both the sbuf_shapes dict and variable
                 # naming conventions (_nki_*, indices_*).
-                _sbuf_shapes = getattr(
-                    getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
-                )
+                _sbuf_shapes = state.device_function._nki_sbuf_shapes
                 # Block SBUF tile variables from being used as DMA slice offsets.
                 # SBUF tiles cannot be used as Python integers in DMA slice
                 # expressions — they cause NKI compile errors like
@@ -222,9 +220,7 @@ def _nki_shifted_tile_subscript(
             _lhs_ast = state.codegen.ast_for_fx_node(args[0])
             if isinstance(_lhs_ast, ast.AST):
                 _candidate_lhs = ast.unparse(_lhs_ast)
-                _sbuf_shapes_rev = getattr(
-                    getattr(state, "device_function", None), "_nki_sbuf_shapes", {}
-                )
+                _sbuf_shapes_rev = state.device_function._nki_sbuf_shapes
                 _is_sbuf_tile_lhs = (
                     _candidate_lhs in _sbuf_shapes_rev
                     or _candidate_lhs.startswith(("_nki_", "indices_"))

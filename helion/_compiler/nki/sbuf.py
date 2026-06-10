@@ -24,5 +24,5 @@ def _nki_lookup_sbuf_shape_dtype(
             if shape is not None:
                 name = lookup
                 break
-    dtype = getattr(device_fn, "_nki_sbuf_dtypes", {}).get(name, "nl.int32")
+    dtype = device_fn._nki_sbuf_dtypes.get(name, "nl.int32")
     return shape, dtype

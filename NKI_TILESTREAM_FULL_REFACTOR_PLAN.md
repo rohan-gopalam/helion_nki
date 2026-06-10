@@ -283,3 +283,53 @@ Each step: flag-gated, sim A/B (on==off correctness), real-HW compile+run for th
 Files: `helion/_compiler/nki/{tilestream_codegen.py(NEW), codegen.py, tilestream_emit.py}`,
 `helion/_compiler/{nki_backend.py, aten_lowering.py, tile_strategy.py, device_function.py, creation_ops.py}`,
 `helion/language/matmul_ops.py`. nkilib ref: `/opt/aws_neuronx_venv_pytorch_2_9/.../nkilib/`.
+
+---
+
+## FINDINGS (executed 2026-06-10; full per-step log in NKI_TILESTREAM_COMMIT_LOG.md S6/A–G)
+
+**Outcome: the full body-codegen refactor is implemented, flag-gated, and validated on real Trainium.
+Flag-ON kernels match flag-OFF correctness exactly (10/10 sim A/B, 10/10 real-HW), and read in nkilib style
+for every op that has a nkilib primitive accepting raw ndarrays.**
+
+### Definitive op coverage table (the honest answer to "can everything be nkilib?")
+
+| Op category | Flag-ON emits | Bucket | Why |
+|---|---|---|---|
+| contiguous load (full/partial) | `dma.load` + `_nkitv(...).slice()` | 1 CONVERT | clamp via TensorView.slice; primitive takes raw ndarray |
+| contiguous store | `dma.store` | 1 CONVERT | symmetric |
+| partition>128 / 1-D / scalar-idx | `dma.load` (clamped views) | 1 CONVERT | handled by the contiguous path |
+| transpose (layout + matmul) | `blas.transpose` | 1 CONVERT | folds PSUM+nc_transpose+copy+cast |
+| activation / reciprocal | `blas.activation` | 1 CONVERT | raw-ndarray compact fn |
+| partition broadcast `[1,F]→[P,F]` | `blas.broadcast` | 2 HARD | TensorView.broadcast asserts dim 0; dedicated prim |
+| whole-row gather | `TensorView.vector_select` | 1 CONVERT | SW-DGE .ap (sim-compatible) |
+| **flattened F-pattern gather** | `.ap(vector_offset=)` (nisa) | 3 STAYS | vector_select can't express `[[1,P],[1,F]]`; IS what nkilib DGE bottoms to |
+| **matmul `nc_matmul`** + evict + accumulate | `nisa.nc_matmul`/`tensor_copy`/`tensor_tensor` | 3 STAYS | blas.Matmul owns its K-grid (doesn't compose); raw nc_matmul is idiomatic (most composed nkilib kernels use it) |
+| **elementwise binary** (add/mul/where…) | `nisa.tensor_tensor` | 3 STAYS | blas.TensorTensor is TileStream-typed → type cascade, identical lowering, no benefit |
+| **buffer alloc** | `nl.ndarray` | 3 STAYS | alloc_logical returns TensorView (no __getitem__) → type cascade across all consumers |
+| **reductions/scans/cumulative** | `nisa.tensor_reduce`/`tensor_tensor_scan`/… | 3 STAYS | nkilib has NO primitive; its own kernels use raw nisa |
+| **predicated/masking** | `nisa.tensor_copy_predicated` | 3 STAYS | no nkilib primitive |
+| **iota / memset** | `nisa.iota` / `nisa.memset` | 3 STAYS | index/init tied to `indices_N` contract (Finding A) |
+| **dynamic / jagged** | legacy dynamic_range + nisa | 3 STAYS | `tile_at` can't model data-dependent bounds; unchanged by v2 |
+
+### Two refinements the execution forced on the plan
+1. **Gather: use `TensorView.vector_select`, NOT `dma.Load(vector_index=)`** — the latter emits HW-DGE
+   (`dge_mode=1`) which `nki.simulate` rejects; vector_select emits SW-DGE `.ap` (sim-validatable). And the
+   flattened F-pattern sub-form has no vector_select equivalent → stays `.ap`.
+2. **The real conversion boundary is "primitive accepts raw ndarrays"** — `dma.load`/`store`/`blas.transpose`/
+   `activation`/`broadcast`/`vector_select` take raw ndarrays and return nisa-usable views, so they're
+   localized swaps. `alloc_logical`/`blas.TensorTensor`/`blas.Matmul` are TileStream-typed end-to-end → would
+   cascade a type change across Helion's raw-ndarray-indexing body for ZERO benefit (identical lowering). They
+   correctly stay nisa. This matches how nkilib's OWN composed kernels mix `tile_stream`/`dma`/`blas` (movement)
+   with raw `nisa` (reduce/scan/matmul/predicate).
+
+### Recommendation
+- The v2 path is **correct, real-HW-validated, and reversible** (flag default OFF; legacy is the A/B
+  reference; `test_nki_port_codegen.py` 4/4 flag-off throughout).
+- "Everything in nkilib, zero nisa" is **neither achievable nor idiomatic** — nkilib itself has no primitive
+  for reduce/scan/predicate and uses raw nisa for matmul in most kernels. The achieved state — nkilib for
+  data-movement/transpose/unary/partition-broadcast/gather, raw nisa for compute/reduce/alloc — IS the
+  structure of a hand-written nkilib kernel.
+- For production: the load/store/transpose/broadcast conversions are clean wins (future-proofed via the
+  maintained primitives, no perf change). The compute/alloc ops should stay nisa. Recommend HW perf profiling
+  before flag-default-ON, and resolving the autotuner-config composition for jagged kernels (orthogonal to v2).

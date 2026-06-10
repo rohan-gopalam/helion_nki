@@ -322,3 +322,18 @@ for data movement/transpose/unary/partition-bcast; raw `nisa` ONLY for bucket-3 
 tensor_copy_predicated, scalar_tensor_tensor, iota, memset) + tensor_tensor/nc_matmul (type-cascade/idiomatic,
 E1/E2/D1). This matches the structure of a hand-written nkilib kernel. No bucket-4 (unclassified) ops remain
 in the tested set.
+
+### F1 — dynamic/jagged: unchanged by v2 (identical flag on/off)
+**Finding:** jagged_sum codegen behaves IDENTICALLY flag-on vs flag-off (same InductorLoweringError with
+naive configs; needs the example's autotuned config). v2 introduces NO regression in the dynamic/jagged path.
+The dynamic-range loop + counter mechanism + jagged gather stay on the legacy nisa path (bucket-3:
+dynamic_range/scalar_offset have no static-tile nkilib equivalent — `tile_at` can't model data-dependent
+bounds). This is the documented gap: jagged/dynamic stays nisa, exactly as the no-fallthrough policy allows
+for "no nkilib primitive" cases.
+
+### G1/G2 — full validation (PASSED)
+**G1 sim A/B** (`/home/ubuntu/ts_v2_validate.py`): flag OFF and ON both **10/10** identical — copy(×3 incl.
+partials), add, sigmoid, matmul, sum-reduce, where, bias-bcast, gather.
+**G2 REAL HARDWARE** flag-ON: **10/10 PASS** through neuronx-cc on /dev/neuron0 — every bucket compiles + runs
+correct. (copy/add/sigmoid/matmul/bias-bcast/gather use converted nkilib ops; sum/where use bucket-3 nisa.)
+Flag-off `test_nki_port_codegen.py` 4/4 throughout.

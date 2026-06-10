@@ -5667,6 +5667,9 @@ class NKIBackend(Backend):
             imports["_nkitile"] = (
                 "from nkilib.experimental import primitives as _nkitile"
             )
+            imports["_nkitv"] = (
+                "from nkilib.core.utils.tensor_view import TensorView as _nkitv"
+            )
         return imports
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:

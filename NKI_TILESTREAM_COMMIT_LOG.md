@@ -57,3 +57,29 @@ tile_hbm/Load/Store/Matmul). Pure string builders, unit-testable. Strings verifi
 S0.1 spike kernels that simulated correctly, and `_nkitile.{tile_stream,dma.Load,dma.Store,blas.Matmul,
 RowMajor}` attribute paths all resolve against the installed nkilib.
 **Verify (gate passed):** all emitter asserts pass; attribute-path check green.
+
+## S2.1 — TileStream load path for contiguous tiles (flag-gated)
+
+**Files:** `helion/_compiler/nki_backend.py` (add `_nkitv` import), `helion/_compiler/nki/codegen.py`
+(`_emit_dma_copy`).
+
+**Design refinement (spike-driven):** `dma.Load.execute()` owns tile iteration, which does NOT compose with
+Helion's already-emitted per-tile `affine_range` body. The right drop-in (verified by
+`/tmp/ts_spike/spike_tv_{loopvar,fixed}.py`) is: keep Helion's fixed `[P,F]` buffer + `memset(0)`, and replace
+the fast-path DMA + 3^N `tail_cases` boundary enumeration with ONE `TensorView(hbm).slice(d, start, end)`
+chain whose `min()`-clamp produces the correct partial extent; DMA into `dst[0:srcv.shape[0], ...]`. The
+memset(0) preserves legacy zero-fill semantics for the dropped region.
+
+**Scope:** fires only for the clean contiguous 2D case (`hbm_base` set, every `part` a plain `start:end`
+string). Indirect/dynamic/1D-reshape fall through to legacy. Flag-gated on `backend.use_tilestream`.
+
+**Verify (sim, gate passed):**
+- 2D copy (`out[tm,tn]=x[tm,tn]`, block [128,64]) flag-ON: M×N ∈ {256×128, **500×128**, **130×64**, **256×100**}
+  → all PASS, max_err 0.0 — matches flag-OFF baseline exactly. The partial configs (500,130,N=100) are the
+  ones that produced the boundary explosion.
+- Generated code flag-ON: `.slice(` count 2, **`offset < 0` boundary branches: 0** (was 8 for 2D). One
+  `_nkitv(x).slice(0,offset_0,offset_0+128).slice(1,offset_1,offset_1+64)` + one clamped `dma_copy`.
+- `test/test_nki_port_codegen.py` 4/4 pass flag-OFF (legacy unchanged).
+- KNOWN pre-existing (NOT introduced here): 1D copy (`out[t]=x[t]`) with non-divisible M fails on BOTH flag
+  on/off — the 1D-free-axis STORE path (`nki_return_buf[0:1, offset:offset+128]`) is unguarded OOB. Unrelated
+  to load; store path is S2.2.

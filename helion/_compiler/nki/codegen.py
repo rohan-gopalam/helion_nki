@@ -3071,6 +3071,33 @@ def load_expr(
         parts: list[str] | None = None,
         hbm_base: str | None = None,
     ) -> None:
+        # EXPERIMENTAL (HELION_NKI_TILESTREAM): replace the fast-path DMA + the
+        # 3^N boundary-tail enumeration with ONE TensorView-clamped DMA. The SBUF
+        # dst is already memset(0), so a partial tile fills only its valid
+        # sub-rectangle and the remainder stays zero — matching legacy semantics
+        # without any guard/branch explosion. Only fires for the clean contiguous
+        # 2D case (hbm_base set, every part a plain "start:end" string); anything
+        # else (indirect/dynamic/1D-reshape) falls through to the legacy path.
+        if (
+            backend.use_tilestream
+            and hbm_base is not None
+            and parts is not None
+            and len(parts) >= 1
+            and all(isinstance(p, str) and ":" in p for p in parts)
+        ):
+            _tv_expr = f"_nkitv({hbm_base})"
+            for _d, _p in enumerate(parts):
+                _s, _e = _p.split(":", 1)
+                _tv_expr += f".slice({_d}, {_s.strip()}, {_e.strip()})"
+            _srcv = device_fn.new_var("_ts_srcv")
+            _dst_idx = ", ".join(f"0:{_srcv}.shape[{_d}]" for _d in range(len(parts)))
+            state.codegen.add_statement(statement_from_string(f"{_srcv} = {_tv_expr}"))
+            state.codegen.add_statement(
+                statement_from_string(
+                    f"nisa.dma_copy(dst={dst}[{_dst_idx}], src={_srcv}.get_view())"
+                )
+            )
+            return
         oob_arg = (
             ", oob_mode=nisa.oob_mode.skip"
             if (

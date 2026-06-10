@@ -149,3 +149,19 @@ still improves their *operand loads*. (matmul flag-ON PASS in S2.2 confirms this
 transpose for p_count>128, oob_mode). `dma.Load(vector_index=...)` is a plausible target (S0.1 did not spike
 it), but converting it carries high regression risk for an exploratory pass whose headline result (load/store)
 is already established. Left on legacy; flagged as future work if a real port proceeds.
+
+## S4.1 / S4.2 — A/B simulation + feasibility verdict
+
+**A/B sim (`/home/ubuntu/ts_ab_sim.py`), flag OFF vs ON, `nki.simulate` CPU:**
+- LEGACY: 8/8 PASS. TILESTREAM: 8/8 PASS. **Identical correctness** across copy (256×128, 500×128, 130×64,
+  256×100), add (256×128, 500×100), matmul (256³, 128³). Partial configs (M∈{500,130}, N=100) — the
+  boundary-explosion cases — all match.
+- **Quantified code-shape win** (500×100 copy, block [128,64]): dma_copy 13→2, if-branches 13→0,
+  boundary-arith 11→0, generated lines 74→51 (−31%).
+
+**Verdict (full writeup in NKI_TILESTREAM_REFACTOR_PLAN.md §Findings):** TileStream is feasible and correct for
+the load/store layer — a clean, reversible, flag-gated win (branch explosion eliminated, −31% lines, 0
+regressions in sim). Matmul (no transpose savings), gather (highest risk), partition-split (already covered),
+flatten/transpose (compile-time math / unavoidable nc_transpose) correctly NOT worth converting. Recommend a
+real port for load/store ONLY, gated on a Trainium spot-check of clamp+zero-fill semantics and autotuner
+composition.

@@ -339,3 +339,73 @@ Relevant paths (all under `/home/ubuntu/helion_port/`):
 `helion/_compiler/{nki_backend.py, tile_strategy.py}`, `helion/language/{memory_ops.py, matmul_ops.py}`,
 `helion/runtime/__init__.py` (sim launcher, unchanged). nkilib reference source:
 `/opt/aws_neuronx_venv_pytorch_2_9/lib/python3.12/site-packages/nkilib/`.
+
+---
+
+## Findings (executed 2026-06-10; see NKI_TILESTREAM_COMMIT_LOG.md for per-step gates)
+
+**Bottom line: feasible and correct for the load/store layer; a clean, reversible, flag-gated win there.
+Matmul/gather/partition-split/flatten/transpose are correctly NOT worth converting.**
+
+### 1. What works under TileStream (sim-validated, flag ON vs OFF, `nki.simulate` CPU)
+A/B over copy / elementwise-add / matmul × full+partial configs: **8/8 PASS on BOTH paths, identical
+correctness** (`/home/ubuntu/ts_ab_sim.py`). Specifically, flag-ON matches flag-OFF (max_err 0, or ~3.8e-5 for
+fp32 matmul accumulation) for every partial-tile case — M∈{500,130}, N=100 — which are exactly the cases that
+trigger the boundary explosion.
+
+- **Load** (S2.1): the fast-path DMA + 3ᴺ−1 boundary-tail enumeration in `_emit_dma_copy` → ONE
+  `TensorView(hbm).slice(d,start,end)…` clamped DMA into a memset(0) buffer.
+- **Store** (S2.2): the 2ᴺ TAIL_OVERFLOW enumeration in `_emit_direct_store` → ONE clamped store.
+- **NEG_START/shifted** (S2.3): correctly left on legacy (`TensorView.slice` asserts start≥0); the guard only
+  fires for plain contiguous `start:end`, so shifted subscripts auto-fall-through to the proven
+  `memset(0)+oob_mode=skip` path.
+
+### 2. Quantified code-shape win (generated kernel, 500×100 copy, block [128,64])
+| metric | legacy | TileStream |
+|---|---|---|
+| `dma_copy` calls | 13 | **2** |
+| `if` branches | 13 | **0** |
+| boundary arithmetic terms | 11 | **0** |
+| generated lines | 74 | **51 (−31%)** |
+
+The 3ᴺ-branch explosion is fully eliminated for the contiguous case. Source-code reduction in
+`nki/codegen.py` would follow only if the legacy `_single_tail_load_cases`/`_single_tail_store_cases`
+(~330 lines) were *removed* — not done here (flag-gated coexistence keeps both).
+
+### 3. What was scoped out, with reasons (NOT gaps — deliberate boundaries)
+- **Partition >128 split** (S3.1): already covered — Helion caps the partition loop *step* at 128, so per-tile
+  partition ≤128 and the S2.1 path handles it. `alloc_logical` only relevant for the rare flattened
+  single-tile-logical-partition>128 case.
+- **Matmul** (S3.2): `blas.Matmul` works standalone (S0.1) but deep `_nki_dot` integration is high-surgery
+  with **no transpose savings** — lhs arrives `[M,K]`, the M↔K transpose to `[K,M]` is unavoidable hardware
+  work that `TensorView.permute` can't express (dim0 fixed); blas.Matmul just relocates the same
+  `nc_transpose`. Plus PSUM-reuse/sub-tiling/accumulator. Loads still benefit via S2.1/S2.2.
+- **Gather** (S3.3): highest-risk/lowest-marginal-value (~1060 lines, most edge cases); left on legacy.
+- **Flatten / partition-transpose**: confirmed non-candidates (Do-NOT-do list) — compile-time list math beats
+  runtime views; partition transpose is unavoidable `nc_transpose` either way.
+
+### 4. The dependency / altitude trade (restated concretely)
+Flag-ON kernels gain a runtime `from nkilib.experimental import primitives as _nkitile` +
+`from nkilib.core.utils.tensor_view import TensorView` in their header, and the partial-tile correctness now
+resolves inside `TensorView.slice`'s `min()`-clamp **at neuronx-cc trace time** — a layer Helion doesn't
+control, marked `experimental`. Validated only under `nki.simulate` (CPU); real-Trainium DMA/`oob_mode`
+behavior is NOT confirmed here.
+
+### 5. Recommendation
+- **Worth a real (non-flagged, HW-swept, source-reducing) port for the LOAD/STORE layer only.** It's a
+  genuine simplification (−31% generated lines, 13→2 DMAs, branch explosion gone) with zero correctness
+  regression in sim, and a plausible perf win (fewer DMA descriptors + no `memset`-then-9-DMA on boundary
+  tiles) that should be confirmed with one boundary-heavy HW profile before committing.
+- **Do NOT port matmul, gather, partition-split, flatten, or transpose** — no win or negative.
+- **Before any real port:** (a) one Trainium spot-check that `TensorView.slice` clamping + the un-DMA'd
+  region's zero-fill match on real HW (not just sim); (b) confirm the autotuner's block-size search composes
+  with the TensorView path; (c) decide whether to take the `nkilib.experimental` runtime dependency or
+  reimplement just the `min()`-clamp logic in codegen (no dependency, ~same simplification).
+
+### Files changed (flag-gated, legacy default; branch `nki-tilestream-experiment`)
+- `helion/_compiler/nki_backend.py` — `use_tilestream` property + gated `_nkitile`/`_nkitv` imports.
+- `helion/_compiler/nki/tilestream_emit.py` (NEW) — string-builder helpers (used by spike; load/store
+  inline their own slice chains).
+- `helion/_compiler/nki/codegen.py` — flag-gated TensorView interception in `_emit_dma_copy` (load) and
+  `_emit_direct_store` (store).
+- Docs: this plan + `NKI_TILESTREAM_COMMIT_LOG.md`. Scratch: `/tmp/ts_spike/*`, `/home/ubuntu/ts_ab_sim.py`.

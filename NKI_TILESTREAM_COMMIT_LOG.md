@@ -99,3 +99,16 @@ Only the clean contiguous case; flag-gated on `env.backend.use_tilestream` (stor
 - matmul flag-ON (256³, 128³) PASS, max_err ~4.6e-5 — matches flag-OFF baseline (load/store via TensorView,
   matmul body still legacy).
 - `test/test_nki_port_codegen.py` 4/4 pass flag-OFF.
+
+## S2.3 — NEG_START / shifted tiles decision (scoped to legacy)
+
+**Decision (no code change needed):** TensorView's `slice` asserts `start >= 0` (tensor_view.py:310) and
+cannot express a negative-start tile. The S2.1/S2.2 interception guards already require every `part` to be a
+plain `start:end` string AND pass `_slice_info`/`_store_slice_info`; shifted subscripts (`x[i-pad]`, windowed)
+produce non-matching `slice_parts` (or negative starts) and therefore **automatically fall through to the
+legacy path** — which handles NEG_START via `memset(0)` + `oob_mode=skip` (proven correct in the S0.1 `oob`
+spike: the un-DMA'd region retained its memset(0) value). So the conservative, always-correct behavior is
+already in place: TileStream owns the FULL/TAIL_OVERFLOW contiguous case; legacy owns NEG_START.
+**Verify (sim):** elementwise `out[tm,tn]=x[tm,tn]+y[tm,tn]` (2 loads + store) flag-ON, M×N ∈
+{256×128, 500×128, 130×100} → all PASS, matches flag-OFF. No regression from the dual TensorView load + store.
+**Outcome:** NEG_START is OUT of TileStream scope by design — a clean boundary, not a gap.

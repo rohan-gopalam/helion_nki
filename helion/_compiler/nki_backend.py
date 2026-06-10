@@ -40,6 +40,13 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+def _nki_use_tilestream() -> bool:
+    """EXPERIMENTAL master switch (module-level so nested codegen helpers without
+    a backend instance can gate on it). Reads HELION_NKI_TILESTREAM; default off.
+    Mirrors NKIBackend.use_tilestream. See NKI_TILESTREAM_REFACTOR_PLAN.md."""
+    return os.environ.get("HELION_NKI_TILESTREAM", "0") not in ("0", "false", "")
+
+
 class NKIOpOverrides:
     """NKI op overrides for Inductor codegen (elementwise ops).
     When _codegen_state is set, emits nisa.tensor_tensor(dst, data1, data2, op);
@@ -167,28 +174,35 @@ class NKIOpOverrides:
                     )
                     transpose_src = cast_in
                     transpose_dtype = "nl.float32"
-                tr_psum = state.device_function.new_var("_tr_psum", dce=True)
                 tr_sbuf = state.device_function.new_var("_tr_sbuf", dce=True)
                 state.device_function._nki_sbuf_shapes[tr_sbuf] = list(target_shape)
                 state.device_function._nki_sbuf_dtypes[tr_sbuf] = dtype
-                state.add_statement(
-                    _sfs(
-                        f"{tr_psum} = nl.ndarray([{target_shape[0]}, {target_shape[1]}], "
-                        f"{transpose_dtype}, buffer=nl.psum)"
-                    )
-                )
-                state.add_statement(
-                    _sfs(f"nisa.nc_transpose(dst={tr_psum}, data={transpose_src})")
-                )
                 state.add_statement(
                     _sfs(
                         f"{tr_sbuf} = nl.ndarray([{target_shape[0]}, {target_shape[1]}], "
                         f"{dtype}, buffer=nl.sbuf)"
                     )
                 )
-                state.add_statement(
-                    _sfs(f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})")
-                )
+                if _nki_use_tilestream():
+                    # blas.transpose folds the PSUM alloc + nc_transpose + copy-back
+                    # into one call (allocates its own PSUM internally).
+                    state.add_statement(
+                        _sfs(f"_nkitile.blas.transpose(dst={tr_sbuf}, src={transpose_src})")
+                    )
+                else:
+                    tr_psum = state.device_function.new_var("_tr_psum", dce=True)
+                    state.add_statement(
+                        _sfs(
+                            f"{tr_psum} = nl.ndarray([{target_shape[0]}, {target_shape[1]}], "
+                            f"{transpose_dtype}, buffer=nl.psum)"
+                        )
+                    )
+                    state.add_statement(
+                        _sfs(f"nisa.nc_transpose(dst={tr_psum}, data={transpose_src})")
+                    )
+                    state.add_statement(
+                        _sfs(f"nisa.tensor_copy(dst={tr_sbuf}, src={tr_psum})")
+                    )
                 return tr_sbuf
             return name
 
@@ -5233,7 +5247,7 @@ class NKIBackend(Backend):
         matmul transpose) remains the production path. See
         NKI_TILESTREAM_REFACTOR_PLAN.md.
         """
-        return os.environ.get("HELION_NKI_TILESTREAM", "0") not in ("0", "false", "")
+        return _nki_use_tilestream()
 
     def validate_nki_tensor_shapes(self, graph: torch.fx.Graph) -> None:
         """Run before NKI codegen: require partition dim % 128, free dim % 512."""

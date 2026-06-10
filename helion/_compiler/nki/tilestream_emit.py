@@ -117,3 +117,54 @@ def emit_matmul(dst_ts: str, moving_ts: str, stationary_ts: str) -> str:
         f"_nkitile.blas.Matmul(dst={dst_ts}, moving={moving_ts}, "
         f"stationary={stationary_ts}).execute()"
     )
+
+
+# --- Compact blas primitives: take raw nl.ndarray dst/src and emit the nisa op
+# internally, so they are statement-level drop-ins that DON'T change the type of
+# any variable (unlike tile()/alloc_logical which return stream objects). These
+# are the safe, high-readability swaps for the manual nisa.* emissions. ---
+
+def emit_blas_transpose(dst: str, src: str) -> str:
+    """``_nkitile.blas.transpose(dst=, src=)`` — replaces the manual
+    nc_transpose -> PSUM -> tensor_copy 3-statement dance with one call."""
+    return f"_nkitile.blas.transpose(dst={dst}, src={src})"
+
+
+def emit_blas_tensor_scalar(
+    dst: str,
+    src: str,
+    op0: str,
+    operand0: str,
+    op1: str | None = None,
+    operand1: str | None = None,
+) -> str:
+    """``_nkitile.blas.tensor_scalar(...)``: dst = op1(op0(src, operand0), operand1)."""
+    args = [f"dst={dst}", f"src={src}", f"op0={op0}", f"operand0={operand0}"]
+    if op1 is not None:
+        args.append(f"op1={op1}")
+    if operand1 is not None:
+        args.append(f"operand1={operand1}")
+    return f"_nkitile.blas.tensor_scalar({', '.join(args)})"
+
+
+def emit_blas_activation(
+    dst: str,
+    src: str,
+    op: str = "nl.copy",
+    scale: str | None = None,
+    bias: str | None = None,
+) -> str:
+    """``_nkitile.blas.activation(...)``: dst = op(src * scale + bias)."""
+    args = [f"dst={dst}", f"src={src}", f"op={op}"]
+    if scale is not None:
+        args.append(f"scale={scale}")
+    if bias is not None:
+        args.append(f"bias={bias}")
+    return f"_nkitile.blas.activation({', '.join(args)})"
+
+
+def emit_tv_broadcast(src: str, dim: int, size: int | str, *, base: str | None = None) -> str:
+    """``_nkitv(src).broadcast(dim, size).get_view()`` — stride-0 broadcast view,
+    drop-in for ``nl.broadcast_to(src, shape=...)`` when the broadcast dim is size-1."""
+    inner = base if base is not None else src
+    return f"_nkitv({inner}).broadcast({int(dim)}, {size}).get_view()"

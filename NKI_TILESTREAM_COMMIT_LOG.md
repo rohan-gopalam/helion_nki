@@ -182,3 +182,25 @@ Trainium device. `/dev/neuron0` is present here, so this step closes that gap.
 **Conclusion:** the `TensorView(hbm).slice(...).get_view()` clamped-DMA path **compiles and runs correctly on
 real Trainium**, not just in simulation. The flag-ON kernels' runtime `import nkilib.experimental` /
 `TensorView` traces cleanly through neuronx-cc. Sim-only caveat in §Findings is now lifted for these kernels.
+
+## S5 — Broad conversion: replace manual nisa.* with nkilib primitives (user directive)
+
+User directive: on this experiment branch, replace EVERY manual kernel pattern with TensorView/TileStream
+wherever expressible, for nkilib-example-style output. Hardcoded path stays (flag-off). Working through the
+~158-site catalog (Explore agent inventory) by category.
+
+**Prereqs:** added module-level `_nki_use_tilestream()` (so nested codegen helpers without a backend instance
+can gate); `NKIBackend.use_tilestream` now delegates to it. Added compact-blas emitters to `tilestream_emit.py`
+(`emit_blas_transpose`, `emit_blas_tensor_scalar`, `emit_blas_activation`, `emit_tv_broadcast`).
+
+**Spike findings (`/tmp/ts_spike/spike_transpose*.py`):**
+- `blas.transpose(dst, src)` folds the manual `PSUM alloc + nc_transpose + tensor_copy` 3-statement dance into
+  ONE call (allocates its own PSUM) → PASS in sim.
+- `TensorView.broadcast` works for FREE-dim (dim≠0) but **asserts on partition dim (dim 0)** — so it is NOT a
+  drop-in for Helion's partition-broadcast; only free-dim broadcasts can convert.
+
+### S5.1 — Transpose: `_layout_reconcile_transpose` → blas.transpose (flag-gated)
+**File:** `nki_backend.py:121`. Replaced the PSUM+nc_transpose+copy dance with
+`_nkitile.blas.transpose(dst=tr_sbuf, src=...)` under `_nki_use_tilestream()`; legacy retained in else.
+**Verify:** reduce kernel (`x[tm,:].sum(-1)`, exercises the [N,1]↔[1,N] reconcile) — sim flag ON/OFF both PASS;
+**REAL HW flag-ON: Compiler status PASS, sum 256×512 / 128×512 PASS**. Flag-off 4/4 codegen tests pass.

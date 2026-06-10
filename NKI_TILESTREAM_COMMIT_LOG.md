@@ -165,3 +165,20 @@ regressions in sim). Matmul (no transpose savings), gather (highest risk), parti
 flatten/transpose (compile-time math / unavoidable nc_transpose) correctly NOT worth converting. Recommend a
 real port for load/store ONLY, gated on a Trainium spot-check of clamp+zero-fill semantics and autotuner
 composition.
+
+## S4.3 — REAL HARDWARE compile + run (closing the sim-only gap)
+
+**Was missing:** S0.1–S4.2 used `nki.simulate` (CPU) only — never compiled through neuronx-cc onto the
+Trainium device. `/dev/neuron0` is present here, so this step closes that gap.
+
+**Setup:** cleared Neuron cache + `NEURON_CC_FLAGS='--no_cache'`; `HELION_NKI_TILESTREAM=1` WITHOUT
+`HELION_NKI_SIMULATE` (real XLA/neuronx-cc launcher).
+
+**Result — flag ON, real device:**
+- 2D copy M×N ∈ {256×128, 500×128, 130×64, 256×100}: neuronx-cc **Compiler status PASS** (Total modules 2,
+  Passed 2, Failed 0); all run PASS, max_err 0.0.
+- Full A/B suite on HW: **8/8 PASS** (copy ×4, add ×2, matmul 256³ max_err 4.2e-5, matmul 128³ 2.3e-5).
+
+**Conclusion:** the `TensorView(hbm).slice(...).get_view()` clamped-DMA path **compiles and runs correctly on
+real Trainium**, not just in simulation. The flag-ON kernels' runtime `import nkilib.experimental` /
+`TensorView` traces cleanly through neuronx-cc. Sim-only caveat in §Findings is now lifted for these kernels.

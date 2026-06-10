@@ -1783,8 +1783,8 @@ def _(state: CodegenState) -> ast.AST:
     from .._compiler.nki_backend import NKIOpOverrides
     from .._compiler.compile_environment import CompileEnvironment
     from .._compiler.host_function import HostFunction
-    from .memory_ops import _nki_row_index_gather
-    from .memory_ops import _nki_subscript_block_id
+    from .._compiler.nki.gather import _nki_row_index_gather
+    from .._compiler.nki.indexing import _nki_subscript_block_id
     from .memory_ops import load
     from .memory_ops import store
 

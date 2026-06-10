@@ -37,3 +37,23 @@ correctly under `nki.simulate`. De-risks the whole refactor.
 issues.
 
 **Decision gate:** ✅ all patterns feasible under simulation → proceed to Phase 1.
+
+---
+
+## S1.1 — HELION_NKI_TILESTREAM flag + tilestream library imports
+
+**Files:** `helion/_compiler/nki_backend.py`.
+**What & why:** Master switch `NKIBackend.use_tilestream` (reads `HELION_NKI_TILESTREAM`, default off).
+`library_imports` emits `from nkilib.experimental import primitives as _nkitile` only when on, so legacy
+kernel headers are byte-unchanged. Every later refactor branches on this flag → reversible A/B.
+**Verify (gate passed):** default `use_tilestream=False`, `_nkitile` absent from imports; flag-on True and
+present. `test/test_nki_port_codegen.py` 4/4 pass (flag off, unchanged). Commit `fbaa2cff`.
+
+## S1.2 — tilestream_emit.py string-builder helpers
+
+**Files:** `helion/_compiler/nki/tilestream_emit.py` (NEW).
+**What & why:** One place that builds the `nkilib`-call strings Helion will emit (alloc_logical/tile/
+tile_hbm/Load/Store/Matmul). Pure string builders, unit-testable. Strings verified to exactly match the
+S0.1 spike kernels that simulated correctly, and `_nkitile.{tile_stream,dma.Load,dma.Store,blas.Matmul,
+RowMajor}` attribute paths all resolve against the installed nkilib.
+**Verify (gate passed):** all emitter asserts pass; attribute-path check green.

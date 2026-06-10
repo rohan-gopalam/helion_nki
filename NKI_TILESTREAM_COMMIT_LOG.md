@@ -362,3 +362,19 @@ grep fails. Documented as expected v2-emission-shape mismatch (kernel is correct
 **Net v2 conversions that SURVIVED the sweep (robust):** load/store via TensorView.slice clamp (the headline
 boundary-explosion win), partition broadcast via blas.broadcast, whole-row gather via vector_select. The
 transpose/activation "readability" conversions were reverted (2D-fragile, no functional benefit anyway).
+
+### S7 final — full CPU sweep across all examples: v2 == legacy (1 expected source-test diff)
+**Autotuning (verified composes with v2):** add → autotuned [128,128], matmul → [256,256,128] under
+HELION_AUTOTUNE_EFFORT=quick, flag ON; IDENTICAL configs + correct results flag OFF. Autotuner searches
+block sizes (owned by the scaffold); v2 only changes the body → composes cleanly.
+**Full sweep (49 non-blocked examples, effort=none, sim):**
+- legacy baseline: 40 PASS.  ts (v2): 39 PASS.
+- **Only diff: psum_reuse_test** — a generated-SOURCE-inspection test that greps `dma_copy ... src=y[`; v2
+  moves the `y[` to the `_ts_srcv = _nkitv(y).slice()` line, so 9/9 functional+PSUM-reuse asserts PASS but the
+  legacy-source-pattern grep fails. Kernel is correct; test asserts on legacy emission shape. (File is
+  reference-only `/tmp/ref_wt`, not port-tracked — not modified.)
+- The other 9 FAILs (jagged_*, jsd, kl_div, matmul) fail IDENTICALLY on legacy and ts — they're
+  effort=none/sim-aliasing artifacts, NOT v2 regressions (jagged needs autotuned config; matmul hits a
+  nki.simulate input-aliasing bug).
+**Conclusion: v2 introduces ZERO functional regressions across the example suite.** Flag-off
+test_nki_port_codegen.py 4/4; flag-on core suite 10/10 sim + (earlier) 10/10 real HW.

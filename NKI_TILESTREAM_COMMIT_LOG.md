@@ -123,3 +123,29 @@ fires only for the rarer single-tile-logical-partition>128 case (flattened high-
 be the clean replacement there, but it's not on the common tiling path and is lower-value — **scoped out** for
 this feasibility pass.
 **Verify (sim):** bigP copy block[256,64] flag-ON M×N ∈ {256×64, 512×128, 500×64} PASS, matches flag-OFF.
+
+## S3.2 — Matmul via blas.Matmul: feasible standalone, deep integration scoped out
+
+**Standalone feasibility: PROVEN (S0.1 `mm` spike)** — `blas.Matmul(dst, moving, stationary).execute()` over
+freshly-built TileStreams gives correct results (M,K,N ∈ {(64,64,32),(128,128,128),(100,128,48)}, max_err 0).
+
+**Deep `_nki_dot` integration scoped out, with reasons (read matmul_ops.py:1030-1260):**
+1. `_nki_dot` receives operands ALREADY loaded into SBUF as lhs `[M,K]`, rhs `[K,N]`; `blas.Matmul` wants
+   TileStream operands with K as the *partition* dim — stationary `[K,M]`, moving `[K,N]` (matmul.py:118
+   `dst_tile[-2]==stationary_tile[-1]`). So stationary must be lhs^T `[K,M]`.
+2. **blas.Matmul does NOT remove the transpose** in this orientation — lhs arrives `[M,K]`, the M↔K transpose
+   to `[K,M]` is unavoidable hardware work (`nc_transpose`), and `TensorView.permute` asserts dim0 fixed so it
+   can't express it as a view. blas.Matmul just relocates the same `nc_transpose` inside the library.
+3. `_nki_dot` also carries PSUM-reuse fusion (`nki_keep_in_psum`), M/N/K sub-tiling (`n_sub_*`), dtype-cast
+   packing, and accumulator add — all of which blas.Matmul would need re-expressing.
+**Verdict:** unlike load/store (clear win), matmul is high-surgery with NO transpose savings → not worth it for
+this experiment. matmul kernels keep the (already-correct) legacy `_nki_dot`; the S2.1/S2.2 TensorView path
+still improves their *operand loads*. (matmul flag-ON PASS in S2.2 confirms this composition.)
+
+## S3.3 — Gather via vector-DGE Load: scoped out
+
+**Scoped out (highest risk, lowest marginal value).** The legacy gather path (`nki/gather.py`,
+`nki/indexing.py`, ~1060 lines) is already correct and has the most edge cases (scalar/vector DGE, row-index
+transpose for p_count>128, oob_mode). `dma.Load(vector_index=...)` is a plausible target (S0.1 did not spike
+it), but converting it carries high regression risk for an exploratory pass whose headline result (load/store)
+is already established. Left on legacy; flagged as future work if a real port proceeds.

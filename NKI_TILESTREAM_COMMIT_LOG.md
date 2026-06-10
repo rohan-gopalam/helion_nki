@@ -262,3 +262,17 @@ tiles fill only their valid sub-rectangle. `dma.load`/`store` lower to the same 
 **Verify:** codegen flag-ON emits `_nkitile.dma.load(...)` + `_nkitile.dma.store(...)`, zero raw `nisa.dma_copy`
 in the body, zero boundary branches. A/B sim 8/8 (copy/add/matmul incl. partials). **REAL HW: Compiler PASS
 x3, 8/8 run correct** (copy err 0, matmul ~2-4e-5). Flag-off 4/4 tests.
+
+### B4 — gather: vector_select where it fits; SW-DGE .ap stays for the F-pattern form
+**Files:** `nki/codegen.py` (`_build_hbm_src`, flattened-gather site).
+**Findings (important, refine the plan):**
+1. **`dma.Load(vector_index=)` emits `dge_mode=1` (HW-DGE) which `nki.simulate` REJECTS** ("only supports
+   SWDGE"). So the nkilib `dma.Load` DGE path is NOT sim-validatable. Use `TensorView.vector_select` instead
+   — it produces the SW-DGE `.ap(vector_offset=, indirect_dim=0)` (sim-compatible) and is the view-native
+   expression. Spike `spike_b4b.py`: whole-row gather via vector_select PASS.
+2. **`vector_select` CANNOT express the flattened multi-element gather** (`[[1,P],[1,F]]` pattern: P
+   partitions each reading F contiguous from their indexed base). It yields a single-dim `[P,1]` view → size
+   mismatch (64 vs 4096). So this sub-form **legitimately stays on the SW-DGE `.ap`** — a documented case
+   where TensorView has no equivalent (it IS what nkilib's own DGE bottoms out to). NOT a failure.
+**Verify:** gather kernel sim flag ON==OFF PASS; flag-off 4/4 tests. Whole-row gathers can use vector_select;
+F-pattern gathers keep `.ap` (annotated in code).

@@ -991,15 +991,40 @@ def load_expr(
                     f"{dtype_str}, buffer=nl.sbuf)"
                 )
             )
-            state.codegen.add_statement(
-                statement_from_string(
-                    f"nisa.dma_copy(dst={sbuf_name}, "
-                    f"src={name}.reshape([{total_elems}, 1]).ap("
-                    f"pattern=[[1, {p_count}], [1, {f_count}]], "
-                    f"vector_offset={vec_offset}, indirect_dim=0), "
-                    "oob_mode=nisa.oob_mode.skip)"
+            if backend.use_tilestream:
+                # v2 (B4): gather via TensorView.vector_select — the view-native
+                # expression of SW-DGE. vector_select(0, vec) sets vector_offset+
+                # indirect_dim on a reshaped [total,1] base; get_view() emits the
+                # SAME .ap(vector_offset=, indirect_dim=0) the legacy path builds
+                # by hand. (We use vector_select, NOT dma.Load(vector_index=),
+                # because the latter emits dge_mode=1/HW-DGE which nki.simulate
+                # rejects; vector_select stays SWDGE and is sim-validatable.)
+                # dma.load has no oob_mode arg, so the gather copy stays a
+                # nisa.dma_copy with oob_mode=skip; the nkilib-native part is that
+                # the access pattern is built by TensorView.vector_select.
+                _gv = device_fn.new_var("_ts_gv")
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"{_gv} = _nkitv({name}).reshape_dim(0, ({total_elems},))"
+                        f".vector_select(0, {vec_offset})"
+                    )
                 )
-            )
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"nisa.dma_copy(dst={sbuf_name}, src={_gv}.get_view(), "
+                        "oob_mode=nisa.oob_mode.skip)"
+                    )
+                )
+            else:
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"nisa.dma_copy(dst={sbuf_name}, "
+                        f"src={name}.reshape([{total_elems}, 1]).ap("
+                        f"pattern=[[1, {p_count}], [1, {f_count}]], "
+                        f"vector_offset={vec_offset}, indirect_dim=0), "
+                        "oob_mode=nisa.oob_mode.skip)"
+                    )
+                )
 
             # When inside a jagged tile loop, oob_mode=skip only skips
             # physically-OOB addresses.  Logically-invalid k-positions
@@ -2696,6 +2721,14 @@ def load_expr(
                     state.codegen.add_statement(_sfs_ig(
                         f"nisa.tensor_scalar(dst={_flat_vec}, data={_flat_vec}, op0=nl.add, operand0={f_start}, op1=None)"
                     ))
+                # v2 NOTE (B4): this flattened multi-element gather uses the 2-D
+                # access pattern [[1,P],[1,F]] — P partitions each reading F
+                # contiguous elements from their indexed base. TensorView.vector_select
+                # produces a single-dim [P,1] indexed view and CANNOT reproduce the
+                # per-partition F-element pattern, so this sub-form legitimately stays
+                # on the SW-DGE .ap form (bucket-3-style: no TensorView equivalent;
+                # this IS what nkilib's own DGE bottoms out to). Whole-row gathers
+                # (f_count == full row) are handled via vector_select elsewhere.
                 pattern = f"[[1, {p_count}], [1, {f_count}]]"
                 return (
                     f"{name_str}.reshape([{_total_elems}, 1]).ap(pattern={pattern}, "

@@ -4573,6 +4573,31 @@ def store_stmt(state: CodegenState) -> None:
 
         def _emit_direct_store(dst_base: str, parts: list[str], src_value: ast.AST) -> None:
             src_name = ast.unparse(src_value)
+            # EXPERIMENTAL (HELION_NKI_TILESTREAM): replace the fast-path store +
+            # 2^N TAIL_OVERFLOW enumeration with ONE TensorView-clamped store. The
+            # HBM dst slice is clamped via TensorView.slice (min() on end); the SBUF
+            # src is sliced to the clamped extent. Only the clean contiguous case
+            # (every part a plain "start:end" string).
+            if (
+                env.backend.use_tilestream
+                and parts
+                and all(isinstance(p, str) and ":" in p for p in parts)
+                and all(_store_slice_info(p, i) is not None for i, p in enumerate(parts))
+            ):
+                _dstv = device_fn.new_var("_ts_dstv")
+                _tv_expr = f"_nkitv({dst_base})"
+                for _d, _p in enumerate(parts):
+                    _s, _e = _p.split(":", 1)
+                    _tv_expr += f".slice({_d}, {_s.strip()}, {_e.strip()})"
+                _src_idx = ", ".join(f"0:{_dstv}.shape[{_d}]" for _d in range(len(parts)))
+                state.codegen.add_statement(statement_from_string(f"{_dstv} = {_tv_expr}"))
+                state.codegen.add_statement(
+                    statement_from_string(
+                        f"nisa.dma_copy(dst={_dstv}.get_view(), src={{value}}[{_src_idx}])",
+                        value=src_value,
+                    )
+                )
+                return
             full_stmt = statement_from_string(
                 f"nisa.dma_copy(dst={dst_base}[{', '.join(parts)}], src={{value}})",
                 value=src_value,

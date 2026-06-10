@@ -83,3 +83,19 @@ string). Indirect/dynamic/1D-reshape fall through to legacy. Flag-gated on `back
 - KNOWN pre-existing (NOT introduced here): 1D copy (`out[t]=x[t]`) with non-divisible M fails on BOTH flag
   on/off — the 1D-free-axis STORE path (`nki_return_buf[0:1, offset:offset+128]`) is unguarded OOB. Unrelated
   to load; store path is S2.2.
+
+## S2.2 — TileStream store path for contiguous tiles (flag-gated)
+
+**Files:** `helion/_compiler/nki/codegen.py` (`_emit_direct_store`).
+**What & why:** Symmetric to S2.1. Replace the fast-path store + 2^N TAIL_OVERFLOW enumeration
+(`_single_tail_store_cases`) with ONE TensorView-clamped store: `dst = _nkitv(hbm).slice(d,start,end)`
+(clamps the HBM dest extent), `src = value[0:dst.shape[d], ...]` (slices the fixed SBUF source to match).
+Only the clean contiguous case; flag-gated on `env.backend.use_tilestream` (store_stmt has `env` not
+`backend` in scope — initial `NameError` fixed).
+**Verify (sim, gate passed):**
+- 2D copy flag-ON M×N ∈ {256×128, 500×128, 130×64, 256×100} → all PASS, max_err 0.0 (load+store both
+  TensorView now). Generated code: `.slice(` count 4, **0 boundary branches**; store emits
+  `dma_copy(dst=_ts_dstv.get_view(), src=_nki_sbuf_1[0:_ts_dstv.shape[0], 0:_ts_dstv.shape[1]])`.
+- matmul flag-ON (256³, 128³) PASS, max_err ~4.6e-5 — matches flag-OFF baseline (load/store via TensorView,
+  matmul body still legacy).
+- `test/test_nki_port_codegen.py` 4/4 pass flag-OFF.

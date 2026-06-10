@@ -6141,7 +6141,11 @@ class NKIBackend(Backend):
         # NKI SBUF tensors are always 2D; reshape is a no-op
         return expr
 
-    def scalar_load_expr(self, tensor_name: str) -> str:
+    def scalar_load_expr(self, tensor_name: str, index_expr: str | None = None) -> str:
+        # Match the base Backend.scalar_load_expr signature. Callers (e.g. the
+        # RNG-seed path in rng_utils.py) pass an optional index_expr; without it
+        # this override raised TypeError ("takes 2 positional arguments but 3
+        # were given") instead of the intended graceful BackendUnsupported.
         raise exc.BackendUnsupported(
             self.name,
             "scalar tensor loads (nl.load removed; use dma_copy codegen path)",

@@ -241,3 +241,14 @@ else nisa.activation — same lowering, nkilib-style source). Applied to the cen
 **Verify:** sigmoid kernel codegen flag-ON → `blas.activation: 1, nisa.activation: 0`. sim flag ON/OFF both
 PASS (err ~1e-7). **REAL HW flag-ON Compiler PASS, sigmoid correct.** Flag-off 4/4 tests; A/B suite 8/8 PASS.
 Scattered edge-case activation sites (cross-broadcast cast paths) left on nisa — diminishing returns.
+
+---
+
+## S6 — FULL refactor execution (plan: NKI_TILESTREAM_FULL_REFACTOR_PLAN.md, 4-bucket)
+
+### A1/A2 — stream infra + grid-coord helper
+**Files:** `device_function.py` (`_nki_hbm_streams` dedup registry), `nki/tilestream_codegen.py` (NEW: v2 body
+emitters module — `grid_coord`, `get_or_make_hbm_stream`, `V2Unsupported`).
+**What:** registry dedups hoisted HBMStreams per (name, tile_shape); `grid_coord(offset_N, bs)` =
+`(offset_N)//bs`. No behavior change yet (helpers unused until B).
+**Verify:** helper unit checks pass; `test_nki_port_codegen.py` 4/4 flag-off.

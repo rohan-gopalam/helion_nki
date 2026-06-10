@@ -314,6 +314,12 @@ class DeviceFunction:
         # Loop-carry buffers that must not be modified in-place inside nested
         # device loops.
         self._nki_protected_vars: set[str] = set()
+        # EXPERIMENTAL (HELION_NKI_TILESTREAM v2): dedup registry for hoisted
+        # nkilib HBMStream objects. Maps (hbm_name, tile_shape_tuple) -> stream
+        # var name, so a tensor's HBMStream is emitted ONCE (before the loop)
+        # and reused via .tile_at(grid) inside. Mirrors the nkilib idiom of
+        # building wgt_hbm_grid once and tiling it per iteration.
+        self._nki_hbm_streams: dict[tuple[str, tuple[int, ...]], str] = {}
         # Per-output-tensor return buffer info for multi-output kernels.
         # Keyed by id(tensor). Keys are ints; values map to buf_name etc.
         self._nki_return_buffers: dict[int, dict] = {}

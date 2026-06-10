@@ -252,3 +252,13 @@ emitters module — `grid_coord`, `get_or_make_hbm_stream`, `V2Unsupported`).
 **What:** registry dedups hoisted HBMStreams per (name, tile_shape); `grid_coord(offset_N, bs)` =
 `(offset_N)//bs`. No behavior change yet (helpers unused until B).
 **Verify:** helper unit checks pass; `test_nki_port_codegen.py` 4/4 flag-off.
+
+### B1/C1 — contiguous load/store via dma.load / dma.store primitives
+**Files:** `nki/codegen.py` (`_emit_dma_copy` load, `_emit_direct_store` store).
+**What:** upgraded the S2.1/S2.2 `.slice`+`nisa.dma_copy` interception to the nkilib-native `dma.load` /
+`dma.store` PRIMITIVES (spike `/tmp/ts_spike/spike_b1.py` confirmed they handle contiguous+partial). Clamped
+`_nkitv(hbm).slice(...)` source/dest; SBUF side sliced to the clamped extent; dst still memset(0) so partial
+tiles fill only their valid sub-rectangle. `dma.load`/`store` lower to the same `nisa.dma_copy`.
+**Verify:** codegen flag-ON emits `_nkitile.dma.load(...)` + `_nkitile.dma.store(...)`, zero raw `nisa.dma_copy`
+in the body, zero boundary branches. A/B sim 8/8 (copy/add/matmul incl. partials). **REAL HW: Compiler PASS
+x3, 8/8 run correct** (copy err 0, matmul ~2-4e-5). Flag-off 4/4 tests.

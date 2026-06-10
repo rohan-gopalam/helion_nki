@@ -3085,16 +3085,22 @@ def load_expr(
             and len(parts) >= 1
             and all(isinstance(p, str) and ":" in p for p in parts)
         ):
+            # v2 (B1): nkilib-native contiguous load. Build a clamped TensorView
+            # of the HBM source (slice clamps the tail to <= dim) and copy it into
+            # the matching sub-view of the SBUF dst via the dma.load PRIMITIVE
+            # (not raw nisa.dma_copy). The dst was already memset(0), so a partial
+            # tile fills only its valid sub-rectangle. dma.load lowers to the same
+            # nisa.dma_copy but expresses the op in nkilib terms.
+            _srcv = device_fn.new_var("_ts_srcv")
             _tv_expr = f"_nkitv({hbm_base})"
             for _d, _p in enumerate(parts):
                 _s, _e = _p.split(":", 1)
                 _tv_expr += f".slice({_d}, {_s.strip()}, {_e.strip()})"
-            _srcv = device_fn.new_var("_ts_srcv")
-            _dst_idx = ", ".join(f"0:{_srcv}.shape[{_d}]" for _d in range(len(parts)))
             state.codegen.add_statement(statement_from_string(f"{_srcv} = {_tv_expr}"))
+            _dst_idx = ", ".join(f"0:{_srcv}.shape[{_d}]" for _d in range(len(parts)))
             state.codegen.add_statement(
                 statement_from_string(
-                    f"nisa.dma_copy(dst={dst}[{_dst_idx}], src={_srcv}.get_view())"
+                    f"_nkitile.dma.load({dst}[{_dst_idx}], {_srcv}.get_view())"
                 )
             )
             return
@@ -4591,9 +4597,11 @@ def store_stmt(state: CodegenState) -> None:
                     _tv_expr += f".slice({_d}, {_s.strip()}, {_e.strip()})"
                 _src_idx = ", ".join(f"0:{_dstv}.shape[{_d}]" for _d in range(len(parts)))
                 state.codegen.add_statement(statement_from_string(f"{_dstv} = {_tv_expr}"))
+                # v2 (C1): nkilib-native store via dma.store primitive (clamped HBM
+                # dst view, SBUF src sliced to match). Lowers to the same nisa.dma_copy.
                 state.codegen.add_statement(
                     statement_from_string(
-                        f"nisa.dma_copy(dst={_dstv}.get_view(), src={{value}}[{_src_idx}])",
+                        f"_nkitile.dma.store({_dstv}.get_view(), {{value}}[{_src_idx}])",
                         value=src_value,
                     )
                 )

@@ -233,3 +233,11 @@ ops aren't tiled or gen-specific). This is the "metadata, nothing to inherit" ca
 the common kernels read in nkilib style, via a shared `_emit_unary` helper — but do NOT chase all 83 scattered
 edge-case branches (diminishing returns, churn). `tensor_tensor`/`Matmul` stay nisa/legacy (TileStream-only,
 no benefit). This honors "looks nicer where it cleanly can" without destabilizing the backend.
+
+### S5.4 — Central activation/reciprocal emits → blas.activation (flag-gated)
+**File:** `nki_backend.py`. Added `_emit_activation_str(dst, op, data)` helper (blas.activation when flag on,
+else nisa.activation — same lowering, nkilib-style source). Applied to the central `_nki_activation` emits
+(new-buffer, tile-list, in-place) and the 3 reciprocal emits in `_nki_reciprocal_operand`.
+**Verify:** sigmoid kernel codegen flag-ON → `blas.activation: 1, nisa.activation: 0`. sim flag ON/OFF both
+PASS (err ~1e-7). **REAL HW flag-ON Compiler PASS, sigmoid correct.** Flag-off 4/4 tests; A/B suite 8/8 PASS.
+Scattered edge-case activation sites (cross-broadcast cast paths) left on nisa — diminishing returns.

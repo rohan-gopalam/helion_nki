@@ -47,6 +47,16 @@ def _nki_use_tilestream() -> bool:
     return os.environ.get("HELION_NKI_TILESTREAM", "0") not in ("0", "false", "")
 
 
+def _emit_activation_str(dst: str, op: str, data: str) -> str:
+    """EXPERIMENTAL: emit a unary activation as nkilib `blas.activation` when the
+    tilestream flag is on, else the legacy `nisa.activation`. Both lower to the
+    same nisa op; the blas form makes generated kernels read in nkilib style.
+    Drop-in (raw-ndarray dst/src), so no variable type changes."""
+    if _nki_use_tilestream():
+        return f"_nkitile.blas.activation(dst={dst}, src={data}, op={op})"
+    return f"nisa.activation(dst={dst}, op={op}, data={data})"
+
+
 class NKIOpOverrides:
     """NKI op overrides for Inductor codegen (elementwise ops).
     When _codegen_state is set, emits nisa.tensor_tensor(dst, data1, data2, op);
@@ -3068,9 +3078,7 @@ class NKIOpOverrides:
         if operand_tile_vars is not None:
             for ov in operand_tile_vars:
                 state.add_statement(
-                    statement_from_string(
-                        f"nisa.activation(dst={ov}, op=nl.reciprocal, data={ov})"
-                    )
+                    statement_from_string(_emit_activation_str(ov, "nl.reciprocal", ov))
                 )
             return operand
 
@@ -3104,7 +3112,7 @@ class NKIOpOverrides:
                 )
                 state.add_statement(
                     statement_from_string(
-                        f"nisa.activation(dst={new_var}, op=nl.reciprocal, data={operand_str})"
+                        _emit_activation_str(new_var, "nl.reciprocal", operand_str)
                     )
                 )
                 _refine_reciprocal(new_var, operand_str, list(src_shape))
@@ -3112,7 +3120,7 @@ class NKIOpOverrides:
 
         state.add_statement(
             statement_from_string(
-                f"nisa.activation(dst={operand_str}, op=nl.reciprocal, data={operand_str})"
+                _emit_activation_str(operand_str, "nl.reciprocal", operand_str)
             )
         )
         # If operand is [1, N] (free-dim vector), transpose to [N, 1] so that
@@ -3234,24 +3242,18 @@ class NKIOpOverrides:
                     )
                 )
                 state.add_statement(
-                    statement_from_string(
-                        f"nisa.activation(dst={new_dst}, op={op}, data={dst})"
-                    )
+                    statement_from_string(_emit_activation_str(new_dst, op, dst))
                 )
                 return new_dst
 
         if dst_tile_vars is not None:
             for dv in dst_tile_vars:
                 state.add_statement(
-                    statement_from_string(
-                        f"nisa.activation(dst={dv}, op={op}, data={dv})"
-                    )
+                    statement_from_string(_emit_activation_str(dv, op, dv))
                 )
         else:
             state.add_statement(
-                statement_from_string(
-                    f"nisa.activation(dst={dst}, op={op}, data={dst})"
-                )
+                statement_from_string(_emit_activation_str(dst, op, dst))
             )
         return dst
 

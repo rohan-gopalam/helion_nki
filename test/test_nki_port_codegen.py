@@ -9,7 +9,7 @@ Run: HELION_BACKEND=nki HELION_NEURON_TARGET=trn2 \
 
 The byte-for-byte parity with the reference branch (fix-nki-kernel-compilation)
 was verified during the port for copy/matmul/reduce (identical) and gather
-(semantically identical; see NKI_PORT_COMMIT_LOG.md P1.22). These tests assert
+(semantically identical; see docs/nki_port/NKI_PORT_COMMIT_LOG.md P1.22). These tests assert
 the structural invariants so future changes can't silently regress them.
 """
 

@@ -848,87 +848,6 @@ class ReductionLowering(InductorLowering):
             raise exc.MultipleReductionDims
 
         env = CompileEnvironment.current()
-
-        def match_active_block_id(size: object) -> int | None:
-            candidates: set[int] = set()
-            block_id = env.resolve_block_id(size)
-            if block_id is not None:
-                block_id = env.resolve_codegen_block_id(
-                    block_id,
-                    state.codegen,
-                    node.graph,
-                )
-                if state.codegen.active_device_loops.get(block_id) or (
-                    state.codegen.device_function.tile_strategy.thread_axis_for_block_id(
-                        block_id
-                    )
-                    is not None
-                ):
-                    candidates.add(block_id)
-            for strategy in state.codegen.device_function.tile_strategy.strategies:
-                for candidate_block_id in strategy.block_ids:
-                    if (
-                        state.codegen.device_function.tile_strategy.thread_axis_for_block_id(
-                            candidate_block_id
-                        )
-                        is None
-                    ):
-                        continue
-                    candidate_size = env.block_sizes[candidate_block_id].size
-                    candidate_source = getattr(
-                        env.block_sizes[candidate_block_id].block_size_source,
-                        "value",
-                        None,
-                    )
-                    if (
-                        isinstance(size, torch.SymInt)
-                        and isinstance(candidate_source, torch.SymInt)
-                        and candidate_source._sympy_() == size._sympy_()
-                    ):
-                        candidates.add(candidate_block_id)
-                        continue
-                    if isinstance(size, (int, torch.SymInt)) and isinstance(
-                        candidate_size, (int, torch.SymInt)
-                    ):
-                        if env.known_equal(candidate_size, size):
-                            candidates.add(candidate_block_id)
-
-            seen: set[int] = set()
-            for loops in state.codegen.active_device_loops.values():
-                for loop_state in loops:
-                    key = id(loop_state)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    for candidate_block_id, info in loop_state.block_id_to_info.items():
-                        if isinstance(
-                            size, (int, torch.SymInt)
-                        ) and info.is_end_matching(size):
-                            candidates.add(candidate_block_id)
-            if len(candidates) == 1:
-                return next(iter(candidates))
-            return None
-
-        active_block_id = (
-            match_active_block_id(repr_input.size(dims[0]))
-            if env.backend.name == "cute"
-            and not env.block_sizes[self.block_index].reduction
-            else None
-        )
-        if active_block_id is not None:
-            from .reduction_strategy import BlockReductionStrategy
-
-            strategy = BlockReductionStrategy(state, active_block_id)
-        elif env.block_sizes[self.block_index].reduction:
-            strategy = ctx.cg.device_function.tile_strategy.get_reduction_strategy(
-                self.block_index
-            )
-        else:
-            from .reduction_strategy import BlockReductionStrategy
-
-            strategy = BlockReductionStrategy(state, self.block_index)
-
-        env = CompileEnvironment.current()
         with env.set_codegen_state(state):
             result_ast = strategy.codegen_reduction(
                 state,
@@ -1179,10 +1098,6 @@ class GenerateASTFromInductor(DefaultHandler):
                         "exp, log, sin, arctan, sqrt, rsqrt, reciprocal, sign, abs.",
                     ) from e
             raise
-        # C++ namespace syntax (::) is not valid Python.  Replace with dot
-        # notation so expr_from_string can parse it as attribute access.
-        if CompileEnvironment.current().backend_name == "metal" and "::" in result_str:
-            result_str = result_str.replace("::", ".")
         return self._lift(expr_from_string(result_str))
 
     def to_dtype(
@@ -1198,16 +1113,6 @@ class GenerateASTFromInductor(DefaultHandler):
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
-        if (
-            CompileEnvironment.current().backend.name == "cute"
-            and src_dtype is torch.float8_e4m3fn
-            and dtype is torch.float32
-        ):
-            cast_expr = expr_from_string(
-                "_cute_fp8e4m3fn_to_float32({x})",
-                x=self._to_ast(x),
-            )
-            return self._lift(cast_expr)
         backend = CompileEnvironment.current().backend
         if backend.codegen_name == "nki" and src_dtype is not None and src_dtype != dtype:
             return self._lift(backend.cast_ast(
@@ -1581,10 +1486,9 @@ def codegen_call_with_graph(
                 if tile_vars is not None:
                     cg.device_function.register_tile_list(copy_name, tile_vars)
                 else:
-                    with cg.statement_owner_node(placeholder):
-                        cg.add_statement(
-                            statement_from_string(f"{copy_name} = {{arg}}", arg=arg)
-                        )
+                    cg.add_statement(
+                        statement_from_string(f"{copy_name} = {{arg}}", arg=arg)
+                    )
                 new_args.append(expr_from_string(copy_name))
             else:
                 with cg.statement_owner_node(placeholder):

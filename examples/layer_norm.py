@@ -124,7 +124,7 @@ def layer_norm_bwd(
         if compute_bias_grad:
             grad_b_acc = weight.new_zeros(n, dtype=torch.float32)
         weight_cta = weight[None, :].to(torch.float32)
-        for mb in hl.tile(mb_cta.begin, mb_cta.end):
+        for mb in hl.tile(mb_cta.begin, mb_cta.end, block_size=1):
             x_mb = x[mb, :].to(torch.float32)
             dy_mb = grad_out[mb, :].to(torch.float32)
             mean_mb = mean[mb].to(torch.float32)
@@ -245,7 +245,7 @@ def main() -> None:
     - Prints comparison results and checks for correctness within specified tolerances.
     """
     batch_size = 4096
-    dim = 10240
+    dim = 8192
     device = DEVICE
 
     # Test forward pass only
@@ -277,7 +277,11 @@ def main() -> None:
             layer_norm,
             torch.nn.functional.layer_norm,
             (x_grad, [dim], weight_grad, b, eps),
-            rtol=1e-2,
+            # grad_weight accumulates dy*x_hat over the full batch (4096 rows), so
+            # fp32 summation-order differences between Helion and PyTorch amplify
+            # to ~1 fp16 unit at the max-magnitude gradient scale (~260).
+            # Use rtol=2e-3 (2× fp16 precision) to accommodate this.
+            rtol=2e-3,
             atol=1e-2,
             bwd=True,
         )

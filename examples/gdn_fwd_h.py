@@ -25,7 +25,9 @@ import helion.language as hl
 # %%
 # Helion Kernel Implementation
 # ----------------------------
-@helion.kernel()
+@helion.kernel(
+    backend="nki", autotune_effort="none", config=helion.Config(block_sizes=[128])
+)
 def helion_gdn_fwd_h(
     k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor, chunk_size: int
 ) -> torch.Tensor:

@@ -90,7 +90,11 @@ def reference_jagged_hstu_kernel_pytorch(
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128]),
+)
 def _helion_jagged_attention_kernel(
     max_seq_len: int,
     alpha: float,

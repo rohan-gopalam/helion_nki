@@ -120,12 +120,6 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         # Track var=const for NKI tensor_scalar (avoids tensor_tensor when one op is scalar)
         self._var_to_constant: dict[str, int | float | bool] = {}
-        self._nki_sbuf_constant_values: dict[str, int | float | bool] = {}
-        self._nki_sbuf_alloc_depth: dict[str, int] = {}
-        self.fx_node_to_ast: dict[object, ast.AST | tuple[ast.AST, ...]] = {}
-        self.store_transform = store_transform
-        self.load_transform = load_transform
-        self._statement_owner_fx_node: Node | None = None
 
         # Now create device function and initialize CodegenInterface
         self.device_function = DeviceFunction(
@@ -499,48 +493,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             isinstance(stmt, ast.Assign)
             and len(stmt.targets) == 1
             and isinstance(stmt.targets[0], ast.Name)
-            and isinstance(stmt.value, ast.BinOp)
-            and isinstance(stmt.value.op, ast.Mod)
-            and (lowered := self._lower_nki_mod_assign(stmt.targets[0].id, stmt.value))
-            is not None
+            and isinstance(stmt.value, ast.Constant)
         ):
-            self.statements_stack[-1].extend(lowered)
-            return
-        if (
-            isinstance(stmt, ast.Assign)
-            and len(stmt.targets) == 1
-            and isinstance(stmt.targets[0], ast.Name)
-            and isinstance(stmt.value, ast.Name)
-            and (
-                lowered := self._lower_nki_sbuf_reassign(
-                    stmt.targets[0].id, stmt.value.id
-                )
-            )
-            is not None
-        ):
-            self.statements_stack[-1].extend(lowered)
-            return
-        if (
-            isinstance(stmt, ast.Assign)
-            and len(stmt.targets) == 1
-            and isinstance(stmt.targets[0], ast.Name)
-        ):
-            const_value = self._constant_value_from_ast(stmt.value)
-            if isinstance(const_value, (int, float, bool)):
-                self._var_to_constant[stmt.targets[0].id] = const_value
-            elif (
-                isinstance(stmt.value, ast.Call)
-                and isinstance(stmt.value.func, ast.Name)
-                and stmt.value.func.id == "float"
-                and len(stmt.value.args) == 1
-                and isinstance(stmt.value.args[0], ast.Constant)
-                and isinstance(stmt.value.args[0].value, str)
-            ):
-                self._var_to_constant[stmt.targets[0].id] = float(
-                    stmt.value.args[0].value
-                )
-            self._record_nki_sbuf_allocation(stmt)
-        self._record_nki_sbuf_write(stmt)
+            self._var_to_constant[stmt.targets[0].id] = stmt.value.value
         self.statements_stack[-1].append(stmt)
         self._record_statement_thread_references([stmt])
         self._record_tcgen05_owned_statement(stmt)
@@ -575,6 +530,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 if current_statements is loop_state.inner_statements:
                     cute_state.register_tcgen05_kloop_owned_stmts(loop_state, [stmt])
                     return
+
+    def get_var_constant_value(self, var_name: str) -> int | float | bool | None:
+        """Return constant value if var was assigned a literal, else None."""
+        return self._var_to_constant.get(var_name)
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
         from .compile_environment import CompileEnvironment
@@ -1237,89 +1196,29 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 root_graph_info = self.get_graph(
                     self.host_function.device_ir.root_ids[node._root_id],
                 )
-                previous_root_graph_info = self.current_root_graph_info
-                self.current_root_graph_info = root_graph_info
-                try:
-                    iter_node = node.iter
-                    assert isinstance(iter_node, ExtendedAST)
-                    with iter_node:
-                        assert isinstance(iter_node, ast.Call)
-                        args = []
-                        kwargs = {}
-                        for arg_node in iter_node.args:
-                            assert not isinstance(arg_node, ast.Starred)
-                            assert isinstance(arg_node, ExtendedAST)
-                            assert arg_node._type_info is not None
-                            args.append(arg_node._type_info.proxy())
-                        for kwarg_node in iter_node.keywords:
-                            assert kwarg_node.arg is not None
-                            assert isinstance(kwarg_node.value, ExtendedAST)
-                            assert kwarg_node.value._type_info is not None
-                            kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
-                        fn_node = iter_node.func
-                        assert isinstance(fn_node, ExtendedAST)
-                        assert fn_node._type_info is not None
-                        fn = fn_node._type_info.proxy()
-                        assert is_api_func(fn)
-                        env = CompileEnvironment.current()
-                        try:
-                            codegen_fn = fn._codegen[env.codegen_name]
-                        except KeyError:
-                            raise exc.BackendImplementationMissing(
-                                env.backend_name,
-                                f"codegen for API function {fn.__qualname__}",
-                            ) from None
-                        bound = fn._signature.bind(*args, **kwargs)
-                        bound.apply_defaults()
-                        from .inductor_lowering import CodegenState
-
-                        state = CodegenState(
-                            self,
-                            fx_node=None,
-                            proxy_args=[*bound.arguments.values()],
-                            # pyrefly: ignore [bad-argument-type]
-                            ast_args=None,
-                        )
-
-                        codegen_fn(state)
-                    root = root_graph_info.graph
-                    grid_state = self.current_grid_state
-                    if env.backend.name == "nki":
-                        env.backend.validate_nki_tensor_shapes(root)
-                        # Run FX-graph fusion passes after validation: annotate
-                        # nodes with metadata that downstream codegen consumes
-                        # (e.g. matmul→activation PSUM reuse). Passes are read-only
-                        # on graph structure; they only set node.meta entries.
-                        from .nki_fusion import annotate_fx_graph
-
-                        annotate_fx_graph(root)
-                    with env.set_codegen_state(state):
-                        if isinstance(grid_state, DeviceGridState):
-                            # Codegen the body first so synthetic free-``hl.arange``
-                            # lane loops registered *during* body lowering (CuTe
-                            # over-budget chunking) are visible to the wrap below.
-                            wrapped_body: list[ast.AST] = []
-                            with self.set_statements(wrapped_body):
-                                codegen_call_with_graph(self, root, [])
-                            if grid_state.has_lane_loops():
-                                self.statements_stack[-1].extend(
-                                    grid_state.outer_prefix
-                                )
-                                if self.device_function.cute_state.consume_root_lane_loop_suppression():
-                                    self.statements_stack[-1].extend(wrapped_body)
-                                else:
-                                    self.statements_stack[-1].extend(
-                                        grid_state.wrap_body(wrapped_body)
-                                    )
-                                self.statements_stack[-1].extend(
-                                    grid_state.outer_suffix
-                                )
-                            else:
-                                self.statements_stack[-1].extend(wrapped_body)
-                        else:
+                grid_state = self.current_grid_state
+                env = CompileEnvironment.current()
+                if env.backend.name == "nki":
+                    env.backend.validate_nki_tensor_shapes(root)
+                    # Run FX-graph fusion passes after validation: annotate
+                    # nodes with metadata that downstream codegen consumes
+                    # (e.g. matmul→activation PSUM reuse). Passes are read-only
+                    # on graph structure; they only set node.meta entries.
+                    from .nki_fusion import annotate_fx_graph
+                    annotate_fx_graph(root)
+                with env.set_codegen_state(state):
+                    if (
+                        isinstance(grid_state, DeviceGridState)
+                        and grid_state.has_lane_loops()
+                    ):
+                        wrapped_body: list[ast.AST] = []
+                        with self.set_statements(wrapped_body):
                             codegen_call_with_graph(self, root, [])
-                finally:
-                    self.current_root_graph_info = previous_root_graph_info
+                        self.statements_stack[-1].extend(
+                            grid_state.wrap_body(wrapped_body)
+                        )
+                    else:
+                        codegen_call_with_graph(self, root, [])
 
                 # Flush deferred RDIM definitions now that block sizes are determined
                 # This ensures block size and rdim vars are defined in the correct order

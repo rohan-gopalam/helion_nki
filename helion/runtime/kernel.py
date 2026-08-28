@@ -790,14 +790,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         self.env.backend.setup_compile_cache_dir(device_index)
         try:
+            print("      [Profile] Starting to_triton_code...", file=sys.stderr)
+            t_start = time.time()
             triton_code = self.to_triton_code(
                 config, emit_repro_caller=self.settings.print_output_code
             )
+            t_codegen = time.time()
+            print(f"      [Profile] to_triton_code took {t_codegen - t_start:.2f} seconds.", file=sys.stderr)
+            
             with measure("BoundKernel.PyCodeCache.load"):
+                print("      [Profile] Starting PyCodeCache.load() [this invokes Inductor/AOT/neuronx-cc]...", file=sys.stderr)
                 module = PyCodeCache.load(triton_code)
-            self.env.backend.annotate_compiled_module(
-                module, triton_code, self.kernel.name
-            )
+                t_compile = time.time()
+                print(f"      [Profile] PyCodeCache.load took {t_compile - t_codegen:.2f} seconds.", file=sys.stderr)
         except Exception:
             log.warning(
                 "Helion compiler triton codegen error for %s",
@@ -1131,25 +1136,20 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             assert self._run is not None
             self.maybe_log_repro(log.warning, args)
 
-        _nki_profile = os.environ.get("HELION_NKI_PROFILE", "0") not in (
-            "0",
-            "false",
-            "",
-        )
-        if _nki_profile:
-            print(
-                "      [Profile] Starting self._run(*args) [this triggers NKI AOT compilation]...",
-                file=sys.stderr,
-            )
-        t_run_start = time.time()
-        res = self._run(*args)
-        t_run_end = time.time()
-        if _nki_profile:
-            print(
-                f"      [Profile] self._run took {t_run_end - t_run_start:.2f} seconds.",
-                file=sys.stderr,
-            )
-        return res
+        assert self._config is not None
+        counters["best_config_decorator"][
+            self.format_kernel_decorator(self._config, self.settings)
+        ] = 1
+
+        self.maybe_log_repro(log.warning, args)
+
+        with measure("BoundKernel.kernel_call"):
+            print("      [Profile] Starting self._run(*args) [this triggers NKI AOT compilation]...", file=sys.stderr)
+            t_run_start = time.time()
+            res = self._run(*args)
+            t_run_end = time.time()
+            print(f"      [Profile] self._run took {t_run_end - t_run_start:.2f} seconds.", file=sys.stderr)
+            return res
 
     def backend_cache_key(self, config: ConfigLike | None = None) -> str | None:
         """

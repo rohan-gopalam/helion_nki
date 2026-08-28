@@ -21,7 +21,12 @@ from helion.runtime.settings import _get_backend
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+    static_shapes=True,
+)
 def _bf16xint16_gemm(x: Tensor, w: Tensor) -> Tensor:
     """
     x is bf16, w is int16.
@@ -44,7 +49,12 @@ def _bf16xint16_gemm(x: Tensor, w: Tensor) -> Tensor:
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+    static_shapes=True,
+)
 def _int16xbf16_gemm(x: Tensor, w: Tensor) -> Tensor:
     """
     x is int16, w is bf16.

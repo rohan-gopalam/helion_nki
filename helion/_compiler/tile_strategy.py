@@ -1885,8 +1885,7 @@ class ForiLoopState(DeviceLoopOrGridState):
 
 @dataclasses.dataclass
 class DeviceGridState(DeviceLoopOrGridState):
-    lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
-    lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
+    lane_loops: list[tuple[str, str | int]] = dataclasses.field(default_factory=list)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
@@ -1900,14 +1899,16 @@ class DeviceGridState(DeviceLoopOrGridState):
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
-        for entry in reversed(self.lane_loops):
-            # NKI uses a 3-tuple (lane_var, body_prefix_stmts, extent) to inject
-            # nisa.iota index setup at the top of each loop body where lane_var
-            # is in scope; other backends use the 2-tuple (lane_var, extent).
-            if len(entry) == 3:
-                lane_var, body_prefix, extent = entry
-                iter_expr = (
-                    extent if isinstance(extent, str) else f"range({extent})"
+        for lane_var, extent in reversed(self.lane_loops):
+            iter_expr = extent if isinstance(extent, str) else f"range({extent})"
+            wrapped = [
+                create(
+                    ast.For,
+                    target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+                    iter=expr_from_string(iter_expr),
+                    body=wrapped,
+                    orelse=[],
+                    type_comment=None,
                 )
                 wrapped = [
                     create(
@@ -3431,15 +3432,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         env = CompileEnvironment.current()
         block_sizes = self.block_size
         assert len(block_sizes) == len(block_ids)
-        pids = self.select_pid_strategy()
-        if isinstance(state.device_function.pid, ForEachProgramID):
-            pids.shared_pid_var = state.device_function.pid.shared_pid_var
-        elif (
-            isinstance(pids, FlatProgramIDs)
-            and env.backend.name == "pallas"
-            and len(block_ids) >= 2
-        ):
-            pids = XYZProgramIDs()
 
         assert state.ast_args is None
         assert len(state.proxy_args) == 3
@@ -3462,9 +3454,10 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         if env.backend.name == "nki":
             return self._codegen_grid_nki(state, block_ids, block_sizes, begins, ends)
 
-        steps = self._root_grid_steps(state)
+        pids = self.select_pid_strategy()
+        if isinstance(state.device_function.pid, ForEachProgramID):
+            pids.shared_pid_var = state.device_function.pid.shared_pid_var
 
-        tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
         for i, (block_idx, block_size, begin, end, step) in enumerate(
@@ -3488,21 +3481,18 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                     f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
                 )
 
-            if step not in (None, 1):
-                step_ast = self._to_ast(step, to_dtype=dtype)
-                # CuTe DSL preprocessor reserves ``step_<counter>`` (see comment
-                # in ``TileStrategy.__init__``) — rename our lifted step var to
-                # avoid the same UnboundLocalError that drove the offset rename.
-                step_prefix = "tile_step" if env.backend.name == "cute" else "step"
-                step_var = state.codegen.lift(step_ast, dce=True, prefix=step_prefix).id
-                block_size_var = "1"
-                state.add_statement(
-                    f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
+            if block_size != 1:
+                # NKI: set cache to literal first so device and launcher grid use literal
+                block_size_var_for_constexpr = self.block_size_var(block_idx)
+                assert block_size_var_for_constexpr is not None
+                self._setup_block_size_constexpr(
+                    state,
+                    block_size_var_for_constexpr,
+                    block_size,
+                    block_idx=block_idx,
                 )
-            elif block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
                 )
@@ -3821,6 +3811,46 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             self, block_id_to_info=block_id_to_info, lane_loops=lane_loops
         )
 
+    def _codegen_grid_nki(
+        self,
+        state: CodegenState,
+        block_ids: list[int],
+        block_sizes: list[int],
+        begins: list[object],
+        ends: list[object],
+    ) -> DeviceGridState:
+        """NKI: emit nl.affine_range loops instead of program_id grid parallelism."""
+        env = CompileEnvironment.current()
+        lane_loops: list[tuple[str, str]] = []
+
+        for block_idx, block_size, begin, end in zip(
+            block_ids, block_sizes, begins, ends, strict=True
+        ):
+            block_size_info = env.block_sizes[block_idx]
+            numel = block_size_info.numel
+            offset_var = self.offset_var(block_idx)
+
+            self._setup_block_size_constexpr(
+                state,
+                self.block_size_var(block_idx),
+                block_size,
+                block_idx=block_idx,
+            )
+
+            begin_str = str(int(begin)) if isinstance(begin, (int, float)) else "0"
+            end_str = str(int(numel)) if numel is not None else str(end)
+            step_str = str(int(block_size))
+            range_expr = f"nl.affine_range({begin_str}, {end_str}, {step_str})"
+            lane_loops.append((offset_var, range_expr))
+
+        nki_pids = NKIProgramIDs()
+        state.device_function.set_pid(nki_pids)
+
+        block_id_to_info = self._create_block_id_info_dict(state)
+        return DeviceGridState(
+            self, block_id_to_info=block_id_to_info, lane_loops=lane_loops
+        )
+
     def _to_ast(self, x: object, to_dtype: str | None = None) -> ast.AST:
         if isinstance(x, ast.AST):
             if to_dtype:
@@ -3874,6 +3904,31 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             steps = [None] * len(block_ids)
         assert isinstance(steps, list)
         assert isinstance(proxy_ends, list)
+        # For NKI device loops, use dimension size as loop end (e.g. x.shape[1] for K)
+        # so the range is 0..dim_size with step block_size, not 0..128.
+        # Only apply when begin == 0 (top-level loops).  For nested loops with a
+        # non-zero begin (e.g. inner tile of hl.tile(mb_cta.begin, mb_cta.end)),
+        # bs_info.size is the range *length* (32), not the absolute end
+        # (offset_0 + 32), so replacing ends[i] with bs_info.size would give a
+        # wrong constant stop value and make all but the first outer iteration empty.
+        if env.backend.name == "nki":
+            ends = list(ends)
+            proxy_ends = list(proxy_ends)
+            for i, block_idx in enumerate(block_ids):
+                begin_i = begins[i]
+                begin_is_zero = (
+                    (isinstance(begin_i, int) and begin_i == 0)
+                    or (
+                        isinstance(begin_i, torch.SymInt)
+                        and begin_i._sympy_() == 0
+                    )
+                )
+                if not begin_is_zero:
+                    continue  # keep the original absolute end for nested loops
+                bs_info = env.block_sizes[block_idx]
+                if isinstance(bs_info.size, (int, torch.SymInt)):
+                    ends[i] = bs_info.size
+                    proxy_ends[i] = bs_info.size
         block_id_to_info = {}
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
@@ -3883,10 +3938,17 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         ):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
-            if step in (None, 1) and block_size != 1:
+            if block_size != 1:
+                block_size_var_for_constexpr = self.block_size_var(block_idx)
+                assert block_size_var_for_constexpr is not None
+                self._setup_block_size_constexpr(
+                    state,
+                    block_size_var_for_constexpr,
+                    block_size,
+                    block_idx=block_idx,
+                )
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
             else:
                 block_size_var = "1"
             end_var_name = state.codegen.lift(
@@ -4459,7 +4521,7 @@ class NDTileStrategy(_BaseNDTileStrategy):
         self.l2_grouping = l2_grouping
 
     def mask_var(self, block_idx: int) -> str | None:
-        return self.mask_vars[block_idx]
+        return self.mask_vars.get(block_idx)
 
     def _setup_mask(
         self,
@@ -4833,7 +4895,9 @@ class CuteNDTileStrategy(NDTileStrategy):
             elif block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
+                self._setup_block_size_constexpr(
+                    state, block_size_var, block_size, block_idx=block_idx
+                )
                 state.add_statement(
                     f"{offset_var} = {begin_offset_expr}{pid_var} * {block_size_var}"
                 )
@@ -4996,10 +5060,17 @@ class CuteNDTileStrategy(NDTileStrategy):
         ):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
-            if step in (None, 1) and block_size != 1:
+            if block_size != 1:
+                block_size_var_for_constexpr = self.block_size_var(block_idx)
+                assert block_size_var_for_constexpr is not None
+                self._setup_block_size_constexpr(
+                    state,
+                    block_size_var_for_constexpr,
+                    block_size,
+                    block_idx=block_idx,
+                )
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
-                self._setup_block_size_constexpr(state, block_size_var, block_size)
             else:
                 block_size_var = "1"
             end_var_name = state.codegen.lift(

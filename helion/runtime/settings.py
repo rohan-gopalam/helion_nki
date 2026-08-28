@@ -45,7 +45,8 @@ if TYPE_CHECKING:
         ) -> BaseAutotuner: ...
 
 
-DotPrecision = Literal["tf32", "tf32x3", "ieee", "default", "high", "highest"]
+BackendLiteral = Literal["triton", "pallas", "cute", "tileir", "nki"]
+DotPrecision = Literal["tf32", "tf32x3", "ieee"]
 PrecompileMode = Literal["spawn", "fork"] | None
 _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
@@ -69,6 +70,43 @@ def _resolve_warning_name(name: str) -> type[exc.BaseWarning]:
         )
     return warning_cls
 
+def get_neuron_target(config_target: str | None = None) -> str:
+    """
+    Determines the target architecture for Neuron compilation.
+    Priority: 1. Config Object -> 2. Environment Variable -> 3. Auto-detect
+    """
+
+    # 1. Check if the user passed it programmatically via Config
+    if config_target:
+        return config_target
+
+    # 2. Check for a Helion-specific environment override
+    env_target = os.environ.get("HELION_NEURON_TARGET")
+    if env_target:
+        return env_target
+
+    # 3. Attempt hardware auto-detection (best effort)
+    try:
+        # Query the actual driver on the machine
+        output = subprocess.check_output(["neuron-ls"], text=True).lower()
+        if "trn1" in output:
+            return "trn1"
+        if "inf2" in output:
+            return "inf2"
+        # Easy to extend for "trn2" later
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # FileNotFoundError: neuron-ls isn't installed (e.g., CPU head node)
+        # CalledProcessError: driver is in a bad state
+        pass
+
+    # 4. Explicit Failure
+    raise RuntimeError(
+        "Helion failed to auto-detect the AWS Neuron hardware target. "
+        "If you are cross-compiling on a CPU node, you must specify the target manually.\n"
+        "Ways to fix this:\n"
+        "  - Pass it to the config: helion.Config(..., target='trn1')\n"
+        "  - Set the environment variable: export HELION_NEURON_TARGET='trn1'"
+    )
 
 def get_neuron_target(config_target: str | None = None) -> str:
     """
@@ -404,8 +442,14 @@ def _get_dot_precision() -> DotPrecision:
 def _get_backend() -> str:
     return _env_get_literal(
         "HELION_BACKEND",
-        "triton",
-        mapping={name: name for name in list_backends()},
+        cast("BackendLiteral", "triton"),
+        mapping={
+            "triton": "triton",
+            "pallas": "pallas",
+            "cute": "cute",
+            "tileir": "tileir",
+            "nki": "nki",
+        },
     )
 
 
@@ -603,38 +647,6 @@ class _Settings:
     autotune_baseline_rtol: float | None = None
     autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
-    autotune_best_available_max_configs: int = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_int, "HELION_BEST_AVAILABLE_MAX_CONFIGS", 20
-        )
-    )
-    autotune_best_available_max_cache_scan: int = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_int, "HELION_BEST_AVAILABLE_MAX_CACHE_SCAN", 500
-        )
-    )
-    autotune_initial_population_strategy: InitialPopulation | None = None
-    torch_compile_fusion: bool = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_bool, "HELION_TORCH_COMPILE_FUSION", False
-        )
-    )
-    autotune_with_torch_compile_fusion: bool = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_bool, "HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION", False
-        )
-    )
-    autotune_config_filter: Callable[[Config], Config | None] | None = None
-    pallas_interpret: bool = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_bool, "HELION_PALLAS_INTERPRET", False
-        )
-    )
-    triton_do_not_specialize: bool = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
-        )
-    )
     platform_target: str | None = None
 
 
@@ -807,40 +819,6 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
-        ),
-        "autotune_best_available_max_configs": (
-            "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population "
-            "and for helion.from_cache() warm-start in FiniteSearch. "
-            "Set HELION_BEST_AVAILABLE_MAX_CONFIGS=N to override. Default is 20."
-        ),
-        "autotune_best_available_max_cache_scan": (
-            "Maximum number of cache files to scan when searching for matching configs in FROM_BEST_AVAILABLE strategy. "
-            "Set HELION_BEST_AVAILABLE_MAX_CACHE_SCAN=N to override. Default is 500."
-        ),
-        "autotune_initial_population_strategy": (
-            "Override the initial population strategy for autotuning. "
-            "Valid values: 'from_random', 'from_best_available'. "
-            "When set, takes precedence over the HELION_AUTOTUNER_INITIAL_POPULATION env var "
-            "and the effort profile default."
-        ),
-        "torch_compile_fusion": (
-            "If True, allow torch.compile to fuse this Helion kernel with surrounding Inductor ops "
-            "(prologue/epilogue) when used inside torch.compile. Default False. "
-            "Set HELION_TORCH_COMPILE_FUSION=1 to enable globally."
-        ),
-        "autotune_config_filter": (
-            "Optional callable ``(config: Config) -> Config | None`` that the autotuner calls on every "
-            "candidate config before compiling or benchmarking it.  If the callable returns None, "
-            "the config is skipped entirely (no compilation, no benchmarking).  If it returns a Config "
-            "(which may be a modified copy of the original), that config is used for benchmarking. "
-            "Also filters the explicit ``configs=[...]`` list when one is provided. "
-            "Pass as @helion.kernel(..., autotune_config_filter=my_filter_fn)."
-        ),
-        "autotune_with_torch_compile_fusion": (
-            "If True, autotuning benchmarks the fused kernel (with epilogue/prologue) "
-            "to pick configs optimal for the actual fused workload. Default False. "
-            "Has no effect unless torch_compile_fusion is also True. "
-            "Set HELION_AUTOTUNE_WITH_TORCH_COMPILE_FUSION=1 to enable globally."
         ),
         "platform_target": "The hardware platform to compile for when using the NKI backend (e.g. 'trn1').",
     }

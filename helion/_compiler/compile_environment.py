@@ -9,6 +9,7 @@ import threading
 import types
 import typing
 from typing import TYPE_CHECKING
+from typing import Iterator
 from typing import Protocol
 import warnings
 
@@ -37,7 +38,12 @@ from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
-from .backend_registry import get_backend_class
+from .backend import Backend
+from .backend import CuteBackend
+from .backend import NKIBackend
+from .backend import PallasBackend
+from .backend import TileIRBackend
+from .backend import TritonBackend
 from .source_location import SourceLocation
 from .source_location import current_location
 from .variable_origin import BlockSizeOrigin
@@ -212,7 +218,10 @@ class CompileEnvironment:
     Global state for the duration of a compilation.
     There is a 1:1 mapping between this and a BoundKernel,
     and a single CompileEnvironment will be used for multiple Configs.
-    No config or codegen specific state should be stored here.
+    No config or codegen specific state should be stored here, except
+    _codegen_state (Option B in NKI_STATEMENT_BASED_CODEGEN.md): set during
+    codegen so statement-based backends (e.g. NKI) can emit statements and
+    return the result variable name.
     """
 
     def __init__(
@@ -231,10 +240,15 @@ class CompileEnvironment:
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
-        self.process_group_name = None
-        self._backend = get_backend_class(settings.backend)()
-        self._backend.validate_environment()
-        if self._backend.experimental:
+        backend_factory: dict[str, type[Backend]] = {
+            "triton": TritonBackend,
+            "pallas": PallasBackend,
+            "cute": CuteBackend,
+            "tileir": TileIRBackend,
+            "nki": NKIBackend,
+        }
+        self._backend = backend_factory[settings.backend]()
+        if settings.backend in ("pallas", "cute"):
             from torch._dynamo.utils import warn_once
 
             warn_once(
@@ -303,8 +317,7 @@ class CompileEnvironment:
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
-        # Set during codegen so backends (e.g. NKI) can emit statements and
-        # return the result variable name; see NKI_STATEMENT_BASED_CODEGEN.md Option B.
+        # Set during codegen so backends (e.g. NKI) can emit statements; see NKI_STATEMENT_BASED_CODEGEN.md Option B.
         self._codegen_state: object | None = None
 
     @contextlib.contextmanager
@@ -1421,15 +1434,16 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
     reduction_loop: int
 
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int | None:
+        env = CompileEnvironment.current()
         if (
             len(config.reduction_loops) <= self.reduction_loop
             or config.reduction_loops[self.reduction_loop] is None
         ):
-            size = max(1, block_size_info.size_hint())
-            # Backends override static_rdim_size to control whether the
-            # persistent-reduction extent is rounded up to a power of two
-            # (Triton/CuTe) or kept exact (Pallas).
-            return CompileEnvironment.current().backend.static_rdim_size(size)
+            # NKI reduction DMA paths require source/destination extents to match.
+            # Avoid power-of-2 expansion for implicit reduction loop tile sizes.
+            if env.backend_name == "nki":
+                return max(1, block_size_info.size_hint())
+            return max(1, next_power_of_2(block_size_info.size_hint()))
         return config.reduction_loops[self.reduction_loop]
 
 

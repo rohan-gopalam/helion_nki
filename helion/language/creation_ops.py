@@ -282,6 +282,33 @@ def _full_codegen(state: CodegenState) -> ast.AST:
                 pass
         return expr_from_string(var)
 
+    # NKI two-line pattern: ndarray then nisa.memset(dst, value=...)
+    nki_memset = getattr(backend, "full_memset_stmt", None)
+    if nki_memset is not None and shape_dims:
+        var = state.device_function.new_var("_nki_full", dce=True)
+        ndarray_expr = backend.full_expr(shape_dims, "0", fake_value.dtype)
+        state.add_statement(statement_from_string(f"{var} = {ndarray_expr}"))
+        proxy_value = state.proxy_arg(1)
+        if isinstance(proxy_value, (int, float, bool)):
+            value_str = state.device_function.literal_expr(proxy_value)
+            state.add_statement(statement_from_string(nki_memset(var, value_str)))
+        else:
+            value_ast = state.ast_arg(1)
+            state.add_statement(
+                statement_from_string(nki_memset(var, "{val}"), val=value_ast)
+            )
+        # Register SBUF shape for multi-user detection on copy vars
+        if hasattr(state.device_function, "_nki_sbuf_shapes"):
+            try:
+                resolved = [int(d) for d in shape_dims]
+                if len(resolved) == 1:
+                    resolved.append(1)  # full_expr adds trailing 1 for 1D
+                if len(resolved) >= 2:
+                    state.device_function._nki_sbuf_shapes[var] = resolved
+            except (TypeError, ValueError):
+                pass
+        return expr_from_string(var)
+
     # Check if the value is static (literal) or dynamic (node)
     proxy_value = state.proxy_arg(1)
     if isinstance(proxy_value, (int, float, bool)):

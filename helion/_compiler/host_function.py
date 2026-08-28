@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import dataclasses
+import inspect
 import sys
 import threading
 import typing
@@ -129,68 +129,53 @@ class HostFunction:
         self.compiler_state: CompilerState = CompilerState()
         self._device_ir: DeviceIR | None = None
         self.local_types: dict[str, TypeInfo] | None = None
+        self.expr_to_origin: dict[sympy.Expr, SymbolOrigin] = {}
+        self.tensor_to_origin: dict[torch.Tensor, Origin] = {}
+        self.global_imports: dict[str, GlobalImport] = {}
+        with self:
+            with measure("HostFunction.parse_ast"):
+                source_indented = inspect.getsource(fn)
+                source = textwrap.dedent(source_indented)
+                self.column_offset: int = source_indented.index(source[0])
+                root = ast.parse(source)
+                assert isinstance(root, ast.Module)
+                (root,) = root.body
+                root = ast_extension.convert(root)
+                assert isinstance(root, ast.FunctionDef)
+                assert isinstance(root, ast_extension.ExtendedAST)
+                self.location = root._location
+                self.name: str = root.name
+                self.args: ast.arguments = root.args
+                self.body: list[ast.stmt] = root.body
 
-    # Backward-compatible accessors
+                self.params = inspect.signature(fn).bind(*fake_args)
+                self.params.apply_defaults()
 
-    # TODO(hinriksnaer): migrate call sites to hf.definition.* and
-    # hf.compiler_state.* directly, then remove these properties.
+                HostFunction.validate_ast(root)
 
-    @property
-    def fn(self) -> types.FunctionType:
-        return self.definition.fn
+            from .device_ir import lower_to_device_ir
+            from .static_loop_unroller import unroll_static_loops
+            from .type_propagation import propagate_types
 
-    @property
-    def constexpr_args(self) -> dict[str, object]:
-        return self.definition.constexpr_args
-
-    @property
-    def name(self) -> str:
-        return self.definition.name
-
-    @property
-    def args(self) -> ast.arguments:
-        return self.definition.args
-
-    @property
-    def body(self) -> list[ast.stmt]:
-        return self.definition.body
-
-    @body.setter
-    def body(self, value: list[ast.stmt]) -> None:
-        self.definition.body = value
-
-    @property
-    def params(self) -> inspect.BoundArguments:
-        return self.definition.params
-
-    @property
-    def device_ir(self) -> DeviceIR:
-        assert self._device_ir is not None
-        return self._device_ir
-
-    @device_ir.setter
-    def device_ir(self, value: DeviceIR) -> None:
-        self._device_ir = value
-
-    @property
-    def expr_to_origin(self) -> dict[sympy.Expr, SymbolOrigin]:
-        return self.compiler_state.expr_to_origin
-
-    @property
-    def tensor_to_origin(self) -> dict[torch.Tensor, Origin]:
-        return self.compiler_state.tensor_to_origin
-
-    @property
-    def global_imports(self) -> dict[str, GlobalImport]:
-        return self.compiler_state.global_imports
-
-    @property
-    def rng_seed_slot_count(self) -> int:
-        return self.compiler_state.rng_seed_slot_count
-
-    @rng_seed_slot_count.setter
-    def rng_seed_slot_count(self, value: int) -> None:
-        self.compiler_state.rng_seed_slot_count = value
+            # Disable autocast so that compilation reflects the actual dtypes
+            # written in the kernel, not the caller's mixed-precision context.
+            with torch._C._DisableAutocast():
+                with measure("HostFunction.unroll_static_loops"):
+                    unroll_static_loops(self)
+                with measure("HostFunction.propagate_types"):
+                    propagate_types(self)
+                with measure("HostFunction.finalize_config_spec"):
+                    env.finalize_config_spec()
+                maybe_patch_tensor_factories = (
+                    patch_tensor_factories()
+                    if env.backend_name != "nki"
+                    else contextlib.nullcontext()
+                )
+                with (
+                    measure("HostFunction.lower_to_device_ir"),
+                    maybe_patch_tensor_factories,
+                ):
+                    self.device_ir = lower_to_device_ir(self)
 
     @staticmethod
     def _suppress_guards_if_profiler_enabled(

@@ -30,6 +30,7 @@ Based on liger_kernel's KL divergence implementation used in language models.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+import time
 
 import torch
 from torch import Tensor
@@ -50,7 +51,12 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128]),
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
 def kl_div_forward(
     y_pred: Tensor,  # input predictions in log-space, shape (BT, V)
     y_true: Tensor,  # target values, shape (BT, V)
@@ -216,7 +222,11 @@ def check_kl_div_kernel(
     def baseline_wrapper(input_tensor: Tensor, target_tensor: Tensor) -> Tensor:
         return torch_kl_div(input_tensor, target_tensor)
 
+    print("  [Profile] Starting run_example...")
+    t0 = time.time()
     run_example(helion_wrapper, baseline_wrapper, (input_tensor, target_tensor))
+    t1 = time.time()
+    print(f"  [Profile] run_example took {t1 - t0:.2f} seconds.")
 
 
 # %%

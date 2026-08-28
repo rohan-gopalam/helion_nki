@@ -39,7 +39,7 @@ from helion._testing import run_example
 import helion.language as hl
 
 
-@helion.kernel()
+@helion.kernel(backend="nki", autotune_effort="none", config=helion.Config())
 def jagged_dense_bmm(
     seq_offsets: torch.Tensor,
     jagged: torch.Tensor,

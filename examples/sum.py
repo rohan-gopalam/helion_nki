@@ -27,7 +27,11 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128]),
+)
 def sum_kernel(x: torch.Tensor) -> torch.Tensor:
     """
     Sums a 2D tensor along the last dimension.

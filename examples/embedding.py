@@ -27,7 +27,11 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128]),
+)
 def embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
     Performs embedding lookup for input indices.

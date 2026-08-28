@@ -345,3 +345,4 @@ def _to_hashable(x: object) -> object:
     if isinstance(x, dict):
         return tuple(sorted([(k, _to_hashable(v)) for k, v in x.items()]))
     return x
+

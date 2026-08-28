@@ -11,9 +11,7 @@ import inspect
 import json
 import linecache
 import os
-import sys
 import time
-from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
 from typing import cast
@@ -1931,29 +1929,56 @@ def default_pallas_launcher(
     via ``input_output_aliases`` so the kernel writes directly into their
     buffers (zero-copy on TPU).
 
-    Output-only tensors (in ``_output_indices`` but not in ``_inplace_indices``)
-    are excluded from pallas_call inputs to save VMEM.  Their results are
-    returned as torch tensors.
-    """
-    cache = getattr(pallas_kernel, "_pallas_cache", None)
-    if cache is None or cache[0] != grid:
-        cache = _pallas_install_launcher_cache(
-            pallas_kernel,
-            grid,
-            args,
-            kind=_PallasLoopKind.UNROLL,
-            cache_attr="_pallas_cache",
-            trace_key_suffix="",
-            _output_indices=_output_indices,
-            _inplace_indices=_inplace_indices,
-            _block_spec_info=_block_spec_info,
-            _smem_arg_indices=_smem_arg_indices,
-            _scratch_shapes=None,
-            _pipeline_arg_indices=None,
-            _ds_pad_dims=_ds_pad_dims,
-            _pallas_interpret=_pallas_interpret,
-            _matmul_dot_general=_matmul_dot_general,
-        )
+def default_nki_launcher(
+    nki_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    """Default launcher for NKI kernels on Trainium/XLA."""
+    from torch.utils._pytree import tree_map
+
+    try:
+        from torch_xla.core import xla_model as xm
+    except Exception as err:  # pragma: no cover
+        raise NotImplementedError(
+            "default_nki_launcher requires torch_xla to execute NKI kernels."
+        ) from err
+
+    first_tensor_device: torch.device | None = None
+    moved_args: list[object] = []
+    xla_device = xm.xla_device()
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            if first_tensor_device is None:
+                first_tensor_device = arg.device
+            moved_args.append(arg.to(xla_device))
+        else:
+            moved_args.append(arg)
+
+    # pyrefly: ignore [operator]
+    import sys
+    print("        [Profile] Starting nki_kernel (XLA trace/compile)...", file=sys.stderr)
+    t_nki_start = time.time()
+    result = nki_kernel[grid](*moved_args, **kwargs)
+    t_nki_end = time.time()
+    print(f"        [Profile] nki_kernel took {t_nki_end - t_nki_start:.2f} seconds.", file=sys.stderr)
+    
+    print("        [Profile] Starting xm.mark_step() (XLA execution)...", file=sys.stderr)
+    t_mark_start = time.time()
+    xm.mark_step()
+    t_mark_end = time.time()
+    print(f"        [Profile] xm.mark_step took {t_mark_end - t_mark_start:.2f} seconds.", file=sys.stderr)
+
+    if first_tensor_device is None:
+        return result
+    return tree_map(
+        lambda x: x.to(first_tensor_device) if isinstance(x, torch.Tensor) else x,
+        result,
+    )
+
+
+_PALLAS_ALIGNMENT = 128
 
     return _pallas_invoke_cached_launcher(
         pallas_kernel,

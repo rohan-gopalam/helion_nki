@@ -24,7 +24,12 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(),
+    static_shapes=True,
+)
 def fp8_attention_kernel(
     q: torch.Tensor,  # [batch*heads, seq, dim]
     k: torch.Tensor,  # [batch*heads, seq, dim]

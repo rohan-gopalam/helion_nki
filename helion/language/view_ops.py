@@ -106,6 +106,14 @@ def _(state: CodegenState) -> ast.AST:
     )
 
 
+@_decorators.codegen(subscript, "nki")
+def _(state: CodegenState) -> ast.AST:
+    # NKI tensors are already 2D (partition, free).
+    # Subscripts like [:, None] and [None, :] are no-ops since NKI
+    # handles broadcasting via partition/free axis semantics.
+    return state.ast_arg(0)
+
+
 @_decorators.codegen(subscript, "cute")
 def _(state: CodegenState) -> ast.AST:
     # CuTe kernels currently execute scalarized pointwise code, so shape-only

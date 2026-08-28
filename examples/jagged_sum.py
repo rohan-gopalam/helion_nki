@@ -28,7 +28,11 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+)
 def jagged_sum_kernel(
     x_data: torch.Tensor,
     x_offsets: torch.Tensor,

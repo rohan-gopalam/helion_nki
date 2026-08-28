@@ -572,189 +572,345 @@ def _(state: CodegenState) -> object:
     )
 
 
-@_decorators.codegen(dot, "cute")
+@_decorators.codegen(dot, "nki")
 def _(state: CodegenState) -> object:
-    lhs_proxy = state.proxy_args[0]
-    assert isinstance(lhs_proxy, FakeTensor)
-    rhs_proxy = state.proxy_args[1]
-    assert isinstance(rhs_proxy, FakeTensor)
-    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
-    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
+    from .._compiler.ast_extension import expr_from_string
+    from .._compiler.ast_extension import statement_from_string
+    from .._compiler.ast_extension import create
 
-    lhs_ast = state.ast_args[0]
-    if isinstance(lhs_ast, int | float | bool | None):
-        lhs_ast = ast.Constant(value=lhs_ast)
-    rhs_ast = state.ast_arg(1)
-    acc_ast = state.ast_arg(2)
-    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
+    import sympy as _sympy
 
-    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-
-    acc_dtype: torch.dtype | None = None
-    if not is_acc_none:
-        assert isinstance(acc_proxy, FakeTensor)
-        acc_dtype = acc_proxy.dtype
-        if lhs_proxy.dtype == torch.float32 and rhs_proxy.dtype == torch.float32:
-            if acc_dtype == torch.float16:
-                raise exc.BackendUnsupported(
-                    "cute",
-                    "hl.dot(float32, float32, acc=float16) is not supported on CuTe; use a float32 accumulator or cast after the dot",
-                )
-
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype)
-        out_dtype = out_dtype_proxy
-
-    # Try MMA path first for configurations whose dtype semantics match fp32 MMA.
-    if _cute_mma_matches_dot_semantics(
-        lhs_proxy.dtype, rhs_proxy.dtype, acc_dtype, out_dtype
-    ):
-        from .._compiler.cute.cute_mma import codegen_cute_mma_dot
-
-        result = codegen_cute_mma_dot(state)
-        if result is not None:
-            return result
-
-    resolved_out_dtype = out_dtype or _compute_out_dtype(
-        lhs_proxy.dtype,
-        rhs_proxy.dtype,
-        acc_dtype,
-    )
-    outer_acc_dtype = cute_outer_accumulator_dtype(
-        state.fx_node,
-        is_acc_none=is_acc_none,
-    )
-    effective_out_dtype = cute_outer_accumulator_out_dtype(
-        resolved_out_dtype,
-        outer_acc_dtype,
-    )
-    k_block_id = cute_resolve_active_matmul_k_block_id(
-        state.codegen,
-        lhs_proxy.shape[-1],
-        rhs_proxy.shape[-2],
-        rhs_proxy.shape[-1],
-    )
-    packed_rhs = None
-    if (
-        k_block_id is None
-        and state.fx_node is not None
-        and len(state.fx_node.args) >= 2
-        and isinstance(rhs_node := state.fx_node.args[1], torch.fx.Node)
-    ):
-        rhs_ast, packed_rhs = cute_lower_rhs_for_matmul(
-            state.env,
-            lhs_ast,
-            rhs_node,
-            rhs_ast,
-        )
-    if k_block_id is None and packed_rhs is not None:
-        packed_nodes, _ = packed_rhs
-        packed_node = packed_nodes[0]
-        k_block_id = cute_resolve_active_block_id(
-            state.codegen, packed_node.meta["val"].shape[0]
-        )
-    assert isinstance(rhs_ast, (ast.AST, CutePackedTerms))
-    static_k_extent = None
-    if k_block_id is None and state.fx_node is not None:
-        lhs_node = state.fx_node.args[0] if len(state.fx_node.args) > 0 else None
-        rhs_node = state.fx_node.args[1] if len(state.fx_node.args) > 1 else None
-        if isinstance(lhs_node, torch.fx.Node) and isinstance(rhs_node, torch.fx.Node):
-            static_k_extent = cute_static_k_invariant_extent(lhs_node, rhs_node)
-    env = CompileEnvironment.current()
-    static_lhs_k = _static_dim_value(env, lhs_proxy.shape[-1])
-    static_rhs_k = _static_dim_value(env, rhs_proxy.shape[-2])
-    k_is_one = static_lhs_k == 1 and static_rhs_k == 1
-    if static_k_extent is None and k_block_id is None and not k_is_one:
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
-        )
-    if _requested_pure_matmul_role_lifecycle(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
-            "to lower through the tcgen05 K-loop path",
-        )
-    if _requested_tcgen05_flat_role_coordinates(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
-            "hl.dot to lower through the tcgen05 K-loop path",
-        )
-    dot_lhs_node = (
-        state.fx_node.args[0]
-        if state.fx_node is not None and len(state.fx_node.args) > 0
-        else None
-    )
-    dot_rhs_node = (
-        state.fx_node.args[1]
-        if state.fx_node is not None and len(state.fx_node.args) > 1
-        else None
-    )
-    dot_acc_node = (
-        state.fx_node.args[2]
-        if state.fx_node is not None and len(state.fx_node.args) > 2
-        else None
-    )
-    return _emit_cute_matmul(
-        state.codegen,
-        lhs_ast,
-        rhs_ast,
-        accumulate_in_lane_loop=not cute_outer_accumulates_result(
-            state.fx_node,
-            is_acc_none=is_acc_none,
-        ),
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-        acc=None if is_acc_none else acc_ast,
-        out_dtype=effective_out_dtype,
-        acc_dtype=acc_dtype,
-        lhs_dtype=lhs_proxy.dtype,
-        rhs_dtype=rhs_proxy.dtype,
-        lhs_node=dot_lhs_node,
-        rhs_node=dot_rhs_node,
-        acc_node=None if is_acc_none else dot_acc_node,
-    )
-
-
-@_decorators.codegen(dot, "pallas")
-def _(state: CodegenState) -> object:
     lhs_ast = state.ast_arg(0)
     rhs_ast = state.ast_arg(1)
     acc_ast = state.ast_arg(2)
 
     lhs_proxy = state.proxy_args[0]
-    assert isinstance(lhs_proxy, FakeTensor)
     rhs_proxy = state.proxy_args[1]
-    assert isinstance(rhs_proxy, FakeTensor)
     acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
-    out_dtype_proxy = state.proxy_args[3] if len(state.proxy_args) > 3 else None
+    assert isinstance(lhs_proxy, FakeTensor)
+    assert isinstance(rhs_proxy, FakeTensor)
 
-    lhs_dtype = lhs_proxy.dtype
-    rhs_dtype = rhs_proxy.dtype
-    need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
-
-    # Determine the accumulator AST (None if acc argument is None)
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
-    acc = None if is_acc_none else acc_ast
 
-    # Determine desired output dtype
-    out_dtype: torch.dtype | None = None
-    if out_dtype_proxy is not None:
-        assert isinstance(out_dtype_proxy, torch.dtype)
-        out_dtype = out_dtype_proxy
-    elif acc_proxy is not None and isinstance(acc_proxy, FakeTensor):
-        out_dtype = acc_proxy.dtype
+    env = CompileEnvironment.current()
+    _bs_subs: dict[_sympy.Symbol, int] = {}
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
 
-    return _emit_pallas_matmul(
-        lhs_ast,
-        rhs_ast,
-        acc=acc,
-        need_f32_acc=need_f32_acc,
-        out_dtype=out_dtype,
-        lhs_ndim=lhs_proxy.ndim,
+    def _to_int(s: int | torch.SymInt) -> int:
+        if isinstance(s, int):
+            return s
+        return int(s._sympy_().subs(_bs_subs))
+
+    lhs_shape = list(lhs_proxy.shape)
+    rhs_shape = list(rhs_proxy.shape)
+    # Squeeze leading batch dims for 3D+ shapes (batch_block=1)
+    while len(lhs_shape) > 2:
+        lhs_shape = lhs_shape[1:]
+    while len(rhs_shape) > 2:
+        rhs_shape = rhs_shape[1:]
+    M_tile = _to_int(lhs_shape[0])
+    K_tile = _to_int(lhs_shape[1])
+    N_tile = _to_int(rhs_shape[-1])
+
+    TILE_M = 128
+    TILE_K = 128
+    TILE_N = 512
+
+    assert M_tile % TILE_M == 0 or M_tile < TILE_M, (
+        f"M_tile={M_tile} must be <= {TILE_M} or a multiple of {TILE_M}"
     )
+    assert K_tile % TILE_K == 0 or K_tile < TILE_K, (
+        f"K_tile={K_tile} must be <= {TILE_K} or a multiple of {TILE_K}"
+    )
+
+    actual_tile_m = min(M_tile, TILE_M)
+    actual_tile_k = min(K_tile, TILE_K)
+    N_sub = min(TILE_N, N_tile)
+    n_sub_m = max(1, M_tile // TILE_M)
+    n_sub_k = max(1, K_tile // TILE_K)
+    n_sub_n = max(1, N_tile // N_sub) if N_tile > TILE_N else 1
+
+    # trn1 requires both nc_matmul inputs to have the same non-float32 dtype.
+    # nc_transpose always produces float32 (PSUM), so cast back to input dtype
+    # when inputs are fp16/bf16 (same fix as in aten_lowering._nki_dot).
+    rhs_dtype = rhs_proxy.dtype
+    need_cast_after_transpose = rhs_dtype != torch.float32
+    matmul_dtype_str = env.backend.dtype_str(rhs_dtype)
+
+    lhs_name = ast.unparse(lhs_ast)
+    rhs_name = ast.unparse(rhs_ast)
+    device_fn = state.device_function
+
+    lhs_tile_vars = device_fn.get_tile_list_vars(lhs_name)
+    rhs_tile_vars = device_fn.get_tile_list_vars(rhs_name)
+    lhs_is_list = lhs_tile_vars is not None
+    rhs_is_list = rhs_tile_vars is not None
+    result_is_list = n_sub_m > 1
+
+    # PSUM-reuse fusion: if this hl.dot node was tagged by nki_fusion and
+    # the result is a single tile with no accumulator, skip the final
+    # PSUM→SBUF copy below and let the downstream Vector/Scalar consumer
+    # read from the PSUM buffer directly.
+    _fx_node = state.fx_node
+    _keep_in_psum = bool(
+        _fx_node is not None
+        and _fx_node.meta.get("nki_keep_in_psum", False)
+        and is_acc_none
+        and not result_is_list
+        and n_sub_n == 1
+    )
+
+    mm_result = device_fn.new_var("_nki_dot_result")
+    mm_result_tile_vars: list[str] = []
+    if result_is_list:
+        for i in range(n_sub_m):
+            rv = device_fn.new_var(f"{mm_result}_{i}")
+            mm_result_tile_vars.append(rv)
+            state.add_statement(
+                statement_from_string(
+                    f"{rv} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+        device_fn.register_tile_list(mm_result, mm_result_tile_vars)
+    elif not _keep_in_psum:
+        state.add_statement(
+            statement_from_string(
+                f"{mm_result} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+
+    sub_k_var = device_fn.new_var("_dot_sub_k")
+    lhs_t_psum = device_fn.new_var("_dot_lhs_t_psum")
+    lhs_t_sbuf = device_fn.new_var("_dot_lhs_t_sbuf")
+    lhs_t_cast = device_fn.new_var("_dot_lhs_t_cast") if need_cast_after_transpose else None
+    mm_psum = device_fn.new_var("_dot_mm_psum")
+    # stationary operand for nc_matmul: cast buffer if dtype cast needed
+    _stationary = lhs_t_cast if need_cast_after_transpose else lhs_t_sbuf
+
+    def _lhs_k_slice(m_i: int, k_expr: str) -> str:
+        if lhs_is_list:
+            assert lhs_tile_vars is not None
+            if n_sub_k > 1:
+                return (
+                    f"{lhs_tile_vars[m_i]}[0:{actual_tile_m}, "
+                    f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+                )
+            return lhs_tile_vars[m_i]
+        if n_sub_m > 1:
+            return (
+                f"{lhs_name}[{m_i} * {actual_tile_m} : ({m_i} + 1) * {actual_tile_m}, "
+                f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+            )
+        if n_sub_k > 1:
+            return f"{lhs_name}[0:{actual_tile_m}, {k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+        return lhs_name
+
+    def _rhs_ref(k_expr: str, n_expr: str) -> str:
+        if rhs_is_list:
+            assert rhs_tile_vars is not None
+            idx = int(k_expr) if k_expr.isdigit() else 0
+            if n_sub_n > 1:
+                return (
+                    f"{rhs_tile_vars[idx]}[0:{TILE_K}, "
+                    f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                )
+            return rhs_tile_vars[idx]
+        if n_sub_k > 1 or n_sub_n > 1:
+            return (
+                f"{rhs_name}[{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}, "
+                f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            )
+        return rhs_name
+
+    def _result_ref(m_i: int, n_expr: str) -> str:
+        if result_is_list:
+            rv = mm_result_tile_vars[m_i]
+            if n_sub_n > 1:
+                return f"{rv}[0:{actual_tile_m}, {n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            return rv
+        if n_sub_n > 1:
+            return f"{mm_result}[0:{actual_tile_m}, {n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+        return mm_result
+
+    def _emit_one_m_stripe(m_i: int, n_expr: str) -> None:
+        mm_sbuf_tmp = device_fn.new_var("_dot_sbuf_tmp")
+        state.add_statement(
+            statement_from_string(
+                f"{mm_psum} = nl.ndarray([{actual_tile_m}, {N_sub}], nl.float32, buffer=nl.psum)"
+            )
+        )
+        if n_sub_k > 1:
+            state.add_statement(
+                create(
+                    ast.For,
+                    target=create(ast.Name, id=sub_k_var, ctx=ast.Store()),
+                    iter=expr_from_string(f"nl.affine_range({n_sub_k})"),
+                    body=[
+                        statement_from_string(
+                            f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], nl.float32, buffer=nl.psum)"
+                        ),
+                        statement_from_string(
+                            f"nisa.nc_transpose(dst={lhs_t_psum}, data={_lhs_k_slice(m_i, sub_k_var)})"
+                        ),
+                        statement_from_string(
+                            f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], nl.float32, buffer=nl.sbuf)"
+                        ),
+                        statement_from_string(
+                            f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
+                        ),
+                        *(
+                            [
+                                statement_from_string(
+                                    f"{lhs_t_cast} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {matmul_dtype_str}, buffer=nl.sbuf)"
+                                ),
+                                statement_from_string(f"nisa.memset({lhs_t_cast}, value=0)"),
+                                statement_from_string(
+                                    f"nisa.tensor_tensor(dst={lhs_t_cast}, data1={lhs_t_cast}, data2={lhs_t_sbuf}, op=nl.add)"
+                                ),
+                            ]
+                            if need_cast_after_transpose
+                            else []
+                        ),
+                        statement_from_string(
+                            f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref(sub_k_var, n_expr)})"
+                        ),
+                    ],
+                    orelse=[],
+                )
+            )
+        else:
+            state.add_statement(
+                statement_from_string(
+                    f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], nl.float32, buffer=nl.psum)"
+                )
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.nc_transpose(dst={lhs_t_psum}, data={_lhs_k_slice(m_i, '0')})"
+                )
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
+                )
+            )
+            if need_cast_after_transpose:
+                state.add_statement(
+                    statement_from_string(
+                        f"{lhs_t_cast} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {matmul_dtype_str}, buffer=nl.sbuf)"
+                    )
+                )
+                state.add_statement(
+                    statement_from_string(f"nisa.memset({lhs_t_cast}, value=0)")
+                )
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.tensor_tensor(dst={lhs_t_cast}, data1={lhs_t_cast}, data2={lhs_t_sbuf}, op=nl.add)"
+                    )
+                )
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref('0', n_expr)})"
+                )
+            )
+        if _keep_in_psum:
+            # PSUM reuse: downstream Vector/Scalar consumer reads mm_psum
+            # directly, so we skip the PSUM→SBUF copies entirely.
+            return
+        state.add_statement(
+            statement_from_string(
+                f"{mm_sbuf_tmp} = nl.ndarray([{actual_tile_m}, {N_sub}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={mm_sbuf_tmp}, src={mm_psum})"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={_result_ref(m_i, n_expr)}, src={mm_sbuf_tmp})"
+            )
+        )
+
+    def _emit_all_m_stripes(n_expr: str) -> None:
+        for m_i in range(n_sub_m):
+            _emit_one_m_stripe(m_i, n_expr)
+
+    if n_sub_n > 1:
+        sub_n_var = device_fn.new_var("_dot_sub_n")
+        inner_body: list[ast.AST] = []
+        orig_stmts = state.codegen.statements_stack[-1]
+        state.codegen.statements_stack[-1] = inner_body
+        _emit_all_m_stripes(sub_n_var)
+        state.codegen.statements_stack[-1] = orig_stmts
+        state.add_statement(
+            create(
+                ast.For,
+                target=create(ast.Name, id=sub_n_var, ctx=ast.Store()),
+                iter=expr_from_string(f"nl.affine_range({n_sub_n})"),
+                body=inner_body,
+                orelse=[],
+            )
+        )
+    else:
+        _emit_all_m_stripes("0")
+
+    # Register PSUM alias so downstream Vector/Scalar ops read from PSUM.
+    if _keep_in_psum:
+        device_fn._nki_psum_aliases[mm_result] = mm_psum
+        device_fn._nki_fx_matmul_vars[_fx_node.name] = mm_result
+        device_fn._nki_sbuf_shapes[mm_result] = [actual_tile_m, N_tile]
+        device_fn._nki_sbuf_shapes[mm_psum] = [actual_tile_m, N_tile]
+
+    if is_acc_none:
+        return expr_from_string(mm_result)
+
+    assert acc_proxy is not None and isinstance(acc_proxy, FakeTensor)
+    acc_name = ast.unparse(acc_ast)
+    acc_tile_vars = device_fn.get_tile_list_vars(acc_name)
+    out_result = device_fn.new_var("_nki_dot_acc_result")
+
+    if result_is_list:
+        out_tile_vars: list[str] = []
+        for i in range(n_sub_m):
+            ov = device_fn.new_var(f"{out_result}_{i}")
+            out_tile_vars.append(ov)
+            state.add_statement(
+                statement_from_string(
+                    f"{ov} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+        for i in range(n_sub_m):
+            acc_ref = acc_tile_vars[i] if acc_tile_vars else acc_name
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={out_tile_vars[i]}, "
+                    f"data1={mm_result_tile_vars[i]}, data2={acc_ref}, op=nl.add)"
+                )
+            )
+        device_fn.register_tile_list(out_result, out_tile_vars)
+    else:
+        state.add_statement(
+            statement_from_string(
+                f"{out_result} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={out_result}, data1={mm_result}, "
+                f"data2={{acc}}, op=nl.add)",
+                acc=acc_ast,
+            )
+        )
+    return expr_from_string(out_result)
 
 
 @_decorators.ref(dot)

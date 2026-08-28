@@ -46,7 +46,12 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128]),
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
 def jsd_forward(
     _input: Tensor,  # student predictions (input) in log-space
     target: Tensor,  # teacher targets in log-space
@@ -342,8 +347,10 @@ def main() -> None:
     Tests various configurations including different beta values and label masking.
     """
     print("Testing JSD kernel...")
-    B = 4
-    T = 2048
+    # NKI: B*T must stay small enough that B*T*V*4 bytes < 4 GB per tensor.
+    # kl_div uses B=8,T=512 (BT=4096); mirror that here.
+    B = 8
+    T = 512
     beta = 0.5
     ignore_index = -100
     use_labels = False

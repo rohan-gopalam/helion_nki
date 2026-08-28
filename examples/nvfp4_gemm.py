@@ -58,8 +58,16 @@ FP4_E2M1_LUT = torch.tensor(
 )
 
 
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
+# %%
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+    static_shapes=False,
+)
+def nvfp4_matmul(A: Tensor, B_packed: Tensor) -> Tensor:
+    """
+    BFloat16 x NVFP4 (E2M1) General Matrix Multiplication (GEMM).
 
 
 def _round_up(a: int, b: int) -> int:

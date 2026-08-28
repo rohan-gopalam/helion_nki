@@ -1,0 +1,656 @@
+ubuntu@ip-172-31-53-167:~/kernel_test/helion_nki$ PYTHONPATH=helion_nki:$PYTHONPATH HELION_BACKEND=nki python examples/run_nki_examples.py
+
+=== add.py ===
+g plugin failed
+2026-Mar-16 09:41:07.0861 286688:287201 [14] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_addp3cniall_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_addupex31ay.klir'
+2026-03-16 09:41:21.000263:  286688  [INFO]: Compilation Successfully Completed for model.MODULE_3417164383922318023+e30acd3a.hlo_module.pb
+
+
+=== aot_example.py ===
+
+
+=== attention.py ===
+FAILED
+m_users=2] = call_function[target=torch.ops.aten.bmm.default](args = (%_new_var, %k), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/attention.py", line 77, in attention
+    qk = torch.bmm(q, k)
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=3] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [1024], [%q, %m_i, %l_i, %acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/attention.py", line 75, in attention
+    for tile_n in hl.tile(v_view.size(1)):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== batch_softmax.py ===
+-Mar-16 09:41:40.0603 288534:289040 [22] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_batch_softmaxd74svnbo_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_batch_softmaxi9rvta7c.klir'
+2026-03-16 09:41:42.000332:  288534  [INFO]: Compilation Successfully Completed for model.MODULE_6583573069180181951+e30acd3a.hlo_module.pb
+
+
+=== bf16xint16_gemm.py ===
+FAILED
+ule>
+    main()
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bf16xint16_gemm.py", line 180, in main
+    check(256, 256, 256)
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bf16xint16_gemm.py", line 154, in check
+    run_example(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_testing.py", line 879, in run_example
+    torch.testing.assert_close(
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch/testing/_comparison.py", line 1589, in assert_close
+    raise error_metas[0].to_error(msg)
+AssertionError: Tensor-likes are not close!
+
+Mismatched elements: 65426 / 65536 (99.8%)
+Greatest absolute difference: 1916928.0 at index (37, 200) (up to 0.01 allowed)
+Greatest relative difference: 39070.5390625 at index (204, 90) (up to 0.01 allowed)
+
+
+=== blackwell_attention.py ===
+
+
+=== bmm.py ===
+FAILED
+^^^^^^^^^
+
+
+While executing %acc : [num_users=1] = call_function[target=torch.ops.aten.baddbmm.default](args = (%_new_var, %load, %load_1), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bmm.py", line 57, in bmm
+    acc = torch.baddbmm(
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [768], [%acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/bmm.py", line 56, in bmm
+    for tile_k in hl.tile(k):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== broadcast_matmul.py ===
+6 09:42:45.0265 291530:292056 [14] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_broadcast_matmulyf7uknqa_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_broadcast_matmul4mv2zipy.klir'
+2026-03-16 09:42:59.000782:  291530  [INFO]: Compilation Successfully Completed for model.MODULE_6425245921374537145+e30acd3a.hlo_module.pb
+
+
+=== concatenate.py ===
+FAILED
+, line 1218, in run_node
+    raise InductorLoweringError(
+helion.exc.InductorLoweringError: Error in codegen for node where (aten.where.self): 'NKIOpOverrides' object has no attribute 'where'
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/concatenate.py", line 58, in concat2d_dim1
+    out[tile0, tile1] = torch.where(
+                        ^^^^^^^^^^^^
+
+
+While executing %where : [num_users=1] = call_function[target=torch.ops.aten.where.self](args = (%subscript_2, %x_part, %y_part), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/concatenate.py", line 58, in concat2d_dim1
+    out[tile0, tile1] = torch.where(
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== cross_entropy.py ===
+FAILED
+", line 100, in __call__
+    return kernel(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/_torch_xla.py", line 102, in __call__
+    config = self.dump_config_with_boundargs(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/FrameworkKernel.py", line 264, in dump_config_with_boundargs
+    _, klir_binary, metadata = self.specialize_and_call(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/TraceKernel.py", line 281, in specialize_and_call
+    raise Exception("Error(s) during tracing:\n" + "\n".join(metadata["errors"]))
+Exception: Error(s) during tracing:
+0:0:unsupported dtype 'int64'
+
+
+=== embedding.py ===
+FAILED
+ndargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/FrameworkKernel.py", line 264, in dump_config_with_boundargs
+    _, klir_binary, metadata = self.specialize_and_call(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/TraceKernel.py", line 281, in specialize_and_call
+    raise Exception("Error(s) during tracing:\n" + "\n".join(metadata["errors"]))
+Exception: Error(s) during tracing:
+
+/tmp/torchinductor_ubuntu/jb/cjbgbqccj5w7zzpgm45pukaqlenwn6mkego65kjqxlvxmbazvvlc.py:27:
+            nisa.dma_copy(dst=_nki_sbuf_2, src=weight[0:16, offset_1:offset_1 + 128])
+                                               ^-- index out of range of tensor dimension
+
+
+=== exp.py ===
+48.000281:  295322  [INFO]: Compilation Successfully Completed for model.MODULE_6714418686852222105+e30acd3a.hlo_module.pb
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_exp_bwdm9zo8l0t_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_exp_bwdtsd0ln_x.klir'
+2026-03-16 09:43:49.000863:  295322  [INFO]: Compilation Successfully Completed for model.MODULE_14927642385166108553+e30acd3a.hlo_module.pb
+
+
+=== fp8_gemm.py ===
+FAILED
+ = call_function[target=helion.language.memory_ops.load](args = (%x, [%sym_size_int, %block_size_2], None, None), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/fp8_gemm.py", line 56, in fp8_gemm
+    x_tile = x[tile_m, tile_k]
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [256], [%acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/fp8_gemm.py", line 54, in fp8_gemm
+    for tile_k in hl.tile(k):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== fused_linear_jsd.py ===
+FAILED
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/FrameworkKernel.py", line 264, in dump_config_with_boundargs
+    _, klir_binary, metadata = self.specialize_and_call(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/TraceKernel.py", line 281, in specialize_and_call
+    raise Exception("Error(s) during tracing:\n" + "\n".join(metadata["errors"]))
+Exception: Error(s) during tracing:
+
+/tmp/torchinductor_ubuntu/wi/cwi2pu4fo35bef4mzfqmsmqxln4me3542qnnottvrjtv7tjdmbrl.py:28:
+        nisa.dma_copy(dst=_nki_sbuf_1, src=student_logits[offset_0:offset_0 + 128, 0:0 + 128256])
+                                           ^-- index out of range of tensor dimension
+
+
+=== gather_gemv.py ===
+FAILED
+0/site-packages/nki/_torch_xla.py", line 102, in __call__
+    config = self.dump_config_with_boundargs(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/FrameworkKernel.py", line 264, in dump_config_with_boundargs
+    _, klir_binary, metadata = self.specialize_and_call(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/TraceKernel.py", line 281, in specialize_and_call
+    raise Exception("Error(s) during tracing:\n" + "\n".join(metadata["errors"]))
+Exception: Error(s) during tracing:
+
+/tmp/torchinductor_ubuntu/el/celrwoxvnp7rzh7lcwalc4s43ckjco5cuunbsm3zky5duy6gyyoq.py:30:
+        v_1 = indices_0 // v_0
+              ^-- indices_0 not found!
+
+
+=== gdn_fwd_h.py ===
+FAILED
+oad](args = (%g, [%u4, %sub_1, %u5], None, None), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/gdn_fwd_h.py", line 71, in helion_gdn_fwd_h
+    b_g_last = g[i_b, t_i_last, i_h].to(acc_dtype)
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [0], [4096], [%b_h]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/gdn_fwd_h.py", line 62, in helion_gdn_fwd_h
+    for t_i in hl.tile(seqlen, block_size=chunk_size):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== geglu.py ===
+essfully Completed for model.MODULE_2846741882865962523+e30acd3a.hlo_module.pb
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_geglu_bwd3id5ngxa_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_geglu_bwdy9o67hny.klir'
+2026-03-16 09:46:03.000462:  382018  [INFO]: Compilation Successfully Completed for model.MODULE_11441241594721132880+e30acd3a.hlo_module.pb
+✓ GEGLU kernel shape (128, 1024) passed
+
+
+=== grouped_gemm.py ===
+FAILED
+me/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/grouped_gemm.py", line 92, in grouped_gemm_jagged
+    for g in hl.grid(G):
+
+
+
+=== grpo_loss.py ===
+FAILED
+venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/FrameworkKernel.py", line 264, in dump_config_with_boundargs
+    _, klir_binary, metadata = self.specialize_and_call(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/TraceKernel.py", line 281, in specialize_and_call
+    raise Exception("Error(s) during tracing:\n" + "\n".join(metadata["errors"]))
+Exception: Error(s) during tracing:
+
+/tmp/torchinductor_ubuntu/yh/cyhxrclptwyqrzkpmevfolwjyfue3hsowhwqoufoo3cjhhz2eqy7.py:52:
+                nisa.dma_copy(dst=_nki_sbuf_1, src=logits[offset_0:offset_0 + 128, offset_1:offset_1 + 128, offset_2:offset_2 + 128])
+                                                   ^-- index out of range of tensor dimension
+
+
+=== int4_gemm.py ===
+FAILED
+rnel_test/helion_nki/helion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/int4_gemm.py", line 62, in matmul_bf16_int4
+    for tile_m, tile_n in hl.tile([M, N]):
+
+
+
+=== jagged_dense_add.py ===
+FAILED
+", line 100, in __call__
+    return kernel(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/_torch_xla.py", line 102, in __call__
+    config = self.dump_config_with_boundargs(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/FrameworkKernel.py", line 264, in dump_config_with_boundargs
+    _, klir_binary, metadata = self.specialize_and_call(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/TraceKernel.py", line 281, in specialize_and_call
+    raise Exception("Error(s) during tracing:\n" + "\n".join(metadata["errors"]))
+Exception: Error(s) during tracing:
+0:0:unsupported dtype 'int64'
+
+
+=== jagged_hstu_attn.py ===
+FAILED
+lion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_hstu_attn.py", line 115, in _helion_jagged_attention_kernel
+    for tile_b, tile_h, tile_q in hl.tile(
+
+
+
+=== jagged_layer_norm.py ===
+FAILED
+s = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_layer_norm.py", line 112, in jagged_layer_norm_kernel
+    for tile_k in hl.tile(0, max_seq_len):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop_1 : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (3, [0], [32], [%max_seq_len, %starts, %seq_lengths, %mean_acc_1, %var_acc]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_layer_norm.py", line 110, in jagged_layer_norm_kernel
+    for tile_m in hl.tile(M):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== jagged_mean.py ===
+FAILED
+new_var_3, %feature_valid, %row_sums]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_mean.py", line 82, in jagged_mean_kernel
+    for tile_k in hl.tile(0, max_nnz):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=0] = call_function[target=helion.language._tracing_ops._for_loop](args = (1, [0], [%u0], [%feature_counts, %max_nnz, %starts, %nnz]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_mean.py", line 74, in jagged_mean_kernel
+    for tile_m in hl.tile(max_M):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== jagged_softmax.py ===
+FAILED
+, %block_max, %block_new_max, %block_L]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_softmax.py", line 96, in jagged_softmax_kernel
+    for tile_k in hl.tile(max_seqlen):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=0] = call_function[target=helion.language._tracing_ops._for_loop](args = (2, [0], [128], [%max_seqlen, %starts, %seqlens]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/jagged_softmax.py", line 91, in jagged_softmax_kernel
+    for tile_m in hl.tile(M):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== jagged_sum.py ===
+FAILED
+", line 100, in __call__
+    return kernel(*args, **kwargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/_torch_xla.py", line 102, in __call__
+    config = self.dump_config_with_boundargs(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/FrameworkKernel.py", line 264, in dump_config_with_boundargs
+    _, klir_binary, metadata = self.specialize_and_call(boundargs)
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/nki/compiler/backends/neuron/TraceKernel.py", line 281, in specialize_and_call
+    raise Exception("Error(s) during tracing:\n" + "\n".join(metadata["errors"]))
+Exception: Error(s) during tracing:
+0:0:unsupported dtype 'int64'
+
+
+=== jsd.py ===
+
+............Completed run_backend_driver.
+
+Compiler status PASS
+✓ JSD passed
+Testing JSD: B=8, T=512, V=131072, beta=0.5, ignore_index=-100, labels=False
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_jsd_forwardtzr_vgdh_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_jsd_forward3a0ts89a.klir'
+2026-03-16 09:55:07.000154:  388677  [INFO]: Compilation Successfully Completed for model.MODULE_16455264156235179831+e30acd3a.hlo_module.pb
+✓ JSD passed
+
+
+=== kl_div.py ===
+..Completed run_backend_driver.
+
+Compiler status PASS
+✓ KL Div passed
+Testing KL Div: B=8, T=512, V=131072, reduction=batchmean, log_target=False
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_kl_div_forwardmrc808mr_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_kl_div_forwardg1eh_3dg.klir'
+2026-03-16 09:59:27.000654:  395093  [INFO]: Compilation Successfully Completed for model.MODULE_15766756002210725907+e30acd3a.hlo_module.pb
+✓ KL Div passed
+
+
+=== layer_norm.py ===
+FAILED (timeout after 600s)
+
+=== layer_norm_f32.py ===
+555  [INFO]: Compilation Successfully Completed for model.MODULE_16935084078354989362+e30acd3a.hlo_module.pb
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_layer_norm_fwdwvkas_ve_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_layer_norm_fwdnmwgp47y.klir'
+2026-03-16 10:09:47.000779:  405555  [INFO]: Compilation Successfully Completed for model.MODULE_11575355549138870459+e30acd3a.hlo_module.pb
+
+
+=== long_sum.py ===
+07199  [INFO]: Compilation Successfully Completed for model.MODULE_5033268477800685604+e30acd3a.hlo_module.pb
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_longsum_manualbiuoboga_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_longsum_manual11jswjub.klir'
+2026-03-16 10:10:11.000516:  407199  [INFO]: Compilation Successfully Completed for model.MODULE_7427626153051249644+e30acd3a.hlo_module.pb
+
+
+=== low_mem_dropout.py ===
+FAILED
+/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/low_mem_dropout.py", line 49, in low_mem_dropout
+    for tidx in hl.tile(n):
+
+
+
+=== mamba2_chunk_scan.py ===
+FAILED
+ng codegen not registered for <OpOverload(op='aten.permute', overload='default')>
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/mamba2_chunk_scan.py", line 106, in helion_mamba2_chunk_scan_kernel
+    acc_o = hl.dot(C_local, prev_states_local.T, acc=acc_o)
+                            ^^^^^^^^^^^^^^^^^^^
+
+
+While executing %permute : [num_users=1] = call_function[target=torch.ops.aten.permute.default](args = (%prev_states_local, [1, 0]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/mamba2_chunk_scan.py", line 106, in helion_mamba2_chunk_scan_kernel
+    acc_o = hl.dot(C_local, prev_states_local.T, acc=acc_o)
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== mamba2_chunk_state.py ===
+FAILED
+rLoweringError: Error in codegen for node load (<function load at 0x76bafcff01f0>): list index out of range
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/mamba2_chunk_state.py", line 73, in helion_mamba2_chunk_state_kernel
+    dA_cumsum_last = dA_cumsum[
+                     ^^^^^^^^^^
+
+
+While executing %load : [num_users=1] = call_function[target=helion.language.memory_ops.load](args = (%dA_cumsum, [%tile_begin, %tile_begin_1, %tile_begin_2, 255], None, None), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/mamba2_chunk_state.py", line 73, in helion_mamba2_chunk_state_kernel
+    dA_cumsum_last = dA_cumsum[
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== matmul.py ===
+:55.000433:  410247  [INFO]: Compilation Successfully Completed for model.MODULE_11337348906968789313+e30acd3a.hlo_module.pb
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_matmulsns2vzjd_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_matmul__hd_azk.klir'
+2026-03-16 10:12:05.000697:  410247  [INFO]: Compilation Successfully Completed for model.MODULE_12028794427162871870+e30acd3a.hlo_module.pb
+
+
+=== matmul_layernorm.py ===
+6 10:12:18.0879 412785:413180 [0] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_matmul_layernorm2xy6prt3_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_matmul_layernormczrmhapa.klir'
+2026-03-16 10:12:20.000438:  412785  [INFO]: Compilation Successfully Completed for model.MODULE_10286938764778262216+e30acd3a.hlo_module.pb
+
+
+=== matmul_split_k.py ===
+FAILED
+
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 284, in visit
+    return visitor(node)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 249, in generic_visit
+    fields[field] = self.visit(  # pyrefly: ignore[unsupported-operation]
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: KeyError: 'split_k'
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/matmul_split_k.py", line 67, in matmul_split_k
+    split_k = hl.register_tunable("split_k", PowerOfTwoFragment(1, 256))
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+
+=== moe_matmul_ogs.py ===
+FAILED
+e/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/moe_matmul_ogs.py", line 64, in moe_matmul_ogs
+    for e_idx in hl.grid(E):
+
+
+
+=== nvfp4_gemm.py ===
+FAILED
+/kernel_test/helion_nki/helion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 552, in generate_ast
+    codegen.add_statement(codegen.visit(stmt))
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/ast_extension.py", line 288, in visit
+    raise exc.InternalError(e) from e
+helion.exc.InternalError: TypeError: Cannot convert symbols to int
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/nvfp4_gemm.py", line 82, in nvfp4_matmul
+    for tile_m, tile_n in hl.tile([M, N]):
+
+
+
+=== rms_norm.py ===
+FAILED
+call_function[target=torch.ops.aten.mul.Tensor](args = (%w_m, %do_m), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/rms_norm.py", line 112, in rms_norm_bwd
+    w_m * do_m * rsqrt_m
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+While executing %_for_loop : [num_users=1] = call_function[target=helion.language._tracing_ops._for_loop](args = (0, [%tile_begin], [%tile_end], [%grad_w_m]), kwargs = {})
+Original traceback:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/rms_norm.py", line 105, in rms_norm_bwd
+    for mb in hl.tile(mb_cta.begin, mb_cta.end):
+
+Use tlparse to see full graph. (https://github.com/pytorch/tlparse?tab=readme-ov-file#tlparse-parse-structured-pt2-logs)
+
+
+=== segment_reduction.py ===
+FAILED
+_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/triton/runtime/autotuner.py", line 123, in do_bench
+    return driver.active.get_benchmarker()
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/triton/runtime/driver.py", line 28, in active
+    self._active = self.default
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/triton/runtime/driver.py", line 22, in default
+    self._default = _create_driver()
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/triton/runtime/driver.py", line 9, in _create_driver
+    raise RuntimeError(f"{len(active_drivers)} active drivers ({active_drivers}). There should only be one.")
+RuntimeError: 0 active drivers ([]). There should only be one.
+
+
+=== softmax.py ===
+-16 10:14:41.0385 417606:418036 [7] net_plugin.cc:97 CCOM WARN OFI plugin initNet() failed is EFA enabled?
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_softmax_two_passd7v_i5h__python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_softmax_two_pass002_o_da.klir'
+2026-03-16 10:14:48.000668:  417606  [INFO]: Compilation Successfully Completed for model.MODULE_693088493971944107+e30acd3a.hlo_module.pb
+
+
+=== softmax_decomposed.py ===
+PASSED
+
+=== split_k_barrier.py ===
+FAILED
+._run = self.compile_config(config)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 568, in compile_config
+    triton_code = self.to_triton_code(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/runtime/kernel.py", line 525, in to_triton_code
+    root = generate_ast(self.host_function, config, emit_repro_caller)
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_compiler/generate_ast.py", line 548, in generate_ast
+    raise exc.BarrierRequiresPersistent(config.pid_type)
+helion.exc.BarrierRequiresPersistent: hl.barrier() requires pid_type to be persistent (got 'flat').
+While processing:
+  File "/home/ubuntu/kernel_test/helion_nki/examples/split_k_barrier.py", line 31, in split_k_matmul
+    def split_k_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+
+
+
+=== squeeze_and_excitation_net.py ===
+FAILED
+
+  File "/home/ubuntu/kernel_test/helion_nki/examples/squeeze_and_excitation_net.py", line 281, in main
+    check(1024, 1024, 1024)
+  File "/home/ubuntu/kernel_test/helion_nki/examples/squeeze_and_excitation_net.py", line 268, in check
+    run_example(
+  File "/home/ubuntu/kernel_test/helion_nki/helion/_testing.py", line 879, in run_example
+    torch.testing.assert_close(
+  File "/home/ubuntu/kernel_test/aws_neuron_venv_pytorch/lib/python3.10/site-packages/torch/testing/_comparison.py", line 1589, in assert_close
+    raise error_metas[0].to_error(msg)
+AssertionError: Tensor-likes are not close!
+
+Mismatched elements: 481878 / 1048576 (46.0%)
+Greatest absolute difference: 3.904296875 at index (4, 792) (up to 0.1 allowed)
+Greatest relative difference: 1.0 at index (0, 1) (up to 0.01 allowed)
+
+
+=== sum.py ===
+668:  421907  [INFO]: Compilation Successfully Completed for model.MODULE_5529827708633615935+e30acd3a.hlo_module.pb
+.Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_sum_kernelqdgwp3ir_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_sum_kernelagm9a3q0.klir'
+2026-03-16 10:15:54.000747:  421907  [INFO]: Compilation Successfully Completed for model.MODULE_10974625214677952010+e30acd3a.hlo_module.pb
+
+
+=== swiglu.py ===
+river.
+
+Compiler status PASS
+✓ SwiGLU kernel shape (2, 2048, 1024) passed
+
+Testing SwiGLU MLP...
+Testing SwiGLU MLP: B=2, T=2048, H=1024, I=2048
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_swiglu_fwd9f7ob94r_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_swiglu_fwdbhqu5i27.klir'
+2026-03-16 10:16:50.000845:  423530  [INFO]: Compilation Successfully Completed for model.MODULE_534039849172408548+e30acd3a.hlo_module.pb
+✓ SwiGLU MLP config passed
+
+
+=== welford.py ===
+.000101:  425413  [INFO]: Compilation Successfully Completed for model.MODULE_2212245441103371699+e30acd3a.hlo_module.pb
+....Completed run_backend_driver.
+
+Compiler status PASS
+The Python AST is located at: python_ast_tmp.name='/tmp/_helion_welforddhva5uhr_python_ast.klir'
+The KLR format is located at: final_klir_filepath='/tmp/_helion_welford29iaiwd2.klir'
+2026-03-16 10:20:18.000306:  425413  [INFO]: Compilation Successfully Completed for model.MODULE_6847749333691243462+e30acd3a.hlo_module.pb
+
+
+========================================
+FAILED: ['attention.py', 'bf16xint16_gemm.py', 'bmm.py', 'concatenate.py', 'cross_entropy.py', 'embedding.py', 'fp8_gemm.py', 'fused_linear_jsd.py', 'gather_gemv.py', 'gdn_fwd_h.py', 'grouped_gemm.py', 'grpo_loss.py', 'int4_gemm.py', 'jagged_dense_add.py
+', 'jagged_hstu_attn.py', 'jagged_layer_norm.py', 'jagged_mean.py', 'jagged_softmax.py', 'jagged_sum.py', 'layer_norm.py', 'low_mem_dropout.py', 'mamba2_chunk_scan.py', 'mamba2_chunk_state.py', 'matmul_split_k.py', 'moe_matmul_ogs.py', 'nvfp4_gemm.py', '
+rms_norm.py', 'segment_reduction.py', 'split_k_barrier.py', 'squeeze_and_excitation_net.py']
+ubuntu@ip-172-31-53-167:~/kernel_test/helion_nki$ tmux capture-pane -pS - > scrollback.txt
+

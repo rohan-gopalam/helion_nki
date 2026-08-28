@@ -25,6 +25,8 @@ from helion.runtime.dist_utils import symm_mem_sync
 
 
 @helion.kernel(
+    backend="nki",
+    autotune_effort="none",
     config=helion.Config(
         block_sizes=[64, 64, 32],  # M, N, K
         num_warps=8,

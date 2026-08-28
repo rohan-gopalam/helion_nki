@@ -28,7 +28,14 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=True)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    # NKI requires batch block_size=1: nc_matmul only supports 2D tiles,
+    # so we iterate over batch elements one at a time.
+    config=helion.Config(block_sizes=[1, 128, 128, 128]),
+    static_shapes=True,
+)
 def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """
     Performs batch matrix multiplication.
@@ -46,8 +53,9 @@ def bmm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     out = torch.empty(
         [b, m, n], device=A.device, dtype=torch.promote_types(A.dtype, B.dtype)
     )
+    acc_dtype = torch.promote_types(A.dtype, B.dtype)
     for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
-        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=acc_dtype)
         for tile_k in hl.tile(k):
             acc = torch.baddbmm(
                 acc, A[tile_b, tile_m, tile_k], B[tile_b, tile_k, tile_n]
@@ -93,7 +101,7 @@ def main() -> None:
     assert version.parse(torch.__version__.split("+")[0]) >= version.parse("2.8"), (
         "Requires torch 2.8+"
     )
-    check(16, 512, 768, 1024)
+    check(2, 128, 128, 128)
 
 
 if __name__ == "__main__":

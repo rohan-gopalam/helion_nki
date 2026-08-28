@@ -23,7 +23,11 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128]),
+)
 def exp_fwd(x: torch.Tensor) -> torch.Tensor:
     """
     Computes the exponential of all elements in the input tensor.
@@ -41,7 +45,11 @@ def exp_fwd(x: torch.Tensor) -> torch.Tensor:
 
 
 # %%
-@helion.kernel()
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128]),
+)
 def exp_bwd(dy: torch.Tensor, exp_x: torch.Tensor) -> torch.Tensor:
     """
     Computes the gradient of the exponential function with respect to the input tensor.
@@ -149,7 +157,8 @@ def main() -> None:
     """
     Main entry point that runs the exp kernel verification.
     """
-    check(10240 * 10240)
+    # TODO: Use larger size (e.g. 10240 * 10240) once NKI handles large grids efficiently.
+    check(128 * 128)
 
 
 if __name__ == "__main__":

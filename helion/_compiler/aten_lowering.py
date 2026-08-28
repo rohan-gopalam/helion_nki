@@ -271,25 +271,112 @@ def codegen_full(ctx: LoweringContext, node: Node) -> object:
     )
 
 
-@scalar_tensor_lowering.register_codegen("common")
-def codegen_scalar_tensor(ctx: LoweringContext, node: Node) -> object:
+@full_lowering.register_codegen("nki")
+def codegen_full_nki(ctx: LoweringContext, node: Node) -> ast.AST:
     env = CompileEnvironment.current()
+    size = map_arg(node.args[0], lambda n: n.meta["val"])
     dtype = node.kwargs.get("dtype", torch.get_default_dtype())
     assert isinstance(dtype, torch.dtype)
-    device = node.kwargs.get("device", env.device)
-    assert device == env.device, f"expected {env.device}, got {device}"
-    layout = node.kwargs.get("layout", torch.strided)
-    assert layout in (None, torch.strided), f"layout={layout}"
-    assert not node.kwargs.get("pin_memory"), "pin_memory not supported"
-    value_arg = node.args[0]
-    value_ast = _env_arg(ctx, value_arg) if isinstance(value_arg, Node) else value_arg
+    value_ast = map_arg(node.args[1], lambda arg: _env_arg(ctx, arg))
     if isinstance(value_ast, (int, float, bool)):
         value_ast = expr_from_string(constant_repr(value_ast))
     assert isinstance(value_ast, ast.AST), value_ast
-    return expr_from_string(
-        env.backend.full_expr([], "{value}", dtype),
-        value=value_ast,
-    )
+
+    NKI_PARTITION_MAX = 128
+
+    import sympy as _sympy
+
+    state = getattr(env, "_codegen_state", None)
+    _bs_subs: dict[_sympy.Symbol, int] = {}
+    if state is not None:
+        for _bid in range(len(env.block_sizes)):
+            _bs = env.block_sizes[_bid]
+            _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+    def _resolve_dim(s: int | torch.SymInt) -> int:
+        if isinstance(s, int):
+            return s
+        return int(s._sympy_().subs(_bs_subs))
+
+    # Squeeze leading batch dims (size 1) from 3D+ shapes to 2D.
+    # E.g. hl.zeros([1, tile_m, tile_n]) → [tile_m, tile_n] in NKI SBUF.
+    size = list(size)
+    while len(size) > 2 and _resolve_dim(size[0]) == 1:
+        size = size[1:]
+    # Also handle case where leading dims multiply to the partition dim
+    # (e.g. [B_tile, M_tile, N_tile] with B_tile > 1 — combine into flat partition)
+    if len(size) > 2:
+        flat_part = 1
+        for s in size[:-1]:
+            flat_part *= _resolve_dim(s)
+        size = [flat_part, _resolve_dim(size[-1])]
+
+    partition_dim = _resolve_dim(size[0])
+    free_dims = [_resolve_dim(s) for s in size[1:]]
+    dtype_str = env.backend.dtype_str(dtype)
+    var = ctx.cg.device_function.new_var("_nki_full", dce=True)
+
+    if partition_dim > NKI_PARTITION_MAX and not free_dims:
+        # 1D tensor (e.g. grad_w_acc[DIM]): in NKI semantics this represents a
+        # feature-dimension accumulator. Allocate as [1, DIM] (partition=1, free=DIM)
+        # so that it can be stored to [block_id:block_id+1, 0:DIM] in HBM.
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"{var} = nl.ndarray([1, {partition_dim}], {dtype_str}, buffer=nl.sbuf)"
+            )
+        )
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"nisa.memset({var}, value={{val}})", val=value_ast
+            )
+        )
+        # Register shape so cast_ast and other ops know the SBUF shape
+        ctx.cg.device_function._nki_sbuf_shapes[var] = [1, partition_dim]
+        # Mark as a free-dim accumulator (not a partition-split tile list)
+        ctx.cg.device_function._nki_free_dim_tile_lists.add(var)
+    elif partition_dim > NKI_PARTITION_MAX:
+        n_partitions = partition_dim // NKI_PARTITION_MAX
+        assert partition_dim % NKI_PARTITION_MAX == 0, (
+            f"partition dim {partition_dim} must be multiple of {NKI_PARTITION_MAX}"
+        )
+        free_str = ", ".join(str(d) for d in free_dims)
+        tile_vars: list[str] = []
+        for i in range(n_partitions):
+            tile_var = ctx.cg.device_function.new_var(f"{var}_{i}")
+            tile_vars.append(tile_var)
+            ctx.cg.add_statement(
+                statement_from_string(
+                    f"{tile_var} = nl.ndarray([{NKI_PARTITION_MAX}, {free_str}], "
+                    f"{dtype_str}, buffer=nl.sbuf)"
+                )
+            )
+        for tile_var in tile_vars:
+            ctx.cg.add_statement(
+                statement_from_string(
+                    f"nisa.memset({tile_var}, value={{val}})", val=value_ast
+                )
+            )
+        ctx.cg.device_function.register_tile_list(var, tile_vars)
+    else:
+        shape_dims = ctx.cg.device_function.tile_strategy.shape_dims([*size])
+        ndarray_expr = env.backend.full_expr(shape_dims, "0", dtype)
+        ctx.cg.add_statement(statement_from_string(f"{var} = {ndarray_expr}"))
+        ctx.cg.add_statement(
+            statement_from_string(
+                f"nisa.memset({var}, value={{val}})", val=value_ast
+            )
+        )
+        # Register SBUF shape for multi-user detection on copy vars
+        # full_expr may have added a trailing 1 for 1D shapes internally
+        try:
+            resolved = [int(d) for d in shape_dims]
+            if len(resolved) == 1:
+                resolved.append(1)
+            if len(resolved) >= 2:
+                ctx.cg.device_function._nki_sbuf_shapes[var] = resolved
+        except (TypeError, ValueError):
+            pass
+    return expr_from_string(var)
 
 
 unsqueeze_lowering = register_lowering(
@@ -333,6 +420,16 @@ def codegen_unsqueeze_cute(ctx: LoweringContext, node: Node) -> object:
                 "cute", "virtual shape-chain direct consumers are not yet supported"
             )
         return materialized
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
+@unsqueeze_lowering.register_codegen("nki")
+def codegen_unsqueeze_nki(ctx: LoweringContext, node: Node) -> object:
+    # NKI tensors are already 2D (partition, free) and broadcast automatically.
+    # unsqueeze is a no-op.
+    assert not node.kwargs, "unsqueeze kwargs not supported"
+    tensor = _env_arg(ctx, cast("Node", node.args[0]))
     assert isinstance(tensor, ast.AST)
     return tensor
 
@@ -596,6 +693,23 @@ def codegen_view_cute(ctx: LoweringContext, node: Node) -> object:
     from .cute.cute_reshape import codegen_cute_reshape
 
     return codegen_cute_reshape(ctx, node)
+
+
+@squeeze_lowering.register_codegen("nki")
+def codegen_squeeze_nki(ctx: LoweringContext, node: Node) -> object:
+    # NKI tensors are already 2D (partition, free); squeeze is a no-op.
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    return tensor
+
+
+@view_lowering.register_codegen("nki")
+@reshape_lowering.register_codegen("nki")
+def codegen_view_nki(ctx: LoweringContext, node: Node) -> object:
+    # NKI SBUF tensors are 2D (partition, free); view/reshape are no-ops.
+    tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(tensor, ast.AST)
+    return tensor
 
 
 @squeeze_lowering.register_codegen("triton")
@@ -934,22 +1048,21 @@ def codegen_expand_pallas(ctx: LoweringContext, node: Node) -> object:
     )
 
 
-@expand_lowering.register_codegen("cute")
-def codegen_expand_cute(ctx: LoweringContext, node: Node) -> object:
-    from .cute.cute_reshape import resolve_cute_shape_chain_value
+silu_lowering = register_lowering(
+    torch.ops.aten.silu.default,
+    masked_value_fn=passthrough_masked_value,
+)
 
-    tensor = _env_arg(ctx, cast("Node", node.args[0]))
-    if isinstance(tensor, CuteShapeChainView):
-        if _shape_chain_only_users(node):
-            return CuteShapeChainView(node)
-        materialized = resolve_cute_shape_chain_value(ctx, node)
-        if materialized is None:
-            raise exc.BackendUnsupported(
-                "cute", "virtual shape-chain direct consumers are not yet supported"
-            )
-        return materialized
-    assert isinstance(tensor, ast.AST)
-    return tensor
+
+@silu_lowering.register_codegen("nki")
+def codegen_silu_nki(ctx: LoweringContext, node: Node) -> object:
+    """Lower aten.silu directly to the NKI activation override."""
+    assert not node.kwargs, "silu kwargs not supported"
+    x = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
+    assert isinstance(x, ast.AST)
+    x_name = ast.unparse(x)
+    result_name = CompileEnvironment.current().backend.inductor_op_overrides().silu(x_name)
+    return expr_from_string(result_name)
 
 
 def apply_dot_requirements(lowering: AtenLowering, node: Node) -> Lowering:
@@ -1136,455 +1249,480 @@ def codegen_baddbmm_pallas(ctx: LoweringContext, node: Node) -> ast.AST:
     return _pallas_dot(ctx, node, True)
 
 
-@bmm_lowering.register_codegen("cute")
-@mm_lowering.register_codegen("cute")
-def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
-    assert not node.kwargs, "matmul kwargs not supported"
-    lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
-    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
-    lhs_node, rhs_node = node.args[:2]
-    assert isinstance(lhs_node, Node)
-    assert isinstance(rhs_node, Node)
-    assert isinstance(rhs, ast.AST)
-    rhs, packed_rhs = cute_lower_rhs_for_matmul(ctx.env, lhs, rhs_node, rhs)
-    k_block_id = cute_resolve_active_matmul_k_block_id(
-        ctx.cg,
-        lhs_node.meta["val"].shape[-1],
-        rhs_node.meta["val"].shape[-2],
-        rhs_node.meta["val"].shape[-1],
-    )
-    if k_block_id is None and packed_rhs is not None:
-        packed_nodes, _ = packed_rhs
-        packed_node = packed_nodes[0]
-        k_block_id = cute_resolve_active_block_id(
-            ctx.cg, packed_node.meta["val"].shape[0]
-        )
-    if k_block_id is None and packed_rhs is None:
-        remat = cute_rematerialize_rhs_at_contraction_block(ctx, lhs_node, rhs_node)
-        if remat is not None:
-            rhs, k_block_id = remat
-    static_k_extent = (
-        None
-        if k_block_id is not None
-        else cute_static_k_invariant_extent(lhs_node, rhs_node)
-    )
-    serial_k_extent = (
-        None
-        if k_block_id is not None or static_k_extent is not None
-        else cute_static_serial_matmul_k_extent(lhs_node, rhs_node)
-    )
-    env = CompileEnvironment.current()
-    size_hint = getattr(env, "size_hint", None)
-
-    def hinted(size: int | torch.SymInt) -> int:
-        if callable(size_hint):
-            hinted_size = size_hint(size)
-            assert isinstance(hinted_size, int)
-            return hinted_size
-        return int(size)
-
-    k_is_one = (
-        hinted(lhs_node.meta["val"].shape[-1]) == 1
-        and hinted(rhs_node.meta["val"].shape[-2]) == 1
-    )
-    if (
-        static_k_extent is None
-        and serial_k_extent is None
-        and k_block_id is None
-        and not k_is_one
-    ):
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
-        )
-    out_dtype = node.meta["val"].dtype if "val" in node.meta else None
-    outer_acc_dtype = cute_outer_accumulator_dtype(node, is_acc_none=True)
-    effective_out_dtype = (
-        cute_outer_accumulator_out_dtype(out_dtype, outer_acc_dtype)
-        if out_dtype is not None
-        else None
-    )
-    direct_mma_result = codegen_cute_mma_direct_mm(
-        ctx,
-        node,
-        serial_k_extent=serial_k_extent,
-    )
-    if direct_mma_result is not None:
-        if _requested_tcgen05_flat_role_coordinates(ctx):
-            _reject_tcgen05_flat_role_coordinates_fallback()
-        if _requested_pure_matmul_role_lifecycle(ctx):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
-                "active-K-loop tcgen05 matmul lowering, not direct-mm fallback",
-            )
-        return direct_mma_result
-    serial_result = emit_cute_serial_scalar_mm_from_loads(
-        ctx,
-        lhs_node,
-        rhs_node,
-        k_extent=serial_k_extent,
-        out_dtype=effective_out_dtype,
-    )
-    if serial_result is not None:
-        if _requested_tcgen05_flat_role_coordinates(ctx):
-            _reject_tcgen05_flat_role_coordinates_fallback()
-        if _requested_pure_matmul_role_lifecycle(ctx):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
-                "active-K-loop tcgen05 matmul lowering, not serial scalar fallback",
-            )
-        return serial_result
-    if serial_k_extent is not None:
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
-        )
-    if _requested_pure_matmul_role_lifecycle(ctx):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires aten.mm "
-            "to lower through the tcgen05 K-loop path",
-        )
-    if _requested_tcgen05_flat_role_coordinates(ctx):
-        _reject_tcgen05_flat_role_coordinates_fallback()
-    return _emit_cute_matmul(
-        ctx.cg,
-        lhs,
-        rhs,
-        accumulate_in_lane_loop=not cute_outer_accumulates_result(
-            node,
-            is_acc_none=True,
-        ),
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-        out_dtype=effective_out_dtype,
-        lhs_dtype=lhs_node.meta["val"].dtype,
-        rhs_dtype=rhs_node.meta["val"].dtype,
-        lhs_node=lhs_node,
-        rhs_node=rhs_node,
-    )
-
-
-@addmm_lowering.register_codegen("cute")
-def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
-    assert not node.kwargs, "addmm kwargs not supported"
-    from .cute.cute_mma import codegen_cute_mma
-
-    result = codegen_cute_mma(ctx, node, with_acc=True)
-    if result is not None:
-        return result
-    if _requested_tcgen05_flat_role_coordinates(ctx):
-        _reject_tcgen05_flat_role_coordinates_fallback()
-    if _requested_pure_matmul_role_lifecycle(ctx):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
-            "active-K-loop tcgen05 addmm lowering",
-        )
-    acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
-    assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
-    acc_node = node.args[0]
-    lhs_node = node.args[1]
-    rhs_node = node.args[2]
-    assert isinstance(acc_node, Node)
-    assert isinstance(lhs_node, Node)
-    assert isinstance(rhs_node, Node)
-    assert isinstance(rhs, ast.AST)
-    rhs, packed_rhs = cute_lower_rhs_for_matmul(ctx.env, lhs, rhs_node, rhs)
-    k_block_id = cute_resolve_active_matmul_k_block_id(
-        ctx.cg,
-        lhs_node.meta["val"].shape[-1],
-        rhs_node.meta["val"].shape[-2],
-        rhs_node.meta["val"].shape[-1],
-    )
-    if k_block_id is None and packed_rhs is not None:
-        packed_nodes, _ = packed_rhs
-        packed_node = packed_nodes[0]
-        k_block_id = cute_resolve_active_block_id(
-            ctx.cg, packed_node.meta["val"].shape[0]
-        )
-    static_k_extent = (
-        None
-        if k_block_id is not None
-        else cute_static_k_invariant_extent(lhs_node, rhs_node)
-    )
-    env = CompileEnvironment.current()
-    size_hint = getattr(env, "size_hint", None)
-
-    def hinted(size: int | torch.SymInt) -> int:
-        if callable(size_hint):
-            hinted_size = size_hint(size)
-            assert isinstance(hinted_size, int)
-            return hinted_size
-        return int(size)
-
-    k_is_one = (
-        hinted(lhs_node.meta["val"].shape[-1]) == 1
-        and hinted(rhs_node.meta["val"].shape[-2]) == 1
-    )
-    if static_k_extent is None and k_block_id is None and not k_is_one:
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
-        )
-    return _emit_cute_matmul(
-        ctx.cg,
-        lhs,
-        rhs,
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-        acc=acc,
-        acc_dtype=acc_node.meta["val"].dtype,
-        lhs_dtype=lhs_node.meta["val"].dtype,
-        rhs_dtype=rhs_node.meta["val"].dtype,
-        lhs_node=lhs_node,
-        rhs_node=rhs_node,
-        acc_node=acc_node,
-    )
-
-
-def _cute_baddbmm_result_reduced_over_block(
-    node: Node,
-    n_block_id: int,
-) -> bool:
-    """Whether *node*'s collapsed result is summed away over *n_block_id*.
-
-    The matmul's M (lhs free) and N (rhs free) axes collapse to ``n_block_id``,
-    so the standard fallback would compute only the diagonal.  Folding the N
-    reduction into the matmul (layout A) is correct *only* when N is genuinely
-    reduced out downstream.  This guard requires:
-
-    * ``n_block_id`` is a reduction block (allocated for a ``sum`` /
-      reduction), and a reduction node over it exists somewhere in the device
-      IR (the ``.sum(-1)``), and
-    * the baddbmm result does not escape to any non-passthrough consumer in its
-      own graph - either it is consumed only by a same-graph reduction over the
-      block, or it is purely loop-carried (its only users are the graph output
-      and/or pure casts), so the carried value reaches the downstream reduction.
-
-    Returns ``False`` otherwise, leaving the (unchanged) standard path.
-    """
-    from ..language._tracing_ops import _new_var
-    from .host_function import HostFunction
-    from .inductor_lowering import ReductionLowering
-
-    env = CompileEnvironment.current()
-    canonical_block_id = getattr(env, "canonical_block_id", lambda block_id: block_id)
-    target_canonical = canonical_block_id(n_block_id)
-
-    if not env.block_sizes[n_block_id].reduction:
-        return False
-
-    # A reduction over the (canonical) N block must exist in the device IR.
-    device_ir = HostFunction.current().device_ir
-    has_block_reduction = False
-    for graph_info in getattr(device_ir, "graphs", ()):
-        graph = getattr(graph_info, "graph", None)
-        if not isinstance(graph, torch.fx.Graph):
-            continue
-        for other in graph.nodes:
-            lowering = other.meta.get("lowering")
-            if (
-                isinstance(lowering, ReductionLowering)
-                and canonical_block_id(lowering.block_index) == target_canonical
-            ):
-                has_block_reduction = True
-                break
-        if has_block_reduction:
-            break
-    if not has_block_reduction:
-        return False
-
-    passthrough = {
-        torch.ops.aten.clone.default,
-        torch.ops.aten.detach.default,
-        torch.ops.aten.to.dtype,
-        torch.ops.prims.convert_element_type.default,
-        _new_var,
-    }
-
-    # Walk forward inside the baddbmm's own graph; the result must not reach any
-    # non-passthrough consumer other than a reduction over the block or the
-    # graph output (loop carry).
-    seen: set[Node] = set()
-    stack: list[Node] = [node]
-    while stack:
-        cur = stack.pop()
-        for user in cur.users:
-            if not isinstance(user, Node) or user in seen:
-                continue
-            seen.add(user)
-            if len(seen) > 64:
-                return False
-            if user.op == "output":
-                continue
-            lowering = user.meta.get("lowering")
-            if (
-                isinstance(lowering, ReductionLowering)
-                and canonical_block_id(lowering.block_index) == target_canonical
-            ):
-                continue
-            if user.op == "call_function" and user.target in passthrough:
-                stack.append(user)
-                continue
-            return False
-    return True
-
-
-def _maybe_codegen_cute_baddbmm_n_collapse(
-    ctx: LoweringContext,
-    node: Node,
+def _nki_copy_psum_to_sbuf(
+    state: object,
+    psum_var: str,
+    shape_str: str,
+    dtype_str: str,
     *,
-    lhs: ast.AST | CutePackedAffineLoad,
-    acc: ast.AST,
-    lhs_node: Node,
-    rhs_node: Node,
-    acc_node: Node,
-    k_block_id: int | None,
-    static_k_extent: int | None,
-) -> ast.AST | None:
-    """Layout (A) for a static-M==N-collapse baddbmm reduced over N.
+    prefix: str = "_nki_psum_copy",
+) -> str:
+    """Allocate an SBUF tile and copy a PSUM tile into it via nisa.tensor_copy.
 
-    See ``cute_static_mn_collapse_n_block_id`` /
-    ``_emit_cute_matmul_n_collapse``.  Returns ``None`` (caller keeps the
-    standard path) unless the tightly-gated pattern holds: the lhs M axis and
-    rhs N axis share a block id and the result is summed away over that block.
+    NKI Tensor Engine ops (nc_transpose, nc_matmul) write to PSUM.
+    All subsequent Vector Engine / ISA ops expect SBUF inputs, so every
+    PSUM result must be copied back to SBUF before further use.
     """
-    if not isinstance(lhs, ast.AST):
-        return None
-    n_block_id = cute_static_mn_collapse_n_block_id(ctx.cg, lhs_node, rhs_node)
-    if n_block_id is None:
-        return None
-    if not _cute_baddbmm_result_reduced_over_block(node, n_block_id):
-        return None
-    env = CompileEnvironment.current()
-    size_hint = getattr(env, "size_hint", None)
-    n_size = rhs_node.meta["val"].shape[-1]
-    n_extent = size_hint(n_size) if callable(size_hint) else int(n_size)
-    if not isinstance(n_extent, int) or n_extent <= 0:
-        return None
-
-    def rhs_at_n(n_var: str) -> ast.AST:
-        rematerialized = cute_rematerialize_rhs_at_index_override(
-            ctx, rhs_node, n_block_id, n_var
+    sbuf_var = state.device_function.new_var(prefix)
+    state.add_statement(
+        statement_from_string(
+            f"{sbuf_var} = nl.ndarray([{shape_str}], {dtype_str}, buffer=nl.sbuf)"
         )
-        if rematerialized is None:
-            raise exc.BackendUnsupported(
-                "cute",
-                "CuTe static-MN-collapse baddbmm could not re-materialize the rhs "
-                "at the serial N index",
-            )
-        return rematerialized
-
-    return _emit_cute_matmul_n_collapse(
-        ctx.cg,
-        lhs,
-        rhs_at_n=rhs_at_n,
-        n_extent=n_extent,
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-        acc=acc,
-        acc_dtype=acc_node.meta["val"].dtype,
-        lhs_dtype=lhs_node.meta["val"].dtype,
-        rhs_dtype=rhs_node.meta["val"].dtype,
-        lhs_node=lhs_node,
-        rhs_node=rhs_node,
     )
+    state.add_statement(
+        statement_from_string(f"nisa.tensor_copy(dst={sbuf_var}, src={psum_var})")
+    )
+    return sbuf_var
 
 
-@baddbmm_lowering.register_codegen("cute")
-def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
-    assert not node.kwargs, "baddbmm kwargs not supported"
-    from .cute.cute_mma import codegen_cute_mma
+def _nki_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
+    """Generate nisa.nc_matmul for NKI backend with automatic sub-tiling.
 
-    result = codegen_cute_mma(ctx, node, with_acc=True)
-    if result is not None:
-        return result
-    if _requested_tcgen05_flat_role_coordinates(ctx):
-        _reject_tcgen05_flat_role_coordinates_fallback()
-    if _requested_pure_matmul_role_lifecycle(ctx):
+    When user tile sizes exceed hardware limits, this emits nested loops
+    that break the matmul into hardware-native sub-tiles:
+      - stationary (LHS^T): [K=128, M=128]
+      - moving (RHS):       [K=128, N<=512]
+      - result (PSUM):      [M=128, N<=512]
+
+    nc_matmul accumulates into PSUM across calls within the inner K loop,
+    so no explicit PSUM zeroing or summation is needed per sub_k iteration.
+
+    When inputs are tile lists (partition dim > 128), uses list indexing
+    to select [128,...] sub-tiles, keeping all NKI allocations within the
+    128-partition hardware limit.
+    """
+    TILE_M = 128  # stationary free dim (gemm_stationary_fmax)
+    TILE_K = 128  # partition dim (pmax)
+    TILE_N = 512  # moving free dim max (gemm_moving_fmax)
+
+    env = CompileEnvironment.current()
+    state = getattr(env, "_codegen_state", None)
+    if state is None:
         raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires "
-            "aten.baddbmm to lower through the tcgen05 K-loop path",
+            "nki", "nc_matmul requires active codegen state"
         )
-    acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
-    assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
-    acc_node = node.args[0]
-    lhs_node = node.args[1]
-    rhs_node = node.args[2]
-    assert isinstance(acc_node, Node)
-    assert isinstance(lhs_node, Node)
-    assert isinstance(rhs_node, Node)
+
+    if with_acc:
+        acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        assert isinstance(acc, ast.AST)
+        lhs_node = node.args[1]
+        rhs_node = node.args[2]
+    else:
+        lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
+        lhs_node = node.args[0]
+        rhs_node = node.args[1]
+        acc = None
+
+    assert isinstance(lhs, ast.AST)
     assert isinstance(rhs, ast.AST)
-    rhs, packed_rhs = cute_lower_rhs_for_matmul(ctx.env, lhs, rhs_node, rhs)
-    k_block_id = cute_resolve_active_matmul_k_block_id(
-        ctx.cg,
-        lhs_node.meta["val"].shape[-1],
-        rhs_node.meta["val"].shape[-2],
-        rhs_node.meta["val"].shape[-1],
-    )
-    if k_block_id is None and packed_rhs is not None:
-        packed_nodes, _ = packed_rhs
-        packed_node = packed_nodes[0]
-        k_block_id = cute_resolve_active_block_id(
-            ctx.cg, packed_node.meta["val"].shape[0]
-        )
-    static_k_extent = (
-        None
-        if k_block_id is not None
-        else cute_static_k_invariant_extent(lhs_node, rhs_node)
-    )
-    env = CompileEnvironment.current()
-    size_hint = getattr(env, "size_hint", None)
 
-    def hinted(size: int | torch.SymInt) -> int:
-        if callable(size_hint):
-            hinted_size = size_hint(size)
-            assert isinstance(hinted_size, int)
-            return hinted_size
-        return int(size)
+    lhs_shape = list(lhs_node.meta["val"].size())  # [M_tile, K_tile] or [B, M_tile, K_tile]
+    rhs_shape = list(rhs_node.meta["val"].size())  # [K_tile, N_tile] or [B, K_tile, N_tile]
 
-    k_is_one = (
-        hinted(lhs_node.meta["val"].shape[-1]) == 1
-        and hinted(rhs_node.meta["val"].shape[-2]) == 1
+    import sympy as _sympy
+
+    _bs_subs: dict[_sympy.Symbol, int] = {}
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+    def _to_int(s: int | torch.SymInt) -> int:
+        if isinstance(s, int):
+            return s
+        return int(s._sympy_().subs(_bs_subs))
+
+    # Squeeze leading batch dimensions (size 1) from 3D+ shapes.
+    # The SBUF operands are already 2D (load codegen flattened them),
+    # so we just need the last 2 dims for tile size computation.
+    while len(lhs_shape) > 2:
+        lhs_shape = lhs_shape[1:]
+    while len(rhs_shape) > 2:
+        rhs_shape = rhs_shape[1:]
+
+    M_tile = _to_int(lhs_shape[0])
+    K_tile = _to_int(lhs_shape[1])
+    N_tile = _to_int(rhs_shape[-1])
+
+    # Determine input dtype for nc_matmul — both operands must match.
+    # nc_transpose always produces fp32 (via PSUM), so we may need to
+    # cast back to the input dtype before nc_matmul.
+    lhs_dtype = lhs_node.meta["val"].dtype
+    rhs_dtype = rhs_node.meta["val"].dtype
+    # nc_matmul requires matching non-32-bit types on trn1
+    matmul_dtype = rhs_dtype  # moving operand dtype
+    need_cast_after_transpose = (matmul_dtype != torch.float32)
+    matmul_dtype_str = env.backend.dtype_str(matmul_dtype)
+
+    if M_tile % TILE_M != 0 and M_tile > TILE_M:
+        raise exc.BackendUnsupported("nki", f"M_tile must be <= {TILE_M} or a multiple of {TILE_M}, got {M_tile}")
+    if K_tile % TILE_K != 0 and K_tile > TILE_K:
+        raise exc.BackendUnsupported("nki", f"K_tile must be <= {TILE_K} or a multiple of {TILE_K}, got {K_tile}")
+    N_sub = min(TILE_N, N_tile)
+    if N_tile > TILE_N and N_tile % TILE_N != 0:
+        raise exc.BackendUnsupported("nki", f"N_tile must be <= {TILE_N} or a multiple of {TILE_N}, got {N_tile}")
+
+    actual_tile_m = min(M_tile, TILE_M)
+    actual_tile_k = min(K_tile, TILE_K)
+    n_sub_m = max(1, M_tile // TILE_M)
+    n_sub_k = max(1, K_tile // TILE_K)
+    n_sub_n = max(1, N_tile // N_sub)
+
+    # From here on, use actual tile sizes for all allocations and slicing
+    TILE_M = actual_tile_m
+    TILE_K = actual_tile_k
+
+    lhs_name = ast.unparse(lhs)
+    rhs_name = ast.unparse(rhs)
+
+    lhs_tile_vars = state.device_function.get_tile_list_vars(lhs_name)  # list[str] or None
+    rhs_tile_vars = state.device_function.get_tile_list_vars(rhs_name)  # list[str] or None
+    lhs_is_list = lhs_tile_vars is not None
+    rhs_is_list = rhs_tile_vars is not None
+    result_is_list = n_sub_m > 1
+
+    # PSUM-reuse fusion: if the fusion pass tagged this matmul node and the
+    # result is a single tile (no M/N sub-tiling, no bias add), skip the
+    # final PSUM→SBUF copy and expose the PSUM buffer via an alias. The
+    # single downstream Vector/Scalar consumer will read from PSUM directly.
+    _keep_in_psum = bool(
+        node.meta.get("nki_keep_in_psum", False)
+        and not result_is_list
+        and n_sub_n == 1
+        and not with_acc
     )
-    if static_k_extent is None and k_block_id is None and not k_is_one:
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
+
+    # Allocate result buffer(s) in SBUF — fully unrolled, no list comprehension.
+    # Skip the SBUF allocation entirely when we're keeping the result in PSUM;
+    # consumers resolve the name through device_function._nki_psum_aliases.
+    mm_result = state.device_function.new_var("_nki_mm_result")
+    mm_result_tile_vars: list[str] = []
+    if result_is_list:
+        for i in range(n_sub_m):
+            rv = state.device_function.new_var(f"{mm_result}_{i}")
+            mm_result_tile_vars.append(rv)
+            state.add_statement(
+                statement_from_string(
+                    f"{rv} = nl.ndarray([{TILE_M}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+        state.device_function.register_tile_list(mm_result, mm_result_tile_vars)
+    elif not _keep_in_psum:
+        state.add_statement(
+            statement_from_string(
+                f"{mm_result} = nl.ndarray([{TILE_M}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+            )
         )
-    n_collapse_result = _maybe_codegen_cute_baddbmm_n_collapse(
-        ctx,
-        node,
-        lhs=lhs,
-        acc=acc,
-        lhs_node=lhs_node,
-        rhs_node=rhs_node,
-        acc_node=acc_node,
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-    )
-    if n_collapse_result is not None:
-        return n_collapse_result
-    return _emit_cute_matmul(
-        ctx.cg,
-        lhs,
-        rhs,
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-        acc=acc,
-        acc_dtype=acc_node.meta["val"].dtype,
-        lhs_dtype=lhs_node.meta["val"].dtype,
-        rhs_dtype=rhs_node.meta["val"].dtype,
-        lhs_node=lhs_node,
-        rhs_node=rhs_node,
-        acc_node=acc_node,
-    )
+
+    sub_k_var = state.device_function.new_var("_sub_k")
+    lhs_t_psum = state.device_function.new_var("_lhs_t_psum")
+    lhs_t_sbuf = state.device_function.new_var("_lhs_t_sbuf")
+    lhs_t_cast = state.device_function.new_var("_lhs_t_cast") if need_cast_after_transpose else None
+    mm_psum = state.device_function.new_var("_mm_psum")
+
+    def _transpose_stmts(lhs_slice: str) -> list[ast.AST]:
+        """Generate transpose + optional cast statements for one LHS sub-tile.
+        Returns statements that leave the transposed data in lhs_t_sbuf (or
+        lhs_t_cast if a dtype cast is needed for nc_matmul compatibility).
+        The final variable name to use as stationary is _stationary_var."""
+        stmts = [
+            statement_from_string(
+                f"{lhs_t_psum} = nl.ndarray([{TILE_K}, {TILE_M}], nl.float32, buffer=nl.psum)"
+            ),
+            statement_from_string(
+                f"nisa.nc_transpose(dst={lhs_t_psum}, data={lhs_slice})"
+            ),
+            statement_from_string(
+                f"{lhs_t_sbuf} = nl.ndarray([{TILE_K}, {TILE_M}], nl.float32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
+            ),
+        ]
+        if need_cast_after_transpose:
+            # Cast fp32 transposed result back to input dtype for nc_matmul
+            stmts.extend([
+                statement_from_string(
+                    f"{lhs_t_cast} = nl.ndarray([{TILE_K}, {TILE_M}], {matmul_dtype_str}, buffer=nl.sbuf)"
+                ),
+                statement_from_string(
+                    f"nisa.memset({lhs_t_cast}, value=0)"
+                ),
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={lhs_t_cast}, data1={lhs_t_cast}, data2={lhs_t_sbuf}, op=nl.add)"
+                ),
+            ])
+        return stmts
+
+    # The variable name to use as the stationary operand for nc_matmul
+    _stationary_var = lhs_t_cast if need_cast_after_transpose else lhs_t_sbuf
+
+    def _lhs_ref(m_i: int) -> str:
+        """Get the concrete SBUF tile name for LHS partition index m_i."""
+        if lhs_is_list:
+            assert lhs_tile_vars is not None
+            return lhs_tile_vars[m_i]
+        return f"{lhs_name}[{m_i} * {TILE_M} : ({m_i} + 1) * {TILE_M}, 0:{K_tile}]"
+
+    def _lhs_k_slice(m_i: int, k_expr: str) -> str:
+        """Get LHS slice for partition m_i and K sub-tile k_expr."""
+        if lhs_is_list:
+            assert lhs_tile_vars is not None
+            if n_sub_k > 1:
+                return (
+                    f"{lhs_tile_vars[m_i]}[0:{TILE_M}, "
+                    f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+                )
+            return lhs_tile_vars[m_i]
+        return (
+            f"{lhs_name}[{m_i} * {TILE_M} : ({m_i} + 1) * {TILE_M}, "
+            f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+        )
+
+    def _rhs_ref(k_i: int, n_expr: str) -> str:
+        """Get RHS reference for K partition k_i and N sub-tile n_expr."""
+        if rhs_is_list:
+            assert rhs_tile_vars is not None
+            if n_sub_n > 1:
+                return (
+                    f"{rhs_tile_vars[k_i]}[0:{TILE_K}, "
+                    f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                )
+            return rhs_tile_vars[k_i]
+        return (
+            f"{rhs_name}[{k_i} * {TILE_K} : ({k_i} + 1) * {TILE_K}, "
+            f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+        )
+
+    def _result_ref(m_i: int, n_expr: str) -> str:
+        """Get result buffer reference for partition m_i."""
+        if result_is_list:
+            rv = mm_result_tile_vars[m_i]
+            if n_sub_n > 1:
+                return (
+                    f"{rv}[0:{TILE_M}, "
+                    f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                )
+            return rv
+        if n_sub_n > 1:
+            return (
+                f"{mm_result}[{m_i} * {TILE_M} : ({m_i} + 1) * {TILE_M}, "
+                f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            )
+        return mm_result
+
+    def _make_k_body_for_m(m_i: int, n_expr: str, k_expr: str) -> list[ast.AST]:
+        """Statements for one K-sub-tile within one M-stripe."""
+        stmts = _transpose_stmts(_lhs_k_slice(m_i, k_expr))
+        stmts.append(
+            statement_from_string(
+                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                f"moving={_rhs_ref(0, n_expr) if not rhs_is_list else _rhs_ref(0, n_expr)})"
+            ),
+        )
+        return stmts
+
+    def _make_k_body_rhs_loop(m_i: int, n_expr: str, k_expr: str) -> list[ast.AST]:
+        """Statements for one K-sub-tile, with rhs indexed by k_expr (affine loop var)."""
+        if rhs_is_list:
+            assert rhs_tile_vars is not None
+            if n_sub_n > 1:
+                rhs_ref = (
+                    f"{rhs_tile_vars[0]}[0:{TILE_K}, "  # placeholder; use k_expr below
+                    f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                )
+            else:
+                rhs_ref = rhs_tile_vars[0]
+        else:
+            rhs_ref = (
+                f"{rhs_name}[{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}, "
+                f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            )
+        stmts = _transpose_stmts(_lhs_k_slice(m_i, k_expr))
+        stmts.append(
+            statement_from_string(
+                f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                f"moving={rhs_ref})"
+            ),
+        )
+        return stmts
+
+    def _emit_one_m_stripe(m_i: int, n_expr: str) -> None:
+        """Emit all statements for a single M-stripe (fully unrolled, no sub_m loop)."""
+        mm_sbuf_tmp = state.device_function.new_var("_mm_sbuf_tmp")
+        state.add_statement(
+            statement_from_string(
+                f"{mm_psum} = nl.ndarray([{TILE_M}, {N_sub}], nl.float32, buffer=nl.psum)"
+            )
+        )
+        if n_sub_k > 1 and rhs_is_list:
+            # Unroll K loop with concrete rhs tile var per iteration
+            assert rhs_tile_vars is not None
+            for k_i in range(n_sub_k):
+                if n_sub_n > 1:
+                    rhs_ref = (
+                        f"{rhs_tile_vars[k_i]}[0:{TILE_K}, "
+                        f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                    )
+                else:
+                    rhs_ref = rhs_tile_vars[k_i]
+                for s in _transpose_stmts(_lhs_k_slice(m_i, str(k_i))):
+                    state.add_statement(s)
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                        f"moving={rhs_ref})"
+                    )
+                )
+        elif n_sub_k > 1:
+            # rhs is not a list; use affine_range for K loop
+            k_body = _transpose_stmts(_lhs_k_slice(m_i, sub_k_var))
+            k_body.append(
+                statement_from_string(
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                    f"moving={_rhs_ref(0, n_expr)})"
+                ),
+            )
+            state.add_statement(
+                create(
+                    ast.For,
+                    target=create(ast.Name, id=sub_k_var, ctx=ast.Store()),
+                    iter=expr_from_string(f"nl.affine_range({n_sub_k})"),
+                    body=k_body,
+                    orelse=[],
+                )
+            )
+        else:
+            # Single K sub-tile: inline
+            rhs_ref_0 = _rhs_ref(0, n_expr) if not rhs_is_list else (
+                rhs_tile_vars[0] if not n_sub_n > 1 else  # type: ignore[index]
+                f"{rhs_tile_vars[0]}[0:{TILE_K}, "  # type: ignore[index]
+                f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            )
+            for s in _transpose_stmts(_lhs_k_slice(m_i, '0')):
+                state.add_statement(s)
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary_var}, "
+                    f"moving={rhs_ref_0})"
+                )
+            )
+        if _keep_in_psum:
+            # PSUM-reuse: skip the PSUM→SBUF copies and let the single
+            # downstream Vector/Scalar consumer read from mm_psum directly.
+            # The alias registration below happens once, after all stripes.
+            return
+        state.add_statement(
+            statement_from_string(
+                f"{mm_sbuf_tmp} = nl.ndarray([{TILE_M}, {N_sub}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={mm_sbuf_tmp}, src={mm_psum})"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={_result_ref(m_i, n_expr)}, src={mm_sbuf_tmp})"
+            )
+        )
+
+    def _emit_all_m_stripes(n_expr: str) -> None:
+        for m_i in range(n_sub_m):
+            _emit_one_m_stripe(m_i, n_expr)
+
+    if n_sub_n > 1:
+        sub_n_var = state.device_function.new_var("_sub_n")
+        inner_body: list[ast.AST] = []
+        orig_stmts = state.codegen.statements_stack[-1]
+        state.codegen.statements_stack[-1] = inner_body
+        _emit_all_m_stripes(sub_n_var)
+        state.codegen.statements_stack[-1] = orig_stmts
+        state.add_statement(
+            create(
+                ast.For,
+                target=create(ast.Name, id=sub_n_var, ctx=ast.Store()),
+                iter=expr_from_string(f"nl.affine_range({n_sub_n})"),
+                body=inner_body,
+                orelse=[],
+            )
+        )
+    else:
+        _emit_all_m_stripes("0")
+
+    # If this matmul was tagged for PSUM reuse, register the alias so
+    # downstream Vector/Scalar consumers read from PSUM instead of SBUF.
+    if _keep_in_psum:
+        state.device_function._nki_psum_aliases[mm_result] = mm_psum
+        state.device_function._nki_fx_matmul_vars[node.name] = mm_result
+        # Register the shape under BOTH the SBUF virtual name and the PSUM
+        # name so shape lookups succeed whether the consumer sees the
+        # original operand or the alias-resolved PSUM name.
+        state.device_function._nki_sbuf_shapes[mm_result] = [TILE_M, N_tile]
+        state.device_function._nki_sbuf_shapes[mm_psum] = [TILE_M, N_tile]
+
+    if not with_acc:
+        return expr_from_string(mm_result)
+
+    # addmm: add bias + mm result → output, fully unrolled
+    assert acc is not None
+    acc_name = ast.unparse(acc)
+    acc_tile_vars = state.device_function.get_tile_list_vars(acc_name)
+    out_result = state.device_function.new_var("_nki_addmm_result")
+
+    if result_is_list:
+        out_tile_vars: list[str] = []
+        for i in range(n_sub_m):
+            ov = state.device_function.new_var(f"{out_result}_{i}")
+            out_tile_vars.append(ov)
+            state.add_statement(
+                statement_from_string(
+                    f"{ov} = nl.ndarray([{TILE_M}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+        for i in range(n_sub_m):
+            acc_ref = acc_tile_vars[i] if acc_tile_vars else acc_name
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={out_tile_vars[i]}, "
+                    f"data1={mm_result_tile_vars[i]}, data2={acc_ref}, op=nl.add)"
+                )
+            )
+        state.device_function.register_tile_list(out_result, out_tile_vars)
+    else:
+        state.add_statement(
+            statement_from_string(
+                f"{out_result} = nl.ndarray([{M_tile}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={out_result}, data1={mm_result}, "
+                f"data2={{acc}}, op=nl.add)",
+                acc=acc,
+            )
+        )
+    return expr_from_string(out_result)
+
+
+@mm_lowering.register_codegen("nki")
+def codegen_mm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, False)
+
+
+@addmm_lowering.register_codegen("nki")
+def codegen_addmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, True)
+
+
+@bmm_lowering.register_codegen("nki")
+def codegen_bmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, False)
+
+
+@baddbmm_lowering.register_codegen("nki")
+def codegen_baddbmm_nki(ctx: LoweringContext, node: Node) -> ast.AST:
+    return _nki_dot(ctx, node, True)
 
 
 iota_lowering = register_lowering(torch.ops.prims.iota.default)

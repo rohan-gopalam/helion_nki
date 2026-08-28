@@ -110,12 +110,6 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # statement-based in-place NKI codegen for SwiGLU-like patterns.
     if CompileEnvironment.current().backend_name == "nki":
         decomp_table.pop(torch.ops.aten.silu.default, None)
-    # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
-    decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
-    # Map F.gelu(x, approximate="tanh") to a single _gelu_tanh_approx FX
-    # node so the cute epilogue chain analyzer can fuse it; the inductor
-    # default decomp expands the polynomial form and breaks the chain.
-    install_gelu_decomp(decomp_table)
     return decomp_table
 
 
@@ -333,26 +327,17 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
         args = state.ast_args[3]
         assert isinstance(args, list)
         assert all(isinstance(x, ast.AST) for x in args)
-        # Make the active graph reachable by the strategy so it can pick
-        # different lane-loop shapes for the reduce vs consume sweeps.
-        # pyrefly: ignore [missing-attribute]
-        state.codegen._cute_active_graph_info = self
         env = CompileEnvironment.current()
-        try:
-            with env.set_codegen_state(state), state.codegen.add_device_loop(
-                state.device_function.tile_strategy.codegen_device_loop(
-                    state, self.block_ids
-                ),
-                needs_barrier_before=self.needs_barrier_before,
-            ):
-                return codegen_call_with_graph(
-                    state.codegen,
-                    self.graph,
-                    args,
-                )
-        finally:
-            # pyrefly: ignore [missing-attribute]
-            state.codegen._cute_active_graph_info = None
+        with env.set_codegen_state(state), state.codegen.add_device_loop(
+            state.device_function.tile_strategy.codegen_device_loop(
+                state, self.block_ids
+            )
+        ):
+            return codegen_call_with_graph(
+                state.codegen,
+                self.graph,
+                args,
+            )
 
 
 class ReductionLoopGraphInfo(ForLoopGraphInfo):
@@ -454,35 +439,13 @@ class IfGraphInfo(NodeArgsGraphInfo):
                     state.codegen, else_graph.graph, else_args
                 )
 
-        if len(body_stmts) == 0:
-            body_stmts.append(ast.Pass())
-        if len(orelse_stmts) == 0:
-            orelse_stmts.append(ast.Pass())
-
-        graph_info = state.get_graph(state.proxy_arg(1))
-        assert isinstance(graph_info, IfGraphInfo)
-
-        if_return_names, else_return_names = graph_info.get_branches_return_names(
-            state, if_outputs, else_outputs
-        )
-
-        return cast(
-            "list[object]",
-            [expr_from_string(n) for n in if_return_names]
-            + [expr_from_string(n) for n in else_return_names],
-        )
-
-
-@dataclasses.dataclass
-class ElseGraphInfo(NodeArgsGraphInfo):
-    @property
-    def name(self) -> str:
-        return f"else_graph_{self.graph_id}"
-
-    def codegen(self, state: CodegenState) -> list[object]:
-        raise exc.InternalError(
-            RuntimeError("ElseGraphInfo should not be codegenned directly")
-        )
+        args = state.ast_args[2]
+        assert isinstance(args, list)
+        assert all(isinstance(x, ast.AST) for x in args)
+        state.add_statement(create(ast.If, test=test, body=(body := []), orelse=[]))
+        env = CompileEnvironment.current()
+        with env.set_codegen_state(state), state.codegen.set_statements(body):
+            return codegen_call_with_graph(state.codegen, self.graph, args)
 
 
 @dataclasses.dataclass
@@ -567,12 +530,7 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
         with env.set_codegen_state(state), state.codegen.set_statements(
             body_statements
         ):
-            outputs = codegen_call_with_graph(
-                state.codegen,
-                self.graph,
-                args,
-                copy_named_args=False,
-            )
+            outputs = codegen_call_with_graph(state.codegen, self.graph, args)
         loop_condition_update: list[ast.AST] = []
         cond_expr_loop = emit_condition(loop_condition_update)
         body_statements.extend(loop_condition_update)

@@ -49,7 +49,12 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(static_shapes=False)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+    static_shapes=False,
+)
 def grouped_gemm_jagged(
     A_packed: torch.Tensor,  # [total_M, K], where total_M == sum(M_i)
     B: torch.Tensor,  # [K, N] shared across all groups
@@ -110,7 +115,12 @@ def grouped_gemm_jagged(
 
 
 # %%
-@helion.kernel(static_shapes=False)
+@helion.kernel(
+    backend="nki",
+    autotune_effort="none",
+    config=helion.Config(block_sizes=[128, 128, 128]),
+    static_shapes=False,
+)
 def grouped_gemm_jagged_persistent(
     A_packed: torch.Tensor,  # [total_M, K]
     B: torch.Tensor,  # [K, N]

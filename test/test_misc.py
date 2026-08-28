@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -29,16 +30,15 @@ from helion._testing import code_and_output
 from helion._testing import get_test_dot_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton"])
-@skipIfCpu("need to debug")
+@onlyBackends(["triton", "cute"])
 class TestMisc(RefEagerTestBase, TestCase):
     def test_binary_operation_duplicate_args(self):
         """Test case to reproduce issue #221: binary operations with duplicate tensor references"""
@@ -129,6 +129,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             out = x.new_empty([m])
             block_size_n = hl.register_block_size(n)
             for tile_m in hl.tile(m):
+                # pyrefly: ignore [no-matching-overload]
                 acc = x.new_zeros([tile_m, block_size_n])
                 for tile_n in hl.tile(n, block_size=block_size_n):
                     acc += x[tile_m, tile_n]
@@ -138,7 +139,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         x = torch.randn([512, 512], device=DEVICE)
         code, result = code_and_output(fn, (x,))
         torch.testing.assert_close(result, x.sum(-1), atol=1e-2, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("Decorator ordering checks not applicable in ref eager mode")
     def test_decorator(self):
@@ -234,6 +234,35 @@ class TestMisc(RefEagerTestBase, TestCase):
         for op in torch._inductor.lowering.lowerings:
             assert torch._inductor.lowering.lowerings[op] == inductor_lowerings_orig[op]
 
+    @skipIfRefEager("Inductor config tests not applicable in ref eager mode")
+    def test_patched_inductor_config(self):
+        from unittest.mock import MagicMock
+
+        from torch._inductor import config as inductor_config
+
+        from helion._compiler.inductor_lowering import _patched_inductor_config
+
+        # Maps helion settings to expected inductor config values
+        settings_to_inductor = {
+            "fast_math": "use_fast_math",
+        }
+
+        for settings_attr, inductor_attr in settings_to_inductor.items():
+            for enabled in (True, False):
+                mock_env = MagicMock()
+                setattr(mock_env.settings, settings_attr, enabled)
+                with (
+                    patch(
+                        "helion._compiler.inductor_lowering.CompileEnvironment.current",
+                        return_value=mock_env,
+                    ),
+                    _patched_inductor_config(),
+                ):
+                    assert getattr(inductor_config, inductor_attr) == enabled, (
+                        f"expected inductor {inductor_attr}={enabled} "
+                        f"when settings.{settings_attr}={enabled}"
+                    )
+
     def test_inputs(self):
         @helion.kernel
         def kernel(a_list, b_dict, b_tuple, c_named_tuple, d_dataclass):
@@ -263,9 +292,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(kernel, ([x, x], {"b0": x}, (x,), p, p2))
         torch.testing.assert_close(result[0], 4 * x)
         torch.testing.assert_close(result[1], 4 * x)
-        self.assertExpectedJournal(code)
 
-    @skipIfCpu("AssertionError: Tensor-likes are not close!")
     def test_dtype_cast_preserved_before_second_dot(self):
         """Regression for issue #512: ensure p.to(v.dtype) is honored before a second dot.
 
@@ -384,7 +411,6 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         x = torch.randn(32, device=DEVICE)
         code, result = code_and_output(test_tile_block_size_usage, (x,))
-        self.assertExpectedJournal(code)
         # The result should have 1s at positions that are last in their tile
         self.assertTrue(result.sum().item() > 0)
 
@@ -434,6 +460,7 @@ class TestMisc(RefEagerTestBase, TestCase):
         bound_kernel_no_config = kernel_no_config.bind((x,))
 
         # Should raise RuntimeError when no implicit config available
+        # pyrefly: ignore [bad-context-manager]
         with self.assertRaises(RuntimeError) as cm:
             bound_kernel_no_config.to_triton_code()
         self.assertIn(
@@ -457,7 +484,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             kernel_with_scalar_item, (x, torch.tensor(5.0, device=DEVICE))
         )
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(result, x + 5)
 
         code2, result2 = code_and_output(
@@ -497,8 +523,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
 
-        self.assertNotEqualCode(code_pointer, code_block)
-        self.assertExpectedJournal(code_pointer + code_block)
+        if _get_backend() == "triton":
+            self.assertNotEqualCode(code_pointer, code_block)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_tuple_literal_subscript_w_descriptor(self):
@@ -521,7 +547,6 @@ class TestMisc(RefEagerTestBase, TestCase):
             indexing="tensor_descriptor",
         )
         torch.testing.assert_close(result, (inp_tuple[0] + inp_tuple[1][:, :30]) * 3)
-        self.assertExpectedJournal(code)
 
     def test_tuple_unpack(self):
         @helion.kernel
@@ -540,8 +565,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(tuple_unpack_kernel, (inp_tuple,), block_size=4)
         torch.testing.assert_close(result, inp_tuple[0] + inp_tuple[1] + 5)
 
-        self.assertExpectedJournal(code)
-
     def test_propagate_tile(self):
         @helion.kernel
         def copy_kernel(a: torch.Tensor) -> torch.Tensor:
@@ -556,7 +579,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         args = (torch.randn(16, device=DEVICE, dtype=torch.bfloat16),)
         code, result = code_and_output(copy_kernel, args)
         torch.testing.assert_close(result, args[0])
-        self.assertExpectedJournal(code)
 
     @parametrize("static_shapes", (True, False))
     def test_sequence_assert(self, static_shapes):
@@ -572,7 +594,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         a = torch.randn(16, 1, device=DEVICE)
         code, result = code_and_output(kernel, (a, a))
         torch.testing.assert_close(result, a + a)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("no code execution")
     def test_triton_repro_add(self):
@@ -596,7 +617,6 @@ class TestMisc(RefEagerTestBase, TestCase):
                 },
             )
             self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("no code execution")
     @parametrize("static_shapes", (True, False))
@@ -632,7 +652,6 @@ class TestMisc(RefEagerTestBase, TestCase):
             self.assertEqual(
                 result.returncode, 0, msg=f"code:{code}\nstderr:\n{result.stderr}"
             )
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager("no code execution")
     def test_repro_parseable(self):
@@ -681,7 +700,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_out = ref_min(x)
 
         torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code)
 
     def test_builtin_max(self) -> None:
         @helion.kernel(autotune_effort="none")
@@ -716,7 +734,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_out = ref_max(x)
 
         torch.testing.assert_close(helion_out, ref_out, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code)
 
     def test_torch_tensor_constant_in_kernel(self):
         """Test that torch.tensor() with a constant value works inside a kernel."""
@@ -732,9 +749,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         code, result = code_and_output(foo, (x, 16))
         expected = torch.full([64], 17, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
-        # Verify that tl.full is used for the constant
-        self.assertIn("tl.full([], 16", code)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "triton":
+            # Verify that tl.full is used for the constant
+            self.assertIn("tl.full([], 16", code)
 
     def test_torch_sort_in_kernel(self):
         """Test that torch.sort works inside Helion kernels.
@@ -760,8 +777,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, ref_indices = torch.sort(x, dim=-1, descending=True)
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
-        self.assertIn("tl.sort", code)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.sort", code)
 
     def test_torch_sort_ascending(self):
         """Test torch.sort with ascending order (descending=False)."""
@@ -783,8 +800,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, ref_indices = torch.sort(x, dim=-1, descending=False)
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
-        self.assertIn("tl.sort", code)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.sort", code)
 
     def test_torch_sort_then_cumsum(self):
         """Test that torch.sort result can be used as input to torch.cumsum.
@@ -813,9 +830,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, _ = torch.sort(x, dim=-1, descending=True)
         ref_cumsum = torch.cumsum(ref_vals, dim=-1)
         torch.testing.assert_close(result, ref_cumsum)
-        self.assertIn("tl.sort", code)
-        self.assertIn("tl.associative_scan", code)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.sort", code)
+            self.assertIn("tl.associative_scan", code)
 
     def test_torch_sort_skips_argsort_when_indices_unused(self):
         """Test that sort skips O(N^2) argsort when indices are not used.
@@ -840,10 +857,10 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         ref_vals, _ = torch.sort(x, dim=-1, descending=True)
         torch.testing.assert_close(result, ref_vals)
-        self.assertIn("tl.sort", code)
-        # Argsort rank computation should NOT be present
-        self.assertNotIn("tl.sum(tl.where(", code)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.sort", code)
+            # Argsort rank computation should NOT be present
+            self.assertNotIn("tl.sum(tl.where(", code)
 
         # Contrast: when indices ARE used, argsort code must be generated
         @helion.kernel()
@@ -863,8 +880,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals2, ref_idx2 = torch.sort(x, dim=-1, descending=True)
         torch.testing.assert_close(vals2, ref_vals2)
         torch.testing.assert_close(idx2, ref_idx2)
-        # Argsort rank computation SHOULD be present when indices are used
-        self.assertIn("tl.sum(tl.where(", code2)
+        if _get_backend() == "triton":
+            # Argsort rank computation SHOULD be present when indices are used
+            self.assertIn("tl.sum(tl.where(", code2)
 
     def test_cumsum_does_not_alias_input(self):
         """Regression test: torch.cumsum output must not alias its input.
@@ -890,7 +908,8 @@ class TestMisc(RefEagerTestBase, TestCase):
 
         ref = torch.cumsum(x, dim=-1) - x
         torch.testing.assert_close(result, ref)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.associative_scan", code)
 
     def test_torch_topk_in_kernel(self):
         """Test that torch.topk works inside Helion kernels.
@@ -918,9 +937,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=True)
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
-        # Uses tl.topk for largest=True
-        self.assertIn("tl.topk", code)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "triton":
+            # Uses tl.topk for largest=True
+            self.assertIn("tl.topk", code)
 
     def test_torch_topk_smallest(self):
         """Test torch.topk with largest=False (k smallest elements)."""
@@ -946,12 +965,212 @@ class TestMisc(RefEagerTestBase, TestCase):
         ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=False)
         torch.testing.assert_close(vals, ref_vals)
         torch.testing.assert_close(indices, ref_indices)
-        # Uses tl.sort for largest=False (tl.topk only supports largest=True)
-        self.assertIn("tl.sort", code)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "triton":
+            # Uses tl.sort for largest=False (tl.topk only supports largest=True)
+            self.assertIn("tl.sort", code)
+
+    def test_profiler_does_not_concretize_block_vars(self):
+        """Compiling a kernel inside a torch.profiler context must not
+        concretize block-size SymInts."""
+
+        @helion.kernel(config=helion.Config(block_sizes=[128, 128]))
+        def affine(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                w = weight[tile_n]
+                b = bias[tile_n]
+                out[tile_m, tile_n] = x[tile_m, tile_n] * w[None, :] + b[None, :]
+            return out
+
+        # Warmup outside profiler to populate the cache for these shapes.
+        x1 = torch.randn([1024, 256], device=DEVICE, dtype=torch.float32)
+        w1 = torch.randn([256], device=DEVICE, dtype=torch.float32)
+        b1 = torch.randn([256], device=DEVICE, dtype=torch.float32)
+        affine(x1, w1, b1)
+
+        # Force recompile inside profiler with different shapes.
+        x2 = torch.randn([2048, 512], device=DEVICE, dtype=torch.float32)
+        w2 = torch.randn([512], device=DEVICE, dtype=torch.float32)
+        b2 = torch.randn([512], device=DEVICE, dtype=torch.float32)
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+            with_modules=True,
+        ):
+            result = affine(x2, w2, b2)
+
+        expected = x2 * w2[None, :] + b2[None, :]
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("Config tests not applicable in ref eager mode")
+    def test_default_block_sizes_high_dim_with_reduction(self):
+        """Regression test for issue #1354: default config hangs when indexing
+        tensor with enough dims.
+
+        When a kernel tiles over 3+ dimensions and also accesses a non-tiled
+        (reduction/full-slice) dimension, the total tensor elements per block
+        must stay within a reasonable limit to avoid extremely slow Triton
+        JIT compilation.
+        """
+        from helion.autotuner.config_generation import TRITON_MAX_TENSOR_NUMEL
+
+        @helion.kernel(
+            static_shapes=False,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def helion_merge_attention_fwd(a, lse_a, b, lse_b):
+            batch, heads, seq_len, head_dim = a.shape
+            out = torch.empty_like(a)
+            for tile_b, tile_h, tile_s in hl.tile([batch, heads, seq_len]):
+                a_tile = a[tile_b, tile_h, tile_s, :].to(torch.float32)
+                b_tile = b[tile_b, tile_h, tile_s, :].to(torch.float32)
+                max_lse = torch.maximum(
+                    lse_a[tile_b, tile_h, tile_s, None],
+                    lse_b[tile_b, tile_h, tile_s, None],
+                )
+                exp_a = torch.exp(lse_a[tile_b, tile_h, tile_s, None] - max_lse)
+                exp_b = torch.exp(lse_b[tile_b, tile_h, tile_s, None] - max_lse)
+                out[tile_b, tile_h, tile_s, :] = (
+                    (a_tile * exp_a + b_tile * exp_b) / (exp_a + exp_b)
+                ).to(a.dtype)
+            return out
+
+        batch, heads, seq_len, head_dim = 32, 32, 8192, 128
+        # Non-contiguous layout (stride order 0,2,1,3) from the original repro
+        a = (
+            torch.randn(
+                batch,
+                heads,
+                seq_len,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=DEVICE,
+            )
+            .transpose(1, 2)
+            .contiguous()
+            .transpose(1, 2)
+        )
+        b = (
+            torch.randn(
+                batch,
+                heads,
+                seq_len,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=DEVICE,
+            )
+            .transpose(1, 2)
+            .contiguous()
+            .transpose(1, 2)
+        )
+        lse_a = torch.randn(batch, heads, seq_len, dtype=torch.float32, device=DEVICE)
+        lse_b = torch.randn_like(lse_a)
+
+        bound = helion_merge_attention_fwd.bind((a, lse_a, b, lse_b))
+        config_spec = bound.env.config_spec
+        default_config = config_spec.default_config()
+        block_sizes = cast("list[int]", default_config.config["block_sizes"])
+        block_numel = 1
+        for bs in block_sizes:
+            block_numel *= bs
+        reduction_numel = 1
+        for rl in config_spec.reduction_loops:
+            reduction_numel *= rl.size_hint
+        total_numel = block_numel * reduction_numel
+        self.assertLessEqual(
+            total_numel,
+            TRITON_MAX_TENSOR_NUMEL,
+            f"Default block_sizes={block_sizes} with "
+            f"reduction_numel={reduction_numel} "
+            f"gives total_numel={total_numel} which exceeds "
+            f"{TRITON_MAX_TENSOR_NUMEL}. "
+            f"This will cause Triton JIT compilation to hang.",
+        )
+        # The heuristic in BlockSizeSpec._fragment() should pick default=4
+        # for 3 tiled dims + reduction_numel=128, giving 4^3*128 = 8K
+        # (safe for 64KB shared memory with bf16).
+        self.assertEqual(block_sizes, [4, 4, 4])
+
+        # Also verify it actually runs successfully
+        code, result = code_and_output(helion_merge_attention_fwd, (a, lse_a, b, lse_b))
+        self.assertEqual(result.shape, a.shape)
+
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_gelu_tanh_approx_bf16_triton_dtype_cast(self):
+        """``F.gelu(x, approximate="tanh")`` on a bf16 input renders the
+        fp32 round-trip *and* the trailing cast back to ``tl.bfloat16``.
+
+        Pins the triton lowering's same-dtype contract: the
+        ``aten.gelu.default`` decomp routes the tanh form to the
+        internal ``_gelu_tanh_approx`` op whose ``register_fake`` is
+        ``torch.empty_like(x)``, so the rendered expression must end
+        with a ``.to(tl.bfloat16)`` (or equivalent) when the input is
+        bf16. Without the trailing cast, the result would leak fp32
+        from ``libdevice.tanh`` and break callers that rely on the
+        FX-level dtype.
+        """
+        if _get_backend() == "cute":
+            self.skipTest(
+                "cute backend has its own splice path; this is a "
+                "triton-only dtype contract test"
+            )
+
+        @helion.kernel(autotune_effort="none")
+        def gelu_tanh_approx_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                result[tile] = torch.nn.functional.gelu(x[tile], approximate="tanh")
+            return result
+
+        x = torch.randn([32], device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(gelu_tanh_approx_kernel, (x,))
+        # Result must preserve the input dtype.
+        self.assertEqual(result.dtype, torch.bfloat16)
+        expected = torch.nn.functional.gelu(x, approximate="tanh")
+        torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
+        # Pin the rendered fp32 round-trip + final narrowing cast so a
+        # future refactor can't drop either half of the contract.
+        self.assertIn("libdevice.tanh", code)
+        self.assertIn("tl.float32", code)
+        self.assertIn("tl.bfloat16", code)
 
 
 instantiate_parametrized_tests(TestMisc)
+
+
+@onlyBackends(["triton"])
+class TestTritonExactGelu(RefEagerTestBase, TestCase):
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_gelu_exact_bf16_triton_dtype_cast(self):
+        """Default ``F.gelu`` lowers through the exact erf path and
+        preserves bf16 dtype for the Triton backend."""
+
+        @helion.kernel(autotune_effort="none")
+        def gelu_exact_kernel(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                result[tile] = torch.nn.functional.gelu(x[tile])
+            return result
+
+        x = torch.randn([32], device=DEVICE, dtype=torch.bfloat16)
+        code, result = code_and_output(gelu_exact_kernel, (x,))
+        self.assertEqual(result.dtype, torch.bfloat16)
+        expected = torch.nn.functional.gelu(x)
+        torch.testing.assert_close(result, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("libdevice.erf", code)
+        self.assertIn("tl.float32", code)
+        self.assertIn("tl.bfloat16", code)
 
 
 @onlyBackends(["triton"])
@@ -995,6 +1214,204 @@ class TestHelionTritonPrinter(TestCase):
             result = printer.doprint(sympy.Float(val))
             self.assertNotIn("tl.full", result)
             self.assertAlmostEqual(float(result), val)
+
+    def test_print_FloorDiv_constexpr(self):
+        """Test that FloorDiv with constexpr LHS prints as // operator.
+
+        This is required for TMA tensor descriptors which need compile-time
+        constant block shapes. When the LHS is a constexpr argument (like a
+        block size), we must emit `lhs // rhs` instead of
+        `triton_helpers.div_floor_integer(lhs, rhs)` so Triton can evaluate
+        the expression at compile time.
+        """
+        from unittest.mock import Mock
+
+        import sympy
+        from torch.utils._sympy.functions import FloorDiv
+
+        from helion._compiler.device_function import DeviceFunction
+        from helion._compiler.device_function import HelionTritonPrinter
+
+        printer = HelionTritonPrinter()
+
+        # LHS is constexpr -> use //
+        mock_df = Mock(_constexpr_args={"_BLOCK_SIZE_0": None})
+        with patch.object(DeviceFunction, "current", return_value=mock_df):
+            block_size = sympy.Symbol("_BLOCK_SIZE_0", integer=True)
+            expr = FloorDiv(block_size, 2)
+            result = printer.doprint(expr)
+            self.assertEqual(result, "_BLOCK_SIZE_0 // 2")
+
+        # LHS is NOT constexpr -> fallback to triton_helpers
+        mock_df = Mock(_constexpr_args={})
+        with patch.object(DeviceFunction, "current", return_value=mock_df):
+            x = sympy.Symbol("x", integer=True)
+            expr = FloorDiv(x, 2)
+            result = printer.doprint(expr)
+            self.assertIn("div_floor_integer", result)
+
+
+@onlyBackends(["triton"])
+class TestLauncher(TestCase):
+    """Launcher-agnostic contract tests — every launcher
+    implementation must satisfy these regardless of which Triton
+    dispatch path it uses. Currently exercises whichever launcher
+    Helion installs by default; the same scenarios are pinned down
+    against the static-kernel launcher in
+    ``test/test_static_launcher.py``.
+    """
+
+    def test_unaligned_input_produces_correct_output(self) -> None:
+        """An unaligned tensor (e.g. ``x[1:]`` on fp32) primed after
+        an aligned call must still produce the correct numeric output:
+        the launcher either falls back to Triton's full path or
+        otherwise handles the new alignment cleanly."""
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        n = 1024
+        base = torch.randn(n + 4, device=DEVICE, dtype=torch.float32)
+        aligned = base[:n]
+        unaligned = base[1 : n + 1]
+        self.assertEqual(aligned.data_ptr() % 16, 0)
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+
+        add(aligned, aligned)
+        torch.accelerator.synchronize()
+        out = add(unaligned, unaligned)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out, unaligned + unaligned)
+
+    def test_unaligned_writes_to_user_out_arg_land_on_original(self) -> None:
+        """If the kernel writes to an unaligned user-supplied output
+        buffer, those writes must land on the user's tensor (not on
+        a clone)."""
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+        )
+        def add_write_out(
+            x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        n = 1024
+        x_aligned = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        y_aligned = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        base_out = torch.zeros(n + 4, device=DEVICE, dtype=torch.float32)
+
+        # Prime with aligned slices, then call with only ``out``
+        # unaligned so the test isolates the write-to-unaligned case.
+        add_write_out(x_aligned, y_aligned, base_out[:n])
+        torch.accelerator.synchronize()
+
+        out_unaligned = base_out[1 : n + 1]
+        self.assertEqual(x_aligned.data_ptr() % 16, 0)
+        self.assertEqual(y_aligned.data_ptr() % 16, 0)
+        self.assertNotEqual(out_unaligned.data_ptr() % 16, 0)
+        out_unaligned.fill_(0.0)
+        add_write_out(x_aligned, y_aligned, out_unaligned)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out_unaligned, x_aligned + y_aligned)
+
+    @skipIfRefEager(
+        "Inspects the bound kernel's Triton JITFunction, which doesn't "
+        "exist in ref-eager mode"
+    )
+    def test_used_global_vals_mutation_raises(self) -> None:
+        """Mutating a tracked global (e.g. a ``_BLOCK_SIZE_*``
+        constexpr captured via ``used_global_vals``) between calls
+        must trigger ``RuntimeError`` from Triton's own guard."""
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
+        add(x, x)
+        torch.accelerator.synchronize()
+
+        from triton.runtime.jit import JITFunction
+
+        bound = next(iter(add._bound_kernels.values()))  # type: ignore[attr-defined]
+        jit_fn = next(
+            v for v in bound._run.__globals__.values() if isinstance(v, JITFunction)
+        )
+        ugv = getattr(jit_fn, "used_global_vals", None)
+        if not ugv:
+            self.skipTest("This kernel has no used_global_vals to mutate")
+
+        (name, _gid), (val, gdict) = next(iter(ugv.items()))
+        original = gdict[name]
+        gdict[name] = "MUTATED_NOPE"
+        try:
+            with self.assertRaises(RuntimeError):
+                add(x, x)
+                torch.accelerator.synchronize()
+        finally:
+            gdict[name] = original
+
+    def test_correct_result_on_each_cuda_device(self) -> None:
+        """The same kernel called on ``cuda:0`` then ``cuda:1`` must
+        yield correct numeric results landing on each device. Whether
+        the two calls share a ``BoundKernel`` (cache key collapses on
+        ``device.type``) or get distinct entries (key includes the
+        full ``torch.device``) is an implementation detail covered in
+        ``test_static_launcher.py``; this contract test only pins
+        down per-device correctness.
+
+        Triton's launcher requires the current CUDA context to match
+        the tensor's device — like raw Triton, Helion expects the
+        caller to set the device via ``torch.cuda.device(N)`` (or
+        ``torch.cuda.set_device(N)``) before launching on a
+        non-default device."""
+        if torch.cuda.device_count() < 2:
+            self.skipTest("requires >= 2 CUDA devices")
+
+        @helion.kernel(
+            static_shapes=True,
+            config=helion.Config(block_sizes=[1024], num_warps=4, num_stages=2),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for i in hl.tile(out.size(0)):
+                out[i] = x[i] + y[i]
+            return out
+
+        device0 = torch.device(DEVICE.type, 0)
+        device1 = torch.device(DEVICE.type, 1)
+
+        x0 = torch.randn(1024, device=device0, dtype=torch.float32)
+        with torch.cuda.device(device0.index):
+            out0 = add(x0, x0)
+        torch.cuda.synchronize(0)
+
+        x1 = torch.randn(1024, device=device1, dtype=torch.float32)
+        with torch.cuda.device(device1.index):
+            out1 = add(x1, x1)
+        torch.cuda.synchronize(1)
+
+        self.assertEqual(out0.device, device0)
+        self.assertEqual(out1.device, device1)
+        torch.testing.assert_close(out0, 2 * x0)
+        torch.testing.assert_close(out1, 2 * x1)
 
 
 if __name__ == "__main__":

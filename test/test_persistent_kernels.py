@@ -11,10 +11,11 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
@@ -73,7 +74,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         # Test with persistent_blocked
         code, result = code_and_output(add_kernel, args, pid_type="persistent_blocked")
-        self.assertExpectedJournal(code)
 
         # Check correctness
         expected = args[0] + args[1]
@@ -95,7 +95,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             add_kernel, args, pid_type="persistent_interleaved"
         )
-        self.assertExpectedJournal(code)
 
         # Check correctness
         expected = args[0] + args[1]
@@ -117,13 +116,11 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_persistent, result_persistent = code_and_output(
             matmul_kernel, args, pid_type="persistent_blocked", block_sizes=[32, 32, 32]
         )
-        self.assertExpectedJournal(code_persistent)
 
         # Test with flat for comparison
         code_flat, result_flat = code_and_output(
             matmul_kernel, args, pid_type="flat", block_sizes=[32, 32, 32]
         )
-        self.assertExpectedJournal(code_flat)
 
         # Persistent and flat should produce identical results
         torch.testing.assert_close(result_persistent, result_flat, atol=0, rtol=0)
@@ -151,7 +148,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 32],
             pid_type="persistent_interleaved",
         )
-        self.assertExpectedJournal(code_persistent)
 
         # Test with flat for comparison
         code_flat, result_flat = code_and_output(
@@ -160,7 +156,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 32],
             pid_type="flat",
         )
-        self.assertExpectedJournal(code_flat)
 
         # Persistent and flat should produce identical results
         torch.testing.assert_close(result_persistent, result_flat, atol=0, rtol=0)
@@ -185,11 +180,9 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_persistent, result_persistent = code_and_output(
             add_3d_kernel, args, pid_type="persistent_blocked"
         )
-        self.assertExpectedJournal(code_persistent)
 
         # Test with flat for comparison
         code_flat, result_flat = code_and_output(add_3d_kernel, args, pid_type="flat")
-        self.assertExpectedJournal(code_flat)
 
         # Persistent and flat should produce identical results
         torch.testing.assert_close(result_persistent, result_flat, atol=0, rtol=0)
@@ -217,7 +210,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             args,
             pid_type="persistent_interleaved",
         )
-        self.assertExpectedJournal(code_persistent)
 
         # Test with flat for comparison
         code_flat, result_flat = code_and_output(
@@ -225,7 +217,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             args,
             pid_type="flat",
         )
-        self.assertExpectedJournal(code_flat)
 
         # Persistent and flat should produce identical results
         torch.testing.assert_close(result_persistent, result_flat, atol=0, rtol=0)
@@ -258,6 +249,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         # Should produce identical results
         torch.testing.assert_close(result_flat, result_persistent)
 
+    @skipIfXPU("worker crash on XPU")
     def test_xyz_vs_persistent_interleaved_equivalence(self):
         """Test that xyz and persistent_interleaved produce same results."""
 
@@ -311,19 +303,16 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_blocked, results_blocked = code_and_output(
             multi_loop_kernel, args, pid_type="persistent_blocked"
         )
-        self.assertExpectedJournal(code_blocked)
 
         # Test with persistent_interleaved
         code_interleaved, results_interleaved = code_and_output(
             multi_loop_kernel, args, pid_type="persistent_interleaved"
         )
-        self.assertExpectedJournal(code_interleaved)
 
         # Test with flat for comparison
         code_flat, results_flat = code_and_output(
             multi_loop_kernel, args, pid_type="flat"
         )
-        self.assertExpectedJournal(code_flat)
 
         # First verify all strategies produce identical results (most important check)
         torch.testing.assert_close(results_blocked[0], results_flat[0], atol=0, rtol=0)
@@ -432,18 +421,15 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_blocked, result_blocked = code_and_output(
             complex_shared_kernel, args, pid_type="persistent_blocked"
         )
-        self.assertExpectedJournal(code_blocked)
 
         code_interleaved, result_interleaved = code_and_output(
             complex_shared_kernel, args, pid_type="persistent_interleaved"
         )
-        self.assertExpectedJournal(code_interleaved)
 
         # Test with flat for comparison
         code_flat, result_flat = code_and_output(
             complex_shared_kernel, args, pid_type="flat"
         )
-        self.assertExpectedJournal(code_flat)
 
         # All strategies should produce identical results
         torch.testing.assert_close(result_blocked, result_flat, atol=0, rtol=0)
@@ -475,19 +461,16 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_persistent_l2, result_persistent_l2 = code_and_output(
             add_kernel, args, pid_type="persistent_blocked", l2_grouping=8
         )
-        self.assertExpectedJournal(code_persistent_l2)
 
         # Test with flat + l2_grouping=8 for comparison
         code_flat_l2, result_flat_l2 = code_and_output(
             add_kernel, args, pid_type="flat", l2_grouping=8
         )
-        self.assertExpectedJournal(code_flat_l2)
 
         # Test with persistent_blocked alone for comparison
         code_persistent, result_persistent = code_and_output(
             add_kernel, args, pid_type="persistent_blocked", l2_grouping=1
         )
-        self.assertExpectedJournal(code_persistent)
 
         # All should produce identical results
         torch.testing.assert_close(result_persistent_l2, result_flat_l2, atol=0, rtol=0)
@@ -536,7 +519,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_persistent_shared, result_persistent_shared = code_and_output(
             multi_add_kernel, args, pid_type="persistent_blocked"
         )
-        self.assertExpectedJournal(code_persistent_shared)
 
         # Check correctness - both results should be correct
         expected1 = args[0] + 1.0
@@ -586,7 +568,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_blocked, result_blocked = code_and_output(
             simple_add, args, pid_type="persistent_blocked"
         )
-        self.assertExpectedJournal(code_blocked)
         torch.testing.assert_close(result_blocked, expected)
 
         # Verify correct grid size and loop structure
@@ -599,7 +580,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_interleaved, result_interleaved = code_and_output(
             simple_add, args, pid_type="persistent_interleaved"
         )
-        self.assertExpectedJournal(code_interleaved)
         torch.testing.assert_close(result_interleaved, expected)
 
         # Verify correct grid size and loop structure
@@ -659,7 +639,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_blocked, results_blocked = code_and_output(
             multi_loop_kernel, args, pid_type="persistent_blocked"
         )
-        self.assertExpectedJournal(code_blocked)
         torch.testing.assert_close(results_blocked[0], expected1)
         torch.testing.assert_close(results_blocked[1], expected2)
 
@@ -671,7 +650,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_interleaved, results_interleaved = code_and_output(
             multi_loop_kernel, args, pid_type="persistent_interleaved"
         )
-        self.assertExpectedJournal(code_interleaved)
         torch.testing.assert_close(results_interleaved[0], expected1)
         torch.testing.assert_close(results_interleaved[1], expected2)
 
@@ -694,26 +672,23 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         # Get codes for different strategies
         code_flat, _ = code_and_output(test_kernel, args, pid_type="flat")
-        self.assertExpectedJournal(code_flat)
         code_persistent_blocked, _ = code_and_output(
             test_kernel, args, pid_type="persistent_blocked"
         )
-        self.assertExpectedJournal(code_persistent_blocked)
         code_persistent_interleaved, _ = code_and_output(
             test_kernel, args, pid_type="persistent_interleaved"
         )
-        self.assertExpectedJournal(code_persistent_interleaved)
 
         # Extract grid sizes from kernel calls - look for the pattern _launcher(_kernel, grid, ...)
         import re
 
         # Look for _launcher(_kernel_name, (grid_size), ...) pattern
-        flat_grid_match = re.search(r"_launcher\([^,]+,\s*\(([^)]+)\)", code_flat)
-        persistent_blocked_grid_match = re.search(
-            r"_launcher\([^,]+,\s*\(([^)]+)\)", code_persistent_blocked
-        )
+        # Use a pattern that handles nested parentheses in grid expressions
+        grid_pattern = r"_launcher\([^,]+,\s*\((.+?)\)\s*,"
+        flat_grid_match = re.search(grid_pattern, code_flat)
+        persistent_blocked_grid_match = re.search(grid_pattern, code_persistent_blocked)
         persistent_interleaved_grid_match = re.search(
-            r"_launcher\([^,]+,\s*\(([^)]+)\)", code_persistent_interleaved
+            grid_pattern, code_persistent_interleaved
         )
 
         self.assertIsNotNone(flat_grid_match, "Could not find grid size in flat code")
@@ -732,8 +707,8 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             ","
         )
 
-        # Flat should use the full grid size calculation
-        self.assertIn("triton.cdiv", flat_grid)
+        # Flat should use the full grid size calculation (ceiling division)
+        self.assertIn("//", flat_grid)
 
         # Persistent kernels should use NUM_SMS
         self.assertEqual(
@@ -762,7 +737,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_blocked, result_blocked = code_and_output(
             test_kernel, args, pid_type="persistent_blocked"
         )
-        self.assertExpectedJournal(code_blocked)
         torch.testing.assert_close(result_blocked, expected)
 
         # Should have the correct loop structure
@@ -774,7 +748,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_interleaved, result_interleaved = code_and_output(
             test_kernel, args, pid_type="persistent_interleaved"
         )
-        self.assertExpectedJournal(code_interleaved)
         torch.testing.assert_close(result_interleaved, expected)
 
         # Should have the correct loop structure
@@ -805,7 +778,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_blocked, result_blocked = code_and_output(
             vector_add_1d, args, pid_type="persistent_blocked"
         )
-        self.assertExpectedJournal(code_blocked)
         torch.testing.assert_close(result_blocked, expected)
 
         # Verify 1D persistent loop structure
@@ -817,7 +789,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_interleaved, result_interleaved = code_and_output(
             vector_add_1d, args, pid_type="persistent_interleaved"
         )
-        self.assertExpectedJournal(code_interleaved)
         torch.testing.assert_close(result_interleaved, expected)
 
         # Verify 1D persistent loop structure
@@ -827,7 +798,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 
         # Test correctness vs flat
         code_flat, result_flat = code_and_output(vector_add_1d, args, pid_type="flat")
-        self.assertExpectedJournal(code_flat)
         torch.testing.assert_close(result_blocked, result_flat, atol=0, rtol=0)
         torch.testing.assert_close(result_interleaved, result_flat, atol=0, rtol=0)
 
@@ -851,7 +821,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             pid_type="persistent_interleaved",
             l2_grouping=4,
         )
-        self.assertExpectedJournal(code)
 
         # Check correctness
         expected = args[0] * 2.0
@@ -873,7 +842,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_flat, result_flat = code_and_output(
             single_loop_l2_kernel, args, pid_type="flat", l2_grouping=4
         )
-        self.assertExpectedJournal(code_flat)
         torch.testing.assert_close(result, result_flat, atol=0, rtol=0)
 
     def test_persistent_interleaved_multiple_loops_without_l2_grouping(self):
@@ -905,7 +873,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             args,
             pid_type="persistent_interleaved",
         )
-        self.assertExpectedJournal(code)
 
         # Check correctness
         expected1 = args[0] * 2.0
@@ -924,11 +891,9 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_flat, result_flat = code_and_output(
             multi_loop_kernel, args, pid_type="flat"
         )
-        self.assertExpectedJournal(code_flat)
         torch.testing.assert_close(result[0], result_flat[0], atol=0, rtol=0)
         torch.testing.assert_close(result[1], result_flat[1], atol=0, rtol=0)
 
-    @skipIfCpu("RuntimeError: PassManager::run failed")
     def test_persistent_interleaved_multiple_loops_with_l2_grouping(self):
         """Test persistent_interleaved with multiple top-level hl.tile loops AND l2_grouping (all 3 features combined)."""
 
@@ -957,7 +922,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             pid_type="persistent_interleaved",
             l2_grouping=[2, 4, 2],
         )
-        self.assertExpectedJournal(code)
 
         # Check correctness
         expected1 = args[0] * 2.0
@@ -987,7 +951,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_flat, result_flat = code_and_output(
             multi_loop_l2_kernel, args, pid_type="flat", l2_grouping=4
         )
-        self.assertExpectedJournal(code_flat)
         torch.testing.assert_close(result[0], result_flat[0])
         torch.testing.assert_close(result[1], result_flat[1])
 
@@ -1014,7 +977,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             pid_type="persistent_blocked",
             indexing="tensor_descriptor",
         )
-        self.assertExpectedJournal(code_blocked)
 
         # Test with tensor_descriptor indexing + persistent_interleaved
         code_interleaved, result_interleaved = code_and_output(
@@ -1023,7 +985,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             pid_type="persistent_interleaved",
             indexing="tensor_descriptor",
         )
-        self.assertExpectedJournal(code_interleaved)
 
         # Check correctness
         expected = args[0] + args[1]
@@ -1059,7 +1020,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_unroll, result_unroll = code_and_output(
             test_kernel, args, pid_type="persistent_blocked", range_unroll_factors=[2]
         )
-        self.assertExpectedJournal(code_unroll)
         torch.testing.assert_close(result_unroll, expected)
         self.assertIn("loop_unroll_factor=2", code_unroll)
 
@@ -1067,7 +1027,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_stages, result_stages = code_and_output(
             test_kernel, args, pid_type="persistent_interleaved", range_num_stages=[3]
         )
-        self.assertExpectedJournal(code_stages)
         torch.testing.assert_close(result_stages, expected)
         self.assertIn("num_stages=3", code_stages)
 
@@ -1078,7 +1037,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             pid_type="persistent_blocked",
             range_multi_buffers=[False],
         )
-        self.assertExpectedJournal(code_buffer)
         torch.testing.assert_close(result_buffer, expected)
         self.assertIn("disallow_acc_multi_buffer=True", code_buffer)
 
@@ -1086,7 +1044,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         code_flatten, result_flatten = code_and_output(
             test_kernel, args, pid_type="persistent_interleaved", range_flattens=[True]
         )
-        self.assertExpectedJournal(code_flatten)
         torch.testing.assert_close(result_flatten, expected)
         self.assertIn("flatten=True", code_flatten)
 
@@ -1100,7 +1057,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             range_multi_buffers=[True],
             range_flattens=[False],
         )
-        self.assertExpectedJournal(code_combined)
         torch.testing.assert_close(result_combined, expected)
 
         # Verify all options are present in the generated code
@@ -1109,6 +1065,7 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("disallow_acc_multi_buffer=False", code_combined)
         self.assertIn("flatten=False", code_combined)
 
+    @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(
         (12, 0), reason="Warp specialization requires CUDA capability >= 12.0"
     )
@@ -1132,7 +1089,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
             pid_type="persistent_blocked",
             range_warp_specializes=[True],
         )
-        self.assertExpectedJournal(code_warp)
         torch.testing.assert_close(result_warp, expected)
         self.assertIn("warp_specialize=True", code_warp)
 
@@ -1208,7 +1164,6 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         self.assertIn("persistent_blocked", config_spec.allowed_pid_types)
         self.assertIn("persistent_interleaved", config_spec.allowed_pid_types)
 
-    @skipIfCpu("Persistent kernels not supported on CPU")
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_data_dependent_tile_bounds_codegen(self):
         """Test that data-dependent tile bounds work with persistent kernels.
@@ -1248,14 +1203,12 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
         # Verify persistent kernel structure
         self.assertIn("total_pids", code)
         self.assertIn("virtual_pid", code)
-        self.assertExpectedJournal(code)
 
 
 @onlyBackends(["triton"])
 class TestNumSmMultiplier(RefEagerTestBase, TestCase):
     """Test num_sm_multiplier for multi-occupancy in persistent kernels."""
 
-    @skipIfCpu("Persistent kernels not supported on CPU")
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_num_sm_multiplier_blocked_grid_size(self):
         """Test that num_sm_multiplier affects grid size in blocked persistent kernels."""
@@ -1270,7 +1223,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         )
         self.assertIn("(_NUM_SM,)", code_m1)
         self.assertIn("tl.cdiv(total_pids, _NUM_SM)", code_m1)
-        self.assertExpectedJournal(code_m1)
 
         # Test with multiplier=2
         code_m2, result_m2 = code_and_output(
@@ -1278,7 +1230,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         )
         self.assertIn("(_NUM_SM * 2,)", code_m2)
         self.assertIn("tl.cdiv(total_pids, _NUM_SM * 2)", code_m2)
-        self.assertExpectedJournal(code_m2)
 
         # Test with multiplier=4
         code_m4, result_m4 = code_and_output(
@@ -1286,7 +1237,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         )
         self.assertIn("(_NUM_SM * 4,)", code_m4)
         self.assertIn("tl.cdiv(total_pids, _NUM_SM * 4)", code_m4)
-        self.assertExpectedJournal(code_m4)
 
         # All should produce the same result
         expected = args[0] + args[1]
@@ -1294,7 +1244,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_m2, expected)
         torch.testing.assert_close(result_m4, expected)
 
-    @skipIfCpu("Persistent kernels not supported on CPU")
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_num_sm_multiplier_interleaved_step(self):
         """Test that num_sm_multiplier affects step in interleaved persistent kernels."""
@@ -1309,7 +1258,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         )
         self.assertIn("(_NUM_SM,)", code_m1)
         self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM", code_m1)
-        self.assertExpectedJournal(code_m1)
 
         # Test with multiplier=2
         code_m2, result_m2 = code_and_output(
@@ -1317,7 +1265,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         )
         self.assertIn("(_NUM_SM * 2,)", code_m2)
         self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 2", code_m2)
-        self.assertExpectedJournal(code_m2)
 
         # Test with multiplier=8
         code_m8, result_m8 = code_and_output(
@@ -1325,7 +1272,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         )
         self.assertIn("(_NUM_SM * 8,)", code_m8)
         self.assertIn("tl.range(tl.program_id(0), total_pids, _NUM_SM * 8", code_m8)
-        self.assertExpectedJournal(code_m8)
 
         # All should produce the same result
         expected = args[0] + args[1]
@@ -1333,7 +1279,6 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_m2, expected)
         torch.testing.assert_close(result_m8, expected)
 
-    @skipIfCpu("Persistent kernels not supported on CPU")
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_num_sm_multiplier_matmul_correctness(self):
         """Test that matmul works correctly with different num_sm_multiplier values."""

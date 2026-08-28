@@ -10,8 +10,14 @@ from typing import cast
 import uuid
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
-PidTypeLiteral = Literal["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
+PidTypeLiteral = Literal[
+    "flat",
+    "xyz",
+    "persistent_blocked",
+    "persistent_interleaved",
+]
 EvictionPolicyLiteral = Literal["", "first", "last"]
+LoadCacheModifierLiteral = Literal["", ".cg"]
 NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
@@ -26,7 +32,7 @@ class Config(Mapping[str, object]):
         platform_target: str | None = None,
         # Core properties
         block_sizes: list[int] | None = None,
-        elements_per_thread: list[int] | int | None = None,
+        num_threads: list[int] | int | None = None,
         loop_orders: list[list[int]] | None = None,
         flatten_loops: list[bool] | None = None,
         l2_groupings: list[int] | None = None,
@@ -38,12 +44,16 @@ class Config(Mapping[str, object]):
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
         load_eviction_policies: list[EvictionPolicyLiteral] | None = None,
+        load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
+        atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
+        advanced_controls_file: str | None = None,
+        epilogue_subtile: int | None = None,
         # For user-defined properties
         **kwargs: object,
     ) -> None:
@@ -52,7 +62,7 @@ class Config(Mapping[str, object]):
 
         Args:
             block_sizes: Controls tile sizes for hl.tile invocations.
-            elements_per_thread: Elements computed per thread (backend-specific).
+            num_threads: Target thread count per axis (backend-specific).
             loop_orders: Permutes iteration order of tiles.
             l2_groupings: Reorders program IDs for L2 cache locality.
             reduction_loops: Configures reduction loop behavior.
@@ -63,6 +73,7 @@ class Config(Mapping[str, object]):
             range_flattens: Controls flatten parameter for tl.range calls.
             static_ranges: Whether to use tl.static_range instead tl.range.
             load_eviction_policies: Eviction policies for load operations ("", "first", "last").
+            load_cache_modifiers: Cache modifiers for load operations ("", ".cg").
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
@@ -78,6 +89,12 @@ class Config(Mapping[str, object]):
                   indexing=["pointer", "block_ptr", "tensor_descriptor"]
                 - Empty/omitted (all loads/stores default to "pointer")
                 Valid strategies: "pointer", "tensor_descriptor", "block_ptr"
+            atomic_indexing: Indexing strategy for atomic operations (e.g., hl.atomic_add).
+                Same format as ``indexing`` (a single string or a list per atomic op).
+                Defaults to "pointer" when omitted.
+            advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
+            epilogue_subtile: Split factor for the epilogue (post-matmul pointwise + store) along
+                the N dimension. None = disabled (default), valid values are 2 or 4.
             **kwargs: Additional user-defined configuration parameters.
         """
         self.platform_target = platform_target
@@ -85,7 +102,7 @@ class Config(Mapping[str, object]):
         self.config = {}
         core_props = {
             "block_sizes": block_sizes,
-            "elements_per_thread": elements_per_thread,
+            "num_threads": num_threads,
             "loop_orders": loop_orders,
             "flatten_loops": flatten_loops,
             "l2_groupings": l2_groupings,
@@ -97,12 +114,16 @@ class Config(Mapping[str, object]):
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
             "load_eviction_policies": load_eviction_policies,
+            "load_cache_modifiers": load_cache_modifiers,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
+            "atomic_indexing": atomic_indexing,
             "pid_type": pid_type,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
+            "advanced_controls_file": advanced_controls_file,
+            "epilogue_subtile": epilogue_subtile,
         }
         for key, value in core_props.items():
             if value is not None:
@@ -211,8 +232,8 @@ class Config(Mapping[str, object]):
         return cast("list[list[int]]", self.config.get("loop_orders", []))
 
     @property
-    def elements_per_thread(self) -> list[int]:
-        value = self.config.get("elements_per_thread", [])
+    def num_threads(self) -> list[int]:
+        value = self.config.get("num_threads", [])
         if isinstance(value, int):
             return [value]
         return cast("list[int]", value)
@@ -264,6 +285,10 @@ class Config(Mapping[str, object]):
         return cast("list[int]", self.config.get("range_unroll_factors", []))
 
     @property
+    def advanced_controls_file(self) -> str:
+        return cast("str", self.config.get("advanced_controls_file", ""))
+
+    @property
     def range_warp_specializes(self) -> list[bool | None]:
         return cast("list[bool | None]", self.config.get("range_warp_specializes", []))
 
@@ -290,10 +315,28 @@ class Config(Mapping[str, object]):
         )
 
     @property
+    def load_cache_modifiers(self) -> list[LoadCacheModifierLiteral]:
+        return cast(
+            "list[LoadCacheModifierLiteral]",
+            self.config.get("load_cache_modifiers", []),
+        )
+
+    @property
     def indexing(self) -> IndexingLiteral | list[IndexingLiteral]:
         return cast(
             "IndexingLiteral | list[IndexingLiteral]", self.config.get("indexing", [])
         )
+
+    @property
+    def atomic_indexing(self) -> IndexingLiteral | list[IndexingLiteral]:
+        return cast(
+            "IndexingLiteral | list[IndexingLiteral]",
+            self.config.get("atomic_indexing", []),
+        )
+
+    @property
+    def epilogue_subtile(self) -> int | None:
+        return cast("int | None", self.config.get("epilogue_subtile", None))
 
 
 def _to_hashable(x: object) -> object:

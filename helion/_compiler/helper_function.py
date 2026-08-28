@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC
 from abc import abstractmethod
 import ast
+import contextlib
 import inspect
 from typing import TYPE_CHECKING
 from typing import Callable
@@ -18,7 +19,10 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     import types
+
+    from torch.fx.node import Node
 
     from .device_function import DeviceFunction
     from .device_ir import HelperFunctionGraphInfo
@@ -34,6 +38,10 @@ class CodegenInterface(ABC):
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         """Add a statement to the generated code."""
 
+    @contextlib.contextmanager
+    def statement_owner_node(self, node: Node) -> Iterator[None]:
+        yield
+
     def tmpvar(self, *, dce: bool = False, prefix: str = "v") -> str:
         """Generate a temporary variable name."""
         return self.device_function.unique_name(prefix, dce=dce)
@@ -45,6 +53,13 @@ class CodegenInterface(ABC):
         varname = self.tmpvar(dce=dce, prefix=prefix)
         self.add_statement(statement_from_string(f"{varname} = {{expr}}", expr=expr))
         return create(ast.Name, id=varname, ctx=ast.Load())
+
+    def record_fx_node_ast(self, node: object, value: object) -> None:
+        """Record the final lowered AST value for an FX node if supported."""
+
+    def ast_for_fx_node(self, node: object) -> ast.AST | tuple[ast.AST, ...] | None:
+        """Return the final lowered AST value for an FX node if available."""
+        return None
 
 
 def extract_helper_function(helper_fn: object) -> types.FunctionType:

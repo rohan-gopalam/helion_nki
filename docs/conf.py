@@ -74,7 +74,7 @@ sphinx_gallery_conf = {
     "ignore_pattern": r"(__init__|utils)\.py",  # Exclude __init__.py files
     "plot_gallery": "False",
     "subsection_order": sphinx_gallery.sorting.ExplicitOrder(
-        ["../examples", "../examples/distributed"]
+        ["../examples", "../examples/distributed", "../examples/acfs"]
     ),  # Don't run the examples
 }
 
@@ -155,7 +155,7 @@ html_context = {
     "library_links": [
         {
             "name": "Helion",
-            "url": "https://pytorch.github.io/helion/",
+            "url": "https://github.com/pytorch/helion",
             "current": True,
         },
         {
@@ -174,10 +174,11 @@ html_context = {
 }
 
 html_sidebars = {
-    "helion_puzzles": [],
+    "helion_tutorials": [],
     "examples/index": [],
     "installation": [],
     "deployment_autotuning": [],
+    "tileir_backend": [],
     "events": [],
 }
 
@@ -235,7 +236,14 @@ intersphinx_resolve_self = "helion"
 
 # Linkcheck configuration - ignore URLs that block automated checkers
 linkcheck_ignore = [
-    r"https://pytorchconference\.sched\.com/.*",  # Returns 403 to bots
+    r"https://pytorchconference.*\.sched\.com/.*",  # Returns 403 to bots
+]
+
+# docs.pytorch.org/docs/stable/* serves a JS-only redirect stub to the
+# versioned URL, so linkcheck can't see the real anchors. Skip anchor
+# verification for that host while still checking the URL resolves.
+linkcheck_anchors_ignore_for_url = [
+    r"https://docs\.pytorch\.org/.*",
 ]
 
 # autodoc-typehints configuration

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib
 import re
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -12,6 +14,14 @@ import torch
 from torch._inductor.runtime.hints import DeviceProperties
 
 from ._utils import triton_is_available
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    import sympy
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    from .autotuner.config_fragment import ConfigSpecFragment
 
 if triton_is_available():
     from torch._inductor.utils import triton_type
@@ -235,11 +245,16 @@ if triton_is_available():
     def _min_dot_size(
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
-        if device.type not in ["cuda", "xpu"]:
-            # TODO(jansel): support other hardware backends properly besides CUDA and XPU
-            return (16, 16, 16)
+        # Helion's Pallas backend always targets TPU's Mosaic MXU, even in
+        # interpret mode where the actual device is "cpu".
+        from .runtime.settings import _get_backend
 
-        if torch.xpu.is_available():
+        if _get_backend() == "pallas":
+            # TPU Mosaic MXU tile: (8, 128) sublane × lane.
+            # pl.dot(lhs[M,K], rhs[K,N]) needs M>=8, K>=128, N>=128.
+            return (8, 128, 128)
+
+        if device.type == "xpu" and torch.xpu.is_available():
             # pyrefly: ignore [missing-import]
             from triton.backends.intel.compiler import min_dot_size as min_dot_size_xpu
 
@@ -256,16 +271,26 @@ if triton_is_available():
             # pyrefly: ignore [bad-return]
             return tuple(int(v) for v in dot_size_val)
 
-        from triton.backends.nvidia.compiler import min_dot_size as min_dot_size_cuda
-
-        props = DeviceProperties.create(device)
-        return min_dot_size_cuda(
-            GPUTarget(
+        if device.type == "cuda":
+            props = DeviceProperties.create(device)
+            target = GPUTarget(
                 backend=props.type,
                 arch=props.cc,
                 warp_size=props.warp_size or 32,
             )
-        )(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
+            if is_hip():
+                from triton.backends.amd.compiler import get_min_dot_size
+
+                get_min_size = get_min_dot_size(target)
+            else:
+                from triton.backends.nvidia.compiler import (
+                    min_dot_size as min_dot_size_cuda,
+                )
+
+                get_min_size = min_dot_size_cuda(target)
+            return get_min_size(torch_dtype_to_tl(lhs), torch_dtype_to_tl(rhs))
+
+        return (16, 16, 16)
 
     @functools.cache
     def use_tileir_tunables() -> bool:
@@ -307,6 +332,10 @@ else:
     def _min_dot_size(  # type: ignore[misc]
         device: torch.device, lhs: torch.dtype, rhs: torch.dtype
     ) -> tuple[int, int, int]:
+        from .runtime.settings import _get_backend
+
+        if _get_backend() == "pallas":
+            return (8, 128, 128)
         return (16, 16, 16)
 
     def use_tileir_tunables() -> bool:  # type: ignore[misc]
@@ -316,6 +345,19 @@ else:
 def supports_tensor_descriptor() -> bool:
     # call private func we can patch in testing
     return _supports_tensor_descriptor()
+
+
+def target_device_capability(
+    device: torch.device | None = None,
+) -> tuple[int, int] | None:
+    """Return CUDA compute capability, or None for non-CUDA/unavailable targets."""
+    if device is not None and device.type != "cuda":
+        return None
+    if not torch.cuda.is_available():
+        return None
+    if device is None:
+        return torch.cuda.get_device_capability(torch.cuda.current_device())
+    return torch.cuda.get_device_capability(device)
 
 
 def min_dot_size(
@@ -343,6 +385,47 @@ def _is_hip() -> bool:
         return False
 
 
+@functools.cache
+def get_device_name(device: torch.device | None = None) -> str | None:
+    """Return a human-readable name for the given device."""
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            return None
+
+    if device.type == "cuda" and torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(device)
+        name = torch.cuda.get_device_name(device)
+        if torch.version.hip is not None:
+            arch = getattr(props, "gcnArchName", None)
+            return name if arch is None else f"{name} {arch}"
+        # Inconsistent name reporting, so lets fix H100 to report simple name
+        if name.startswith("NVIDIA H100"):
+            return "NVIDIA H100"
+        return name
+
+    if (
+        device.type == "xpu"
+        and getattr(torch, "xpu", None) is not None
+        and torch.xpu.is_available()
+    ):
+        return torch.xpu.get_device_properties(device).name
+
+    if device.type == "mps":
+        return torch.backends.mps.get_name()
+
+    try:
+        import jax  # type: ignore[import-untyped]
+
+        devices = jax.devices()
+        if devices:
+            return devices[0].device_kind
+    except Exception:
+        pass
+    return None
+
+
 def warps_to_threads(num_warps: int) -> int:
     if torch.cuda.is_available():
         props = DeviceProperties.create(
@@ -350,6 +433,16 @@ def warps_to_threads(num_warps: int) -> int:
         )
         return num_warps * (props.warp_size or 32)
     return num_warps * 32
+
+
+@functools.cache
+def num_compute_units() -> int:
+    """Return the number of SMs (NVIDIA) or CUs (AMD) on the current device."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+    return 128
 
 
 @functools.cache
@@ -369,6 +462,48 @@ def supports_amd_cdna_tunables() -> bool:
         return match is not None and int(match.group(1), 16) >= 0x908
     except Exception:
         return False
+
+
+def supports_mtia_tunables() -> bool:
+    """Check if running on MTIA hardware.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns False in open source builds where the fb module doesn't exist.
+    """
+    return _supports_mtia_tunables()
+
+
+@functools.cache
+def _supports_mtia_tunables() -> bool:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            supports_mtia_tunables as _fb_supports_mtia,
+        )
+
+        return _fb_supports_mtia()
+    except ImportError:
+        return False
+
+
+def get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    """Get MTIA-specific tunable fragments for autotuning.
+
+    This is a wrapper that imports from the fb-private module if available.
+    Returns an empty dict in open source builds where the fb module doesn't exist.
+    """
+    return _get_mtia_tunable_fragments()
+
+
+@functools.cache
+def _get_mtia_tunable_fragments() -> dict[str, ConfigSpecFragment]:
+    try:
+        from .fb.mtia_tunables import (  # pyrefly: ignore [missing-import]
+            get_mtia_tunable_fragments as _fb_get_mtia_tunable_fragments,
+        )
+
+        return _fb_get_mtia_tunable_fragments()
+    except ImportError:
+        return {}
 
 
 @functools.cache
@@ -395,6 +530,16 @@ def supports_tf32_precision_on_amd() -> bool:
         return False
 
 
+def shape_env_size_hint(
+    shape_env: ShapeEnv,
+    expr: sympy.Basic | int,
+) -> int:
+    """Compat wrapper: use optimization_hint (nightly) or size_hint (stable)."""
+    if hasattr(shape_env, "optimization_hint"):
+        return int(shape_env.optimization_hint(expr))  # type: ignore[attr-defined]
+    return int(shape_env.size_hint(expr))  # type: ignore[attr-defined]
+
+
 def supports_maxnreg() -> bool:
     # call private func we can patch in testing
     return _supports_maxnreg()
@@ -402,7 +547,18 @@ def supports_maxnreg() -> bool:
 
 @functools.cache
 def _supports_maxnreg() -> bool:
-    return torch.version.hip is None and torch.version.xpu is None
+    return (
+        torch.version.hip is None
+        and torch.version.xpu is None
+        and torch.cuda.is_available()
+    )
+
+
+@functools.cache
+def _regs_per_block() -> int:
+    """Max 32-bit registers per block on the current CUDA device."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.regs_per_multiprocessor  # pyrefly: ignore[missing-attribute]
 
 
 @functools.cache
@@ -421,3 +577,52 @@ def requires_torch_version(min_version: str) -> bool:
     current_version = version.parse(torch.__version__.split("+")[0])
     current_base = version.parse(current_version.base_version)
     return current_base >= version.parse(min_version)
+
+
+@functools.cache
+def requires_cuda_version(min_version: str) -> bool:
+    """Check if PyTorch's CUDA runtime version meets the minimum requirement.
+
+    Args:
+        min_version: Minimum required CUDA version (e.g., "13").
+
+    Returns:
+        True if ``torch.version.cuda`` is set and >= ``min_version``.
+        False if PyTorch was not built with CUDA support.
+    """
+    cuda_version = torch.version.cuda
+    if cuda_version is None:
+        return False
+    return version.parse(cuda_version) >= version.parse(min_version)
+
+
+@functools.cache
+def supports_torch_compile_fusion() -> bool:
+    """Check whether this PyTorch build exposes Helion's fusion entrypoints."""
+    if torch.xpu.is_available():
+        return False
+    if not requires_torch_version("2.11"):
+        return False
+    try:
+        select_algorithm = importlib.import_module("torch._inductor.select_algorithm")
+        from torch._inductor.ir import TemplateBuffer
+
+        assert hasattr(select_algorithm, "ExternalTritonTemplateKernel")
+
+        init_names = TemplateBuffer.__init__.__code__.co_names
+        assert "allow_prologue_fusion" in init_names
+        assert "allow_epilogue_fusion" in init_names
+        assert hasattr(TemplateBuffer, "has_aliasing_or_mutation_for_prologue_fusion")
+    except (ImportError, AttributeError, AssertionError):
+        return False
+    return True
+
+
+def extract_device(args: Sequence[object]) -> torch.device | None:
+    """Return the first torch.device found in *args*."""
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            return arg.device
+        if isinstance(arg, list) and len(arg) > 0 and isinstance(arg[0], torch.Tensor):
+            return arg[0].device
+    return None

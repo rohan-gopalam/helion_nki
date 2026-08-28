@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Sequence
@@ -17,11 +16,16 @@ from torch._dynamo.variables.higher_order_ops import OutputSpec as _HopOutputSpe
 from torch._dynamo.variables.higher_order_ops import _call_function_and_unflatten_output
 from torch._dynamo.variables.lists import ListVariable
 from torch._dynamo.variables.lists import TupleVariable
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 import torch.utils._pytree as pytree
 
-from helion._compat import requires_torch_version
+from helion._compat import shape_env_size_hint
+from helion._compat import supports_torch_compile_fusion
 from helion._compiler.ast_read_writes import ReadWrites
+import helion.exc as exc
 from helion.runtime.kernel import Kernel
+
+_SYM_SCALAR_TYPES = (torch.SymInt, torch.SymFloat)
 
 if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslator
@@ -36,14 +40,14 @@ def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[
 def _validate_return(
     body: list[ast.stmt], return_value: ast.expr, flat_leaves: list[object]
 ) -> None:
-    """Validate return statement for torch.compile fusion compatibility."""
+    """Validate return statement for torch.compile compatibility."""
     # Check return not in control flow
     for stmt in body:
         for node in ast.walk(stmt):
             if node is not stmt and isinstance(node, ast.Return):
                 raise RuntimeError(
                     "Return statements inside control flow (if/else/for/while) "
-                    "are not supported with torch.compile fusion. "
+                    "are not supported with torch.compile. "
                     "Please restructure the kernel to have a single return at the end."
                 )
 
@@ -58,7 +62,7 @@ def _validate_return(
         if sid in seen_storages:
             raise RuntimeError(
                 "Returning multiple outputs that share storage is not yet supported "
-                "with torch.compile fusion. Please return independent tensors."
+                "with torch.compile. Please return independent tensors."
             )
         seen_storages.add(sid)
 
@@ -165,12 +169,15 @@ def infer_output_spec(
                     "device": str(leaf.device),
                 }
             )
-        elif isinstance(leaf, (torch.SymInt, int, float, bool, str)) or leaf is None:
+        elif (
+            isinstance(leaf, (*_SYM_SCALAR_TYPES, int, float, bool, str))
+            or leaf is None
+        ):
             leaf_specs.append({"type": "scalar", "scalar_value": leaf})
         else:
             raise RuntimeError(
                 f"Returning {type(leaf).__name__} values from a Helion kernel "
-                f"is not supported with torch.compile fusion."
+                f"is not supported with torch.compile."
             )
 
     # Remap helion-internal SymInts back to the caller's values.
@@ -196,18 +203,29 @@ def infer_output_spec(
                     and fake_s.node.shape_env is helion_shape_env
                 ):
                     sym_remap[fake_s.node.expr] = orig_s
-        elif isinstance(fake_val, torch.SymInt):
+        elif isinstance(fake_val, _SYM_SCALAR_TYPES):
             if fake_val.node.shape_env is helion_shape_env:
                 sym_remap[fake_val.node.expr] = orig_val
 
     def _remap_or_resolve(val: object) -> object:
-        if isinstance(val, torch.SymInt) and val.node.shape_env is helion_shape_env:
-            mapped = sym_remap.get(val.node.expr)
+        if (
+            isinstance(val, _SYM_SCALAR_TYPES)
+            and val.node.shape_env is helion_shape_env
+        ):
+            expr = val.node.expr
+            mapped = sym_remap.get(expr)
             if mapped is not None:
                 return mapped
-            return int(  # pyrefly: ignore[no-matching-overload]
-                helion_shape_env.size_hint(val.node.expr)
-            )
+            # For compound expressions like `flag * 2` (= 2*u0), reject
+            # only if some unbacked symbol is NOT an input arg to the Helion kernel
+            # (i.e. was produced by a data-dependent op like `.item()`).
+            unbacked = free_unbacked_symbols(expr)
+            if unbacked and not unbacked.issubset(sym_remap.keys()):
+                assert return_value is not None
+                raise exc.DataDependentOutputShapeNotSupported(
+                    op_desc=f"`{ast.unparse(return_value)}`"
+                )
+            return shape_env_size_hint(helion_shape_env, expr)
         return val
 
     for spec in leaf_specs:
@@ -216,7 +234,7 @@ def infer_output_spec(
             spec["stride"] = [_remap_or_resolve(s) for s in spec["stride"]]
         elif spec["type"] == "scalar":
             sv = spec.get("scalar_value")
-            if isinstance(sv, torch.SymInt):
+            if isinstance(sv, _SYM_SCALAR_TYPES):
                 spec["scalar_value"] = _remap_or_resolve(sv)
 
     mutated = _detect_mutated_inputs(
@@ -235,7 +253,7 @@ def infer_output_spec(
         for shared_names in storage_to_names.values():
             if len(shared_names) > 1:
                 raise RuntimeError(
-                    f"torch.compile fusion does not support multiple mutated arguments "
+                    f"torch.compile does not support multiple mutated arguments "
                     f"that share storage ({', '.join(shared_names)}) in a Helion kernel"
                 )
 
@@ -396,18 +414,17 @@ def register_dynamo_variable() -> None:
     """Register HelionKernelVariable with Dynamo's VariableBuilder."""
 
     def wrap_helion_kernel(self: VariableBuilder, value: Kernel) -> VariableTracker:
-        if os.environ.get("_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION", "0") == "1":
-            if not requires_torch_version("2.11"):
+        if not supports_torch_compile_fusion():
+            if value.settings.torch_compile_fusion:
                 raise RuntimeError(
-                    "Helion kernel torch.compile fusion requires "
-                    "PyTorch >= 2.11. Please upgrade PyTorch or unset "
-                    "_WIP_DEV_ONLY_HELION_TORCH_COMPILE_FUSION environment variable."
+                    "torch_compile_fusion=True requires PyTorch nightly build. "
+                    "Please upgrade PyTorch or disable torch_compile_fusion."
                 )
-            # Import template_buffer to register the HOP's Inductor lowering
-            from helion._compiler._inductor import template_buffer  # noqa: F401
+            return self.wrap_user_defined(value)
+        # Import template_buffer to register the HOP's Inductor lowering
+        from helion._compiler._inductor import template_buffer  # noqa: F401
 
-            self.install_guards(GuardBuilder.ID_MATCH)
-            return HelionKernelVariable(value, None, source=self.source)
-        return self.wrap_user_defined(value)
+        self.install_guards(GuardBuilder.ID_MATCH)
+        return HelionKernelVariable(value, None, source=self.source)
 
     VariableBuilder._type_dispatch()[Kernel] = wrap_helion_kernel

@@ -8,6 +8,7 @@ $ python benchmarks/run.py [tritonbench args...] [--kernel <kernel_name(s)>]
 Example usage:
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add  # Runs vector_add kernel
 $ python benchmarks/run.py --metrics speedup,accuracy --kernel vector_add,rms_norm  # Runs multiple kernels
+$ python benchmarks/run.py --helion-backend cute --metrics speedup,accuracy --kernel gemm  # Runs using the CuTe backend
 $ python benchmarks/run.py --metrics speedup,accuracy  # Runs all kernels
 
 # On GPU-1, run first 1/4 of inputs for all kernels and save results to CSV in the current directory
@@ -22,8 +23,9 @@ from __future__ import annotations
 import argparse
 import collections
 from contextlib import suppress
+import csv
 import dataclasses
-import functools
+import datetime
 import gc
 import importlib.util
 import json
@@ -35,18 +37,31 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
 
+from tabulate import tabulate
 import torch
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
 
+from helion._compat import get_device_name
+from helion._compile_time import enable as enable_compile_time
+from helion._compile_time import get_total_time as get_compile_total_time
+from helion._compile_time import reset as reset_compile_time
+from helion._compiler.backend_registry import list_backends
 from helion._testing import get_nvidia_gpu_model
 from helion._utils import counters
+from helion.autotuner.metrics import AutotuneMetrics
+from helion.autotuner.metrics import register_post_autotune_hook
+from helion.runtime.settings import _get_backend
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 StrPath = str | os.PathLike[str]
 
@@ -86,6 +101,24 @@ def log_tensor_metadata(args: tuple[object, ...], kwargs: dict[str, object]) -> 
 
 # Maximum number of inputs to use
 MAX_NUM_INPUTS = 20
+MAMBA2_LARGE_SHAPE = (64, 64, 1, 8192, 256, 64, 128)
+MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES = 100 * 1024**3
+
+# These patches mutate TritonBench operator classes, so remember patched classes
+# to avoid wrapping the same methods more than once in a long benchmark process.
+_PATCHED_MAMBA_OPERATOR_CLASSES: set[type[Any]] = set()
+_PATCHED_ROPE_OPERATOR_CLASSES: set[type[Any]] = set()
+_PATCHED_GDN_OPERATOR_CLASSES: set[type[Any]] = set()
+
+_RopeInput = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
 
 
 @dataclasses.dataclass
@@ -94,6 +127,191 @@ class RunResult:
     device: str
     shape: list[str]
     metrics: dict[str, list[float]]
+
+
+def _mamba_valid_dA_cumsum_like(dt: torch.Tensor) -> torch.Tensor:
+    # TritonBench PR #567 generates arbitrary random dA_cumsum values for the
+    # Mamba2 operators, but mamba_ssm's optimized Triton kernels assume the real
+    # Mamba invariant: dA_cumsum is cumulative negative decay, so it is
+    # non-increasing within each chunk. Patch the pinned benchmark inputs here so
+    # the handwritten baseline is compared on valid Mamba data.
+    return torch.cumsum(-torch.rand_like(dt), dim=-1)
+
+
+def patch_mamba2_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> None:
+    if operator_name not in {"mamba2_chunk_scan", "mamba2_chunk_state"}:
+        return
+    if Operator in _PATCHED_MAMBA_OPERATOR_CLASSES:
+        return
+
+    original_get_input_iter = Operator.get_input_iter
+
+    def get_input_iter(self: object) -> Iterator[tuple[object, ...]]:
+        for example_inputs in original_get_input_iter(self):
+            if operator_name == "mamba2_chunk_scan":
+                cb, x, dt, _dA_cumsum, C, prev_states, D = example_inputs
+                shape = (
+                    x.shape[0],
+                    x.shape[2],
+                    C.shape[2],
+                    x.shape[1],
+                    dt.shape[3],
+                    x.shape[3],
+                    C.shape[3],
+                )
+                if shape == MAMBA2_LARGE_SHAPE and x.device.type == "cuda":
+                    free_memory, _ = torch.cuda.mem_get_info(x.device)
+                    # Accuracy checks run TritonBench's eager baseline, which
+                    # expands cb across heads and OOMs below this free-memory level.
+                    if free_memory < MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES:
+                        continue
+                dt = torch.rand_like(dt)
+                dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
+                yield cb, x, dt, dA_cumsum, C, prev_states, D
+            else:
+                B, x, dt, _dA_cumsum = example_inputs
+                shape = (
+                    x.shape[0],
+                    x.shape[2],
+                    B.shape[2],
+                    x.shape[1],
+                    dt.shape[3],
+                    x.shape[3],
+                    B.shape[3],
+                )
+                if shape == MAMBA2_LARGE_SHAPE and x.device.type == "cuda":
+                    free_memory, _ = torch.cuda.mem_get_info(x.device)
+                    # Helion autotune for this shape consistently fails on H100
+                    # (~80 GB) after the 5 prior shapes have left behind cached
+                    # buffers and JIT state, even though the kernel + autotune
+                    # work on a freshly-cleared GPU. Gate on free memory so the
+                    # shape still runs on devices with >100 GB free (e.g. B200).
+                    if free_memory < MAMBA2_LARGE_SHAPE_MIN_FREE_MEMORY_BYTES:
+                        continue
+                dA_cumsum = _mamba_valid_dA_cumsum_like(dt)
+                yield B, x, dt, dA_cumsum
+
+    Operator.get_input_iter = get_input_iter
+    _PATCHED_MAMBA_OPERATOR_CLASSES.add(Operator)
+
+
+def patch_rope_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> None:
+    if operator_name != "rope":
+        return
+    if Operator in _PATCHED_ROPE_OPERATOR_CLASSES:
+        return
+
+    input_cache: dict[tuple[str, torch.dtype, int, int, int, int], _RopeInput] = {}
+    operator_module = cast("Any", sys.modules[Operator.__module__])
+    original_rotary_embedding = operator_module.LlamaRotaryEmbedding
+    original_prepare_input = Operator.prepare_input
+
+    def llama_rotary_embedding(*args: object, **kwargs: object) -> torch.nn.Module:
+        # pyrefly: ignore [missing-import]
+        from transformers.models.llama.configuration_llama import LlamaConfig
+
+        if args and isinstance(args[0], LlamaConfig):
+            kwargs["config"] = args[0]
+            args = args[1:]
+        return original_rotary_embedding(*args, **kwargs)
+
+    def prepare_input(
+        self: object, hidden_size: int, seq_length: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # TritonBench's RoPE operator creates fresh random inputs inside each
+        # implementation method. Cache per-shape inputs so accuracy compares all
+        # implementations against the baseline using the same q/k/cos/sin tensors.
+        key = (
+            str(self.device),  # pyrefly: ignore [missing-attribute]
+            self.dtype,  # pyrefly: ignore [missing-attribute]
+            self.num_q_heads,  # pyrefly: ignore [missing-attribute]
+            self.num_kv_heads,  # pyrefly: ignore [missing-attribute]
+            hidden_size,
+            seq_length,
+        )
+        if key not in input_cache:
+            q, k, cos, sin, pos_ids = original_prepare_input(
+                self, hidden_size, seq_length
+            )
+            q.retain_grad()
+            k.retain_grad()
+            input_cache[key] = (
+                q,
+                k,
+                cos,
+                sin,
+                pos_ids,
+                self.dq,  # pyrefly: ignore [missing-attribute]
+                self.dk,  # pyrefly: ignore [missing-attribute]
+            )
+
+        q, k, cos, sin, pos_ids, dq, dk = input_cache[key]
+        self.q = q  # pyrefly: ignore [missing-attribute]
+        self.k = k  # pyrefly: ignore [missing-attribute]
+        self.dq = dq  # pyrefly: ignore [missing-attribute]
+        self.dk = dk  # pyrefly: ignore [missing-attribute]
+        return q, k, cos, sin, pos_ids
+
+    def get_bwd_fn(
+        self: object, fwd_fn: Callable[[], object]
+    ) -> Callable[[], list[torch.Tensor]]:
+        q = self.q  # pyrefly: ignore [missing-attribute]
+        k = self.k  # pyrefly: ignore [missing-attribute]
+        dq = self.dq  # pyrefly: ignore [missing-attribute]
+        dk = self.dk  # pyrefly: ignore [missing-attribute]
+        state: dict[str, object] = {}
+
+        def bwd_fn() -> list[torch.Tensor]:
+            if q.grad is not None:
+                q.grad = None
+            if k.grad is not None:
+                k.grad = None
+            if "outputs" not in state:
+                state["outputs"] = fwd_fn()
+            outputs = cast("tuple[torch.Tensor, torch.Tensor]", state["outputs"])
+            torch.autograd.backward(outputs, (dq, dk), retain_graph=True)
+            return [q, k]
+
+        return bwd_fn
+
+    operator_module.LlamaRotaryEmbedding = llama_rotary_embedding
+    Operator.prepare_input = prepare_input
+    Operator.get_bwd_fn = get_bwd_fn
+    _PATCHED_ROPE_OPERATOR_CLASSES.add(Operator)
+
+
+def patch_gdn_tritonbench_accuracy(operator_name: str, Operator: type[Any]) -> None:
+    if operator_name != "gdn_fwd_h":
+        return
+    if Operator in _PATCHED_GDN_OPERATOR_CLASSES:
+        return
+
+    def accuracy(
+        self: object,
+        fn: Callable[[], torch.Tensor],
+        baseline_fn: Callable[[], torch.Tensor],
+    ) -> bool:
+        output = fn()
+        baseline_output = baseline_fn()
+
+        if torch.isnan(output).any():
+            return False
+
+        # bf16 reduction order vs the eager fp32 baseline drifts in this
+        # dot-heavy kernel. TritonBench's own GDN accuracy path used the
+        # smaller bf16 tolerance; batch>=16 needs the wider dashboard tolerance
+        # because the 16x longer accumulations drift further.
+        if output.shape[0] >= 16:
+            return torch.allclose(output, baseline_output, rtol=0.5, atol=2.0)
+        return torch.allclose(output, baseline_output, rtol=0.1, atol=0.3)
+
+    Operator.accuracy = accuracy
+    _PATCHED_GDN_OPERATOR_CLASSES.add(Operator)
+
+
+def helion_benchmark_method_name(func_name: str) -> str:
+    prefix = "helion_"
+    return func_name if func_name.startswith(prefix) else f"{prefix}{func_name}"
 
 
 # Maps tritonbench op names to Helion kernel examples
@@ -174,6 +392,22 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "rms_norm_tritonbench",
         {
             "num_inputs": 5,  # rms_norm-bwd has 6 inputs total but last input raises Triton OOM at default config: https://github.com/pytorch/helion/issues/711
+            "remove_flags": ["--cudagraph"],
+        },
+    ),
+    "rope": (
+        "tritonbench.operators.rope.operator",
+        "examples.rope",
+        "rope_tritonbench",
+    ),
+    "rope-bwd": (
+        "tritonbench.operators.rope.operator",
+        "examples.rope",
+        "rope_tritonbench",
+        {
+            # tritonbench's torch_compile rope-bwd recompiles during CUDA graph
+            # capture, causing "Offset increment outside graph capture" errors.
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "sum": ("tritonbench.operators.sum.operator", "examples.sum", "sum_tritonbench"),
@@ -235,6 +469,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "layer_norm_tritonbench",
         {
             "num_inputs": 10,  # layer_norm-bwd takes long time on Benchmark CI, so use fewer inputs instead.
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "jagged_softmax": (
@@ -248,6 +483,9 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "grouped_gemm_jagged_persistent_tritonbench",
         {
             "num_inputs": 6,  # grouped_gemm takes long time on Benchmark CI, so use fewer inputs instead.
+            # tritonbench's torch_compile_grouped_gemm recompiles during CUDA graph
+            # capture, causing "Offset increment outside graph capture" errors.
+            "remove_flags": ["--cudagraph"],
         },
     ),
     "fused_linear_jsd": (
@@ -339,6 +577,11 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {
         "tritonbench.operators.gdn_fwd_h.operator",
         "examples.gdn_fwd_h",
         "helion_gdn_fwd_h_tb",
+        {
+            # GDN is dot-heavy; compare all implementations against PyTorch's
+            # high-throughput CUDA matmul precision instead of strict fp32 einsums.
+            "precision": "tf32",
+        },
     ),
     "flex_attention": (
         "tritonbench.operators.flex_attention.operator",
@@ -357,6 +600,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_add-accuracy": "torch_compile_accuracy",
         "helion_add-speedup": "helion_speedup",
         "helion_add-accuracy": "helion_accuracy",
+        "helion_add-latency": "helion_latency_ms",
     },
     "vector_exp": {
         "torch_exp": "baseline",
@@ -366,6 +610,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_exp-accuracy": "torch_compile_accuracy",
         "helion_exp_tritonbench-speedup": "helion_speedup",
         "helion_exp_tritonbench-accuracy": "helion_accuracy",
+        "helion_exp_tritonbench-latency": "helion_latency_ms",
     },
     "sum": {
         "torch_sum": "baseline",
@@ -375,6 +620,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_sum-accuracy": "torch_compile_accuracy",
         "helion_sum_tritonbench-speedup": "helion_speedup",
         "helion_sum_tritonbench-accuracy": "helion_accuracy",
+        "helion_sum_tritonbench-latency": "helion_latency_ms",
     },
     "layer_norm": {
         "torch_layer_norm": "baseline",
@@ -384,6 +630,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
         "helion_layer_norm_tritonbench-speedup": "helion_speedup",
         "helion_layer_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_layer_norm_tritonbench-latency": "helion_latency_ms",
     },
     "layer_norm-bwd": {
         "torch_layer_norm": "baseline",
@@ -393,6 +640,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
         "helion_layer_norm_tritonbench-speedup": "helion_speedup",
         "helion_layer_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_layer_norm_tritonbench-latency": "helion_latency_ms",
     },
     "softmax": {
         "naive_softmax": "baseline",
@@ -402,6 +650,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_softmax-accuracy": "torch_compile_accuracy",
         "helion_softmax_tritonbench-speedup": "helion_speedup",
         "helion_softmax_tritonbench-accuracy": "helion_accuracy",
+        "helion_softmax_tritonbench-latency": "helion_latency_ms",
     },
     "softmax-bwd": {
         "naive_softmax": "baseline",
@@ -411,6 +660,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_softmax-accuracy": "torch_compile_accuracy",
         "helion_softmax_tritonbench-speedup": "helion_speedup",
         "helion_softmax_tritonbench-accuracy": "helion_accuracy",
+        "helion_softmax_tritonbench-latency": "helion_latency_ms",
     },
     "rms_norm": {
         "llama_rms": "baseline",
@@ -420,6 +670,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_rms-accuracy": "torch_compile_accuracy",
         "helion_rms_norm_tritonbench-speedup": "helion_speedup",
         "helion_rms_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_rms_norm_tritonbench-latency": "helion_latency_ms",
     },
     "rms_norm-bwd": {
         "llama_rms": "baseline",
@@ -429,6 +680,27 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_rms-accuracy": "torch_compile_accuracy",
         "helion_rms_norm_tritonbench-speedup": "helion_speedup",
         "helion_rms_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_rms_norm_tritonbench-latency": "helion_latency_ms",
+    },
+    "rope": {
+        "apply_rotary_pos_emb": "baseline",
+        "liger_rotary_pos_emb-speedup": "triton_speedup",
+        "liger_rotary_pos_emb-accuracy": "triton_accuracy",
+        "torch_compile_rotary_pos_emb_full_op-speedup": "torch_compile_speedup",
+        "torch_compile_rotary_pos_emb_full_op-accuracy": "torch_compile_accuracy",
+        "helion_rope_tritonbench-speedup": "helion_speedup",
+        "helion_rope_tritonbench-accuracy": "helion_accuracy",
+        "helion_rope_tritonbench-latency": "helion_latency_ms",
+    },
+    "rope-bwd": {
+        "apply_rotary_pos_emb": "baseline",
+        "liger_rotary_pos_emb-speedup": "triton_speedup",
+        "liger_rotary_pos_emb-accuracy": "triton_accuracy",
+        "torch_compile_rotary_pos_emb_full_op-speedup": "torch_compile_speedup",
+        "torch_compile_rotary_pos_emb_full_op-accuracy": "torch_compile_accuracy",
+        "helion_rope_tritonbench-speedup": "helion_speedup",
+        "helion_rope_tritonbench-accuracy": "helion_accuracy",
+        "helion_rope_tritonbench-latency": "helion_latency_ms",
     },
     "cross_entropy": {
         "cross_entropy_loss": "baseline",
@@ -438,6 +710,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_cross_entropy_loss-accuracy": "torch_compile_accuracy",
         "helion_cross_entropy-speedup": "helion_speedup",
         "helion_cross_entropy-accuracy": "helion_accuracy",
+        "helion_cross_entropy-latency": "helion_latency_ms",
     },
     "geglu": {
         "torch_geglu": "baseline",
@@ -447,6 +720,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_geglu-accuracy": "torch_compile_accuracy",
         "helion_geglu_tritonbench-speedup": "helion_speedup",
         "helion_geglu_tritonbench-accuracy": "helion_accuracy",
+        "helion_geglu_tritonbench-latency": "helion_latency_ms",
     },
     "swiglu": {
         "torch_swiglu": "baseline",
@@ -456,6 +730,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_swiglu-accuracy": "torch_compile_accuracy",
         "helion_swiglu_tritonbench-speedup": "helion_speedup",
         "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
+        "helion_swiglu_tritonbench-latency": "helion_latency_ms",
     },
     "swiglu-bwd": {
         "torch_swiglu": "baseline",
@@ -465,6 +740,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_swiglu-accuracy": "torch_compile_accuracy",
         "helion_swiglu_tritonbench-speedup": "helion_speedup",
         "helion_swiglu_tritonbench-accuracy": "helion_accuracy",
+        "helion_swiglu_tritonbench-latency": "helion_latency_ms",
     },
     "jsd": {
         "torch_jsd": "baseline",
@@ -474,6 +750,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_jsd-accuracy": "torch_compile_accuracy",
         "helion_jsd_tritonbench-speedup": "helion_speedup",
         "helion_jsd_tritonbench-accuracy": "helion_accuracy",
+        "helion_jsd_tritonbench-latency": "helion_latency_ms",
     },
     "welford": {
         "eager_layer_norm": "baseline",
@@ -483,6 +760,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_welford-accuracy": "torch_compile_accuracy",
         "helion_welford-speedup": "helion_speedup",
         "helion_welford-accuracy": "helion_accuracy",
+        "helion_welford-latency": "helion_latency_ms",
     },
     "kl_div": {
         "torch_kl_div": "baseline",
@@ -492,6 +770,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_kl_div-accuracy": "torch_compile_accuracy",
         "helion_kl_div_tritonbench-speedup": "helion_speedup",
         "helion_kl_div_tritonbench-accuracy": "helion_accuracy",
+        "helion_kl_div_tritonbench-latency": "helion_latency_ms",
     },
     "gather_gemv": {
         "eager_gather_gemv": "baseline",
@@ -501,6 +780,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_gather_gemv-accuracy": "torch_compile_accuracy",
         "helion_gather_gemv_tritonbench-speedup": "helion_speedup",
         "helion_gather_gemv_tritonbench-accuracy": "helion_accuracy",
+        "helion_gather_gemv_tritonbench-latency": "helion_latency_ms",
     },
     "int4_gemm": {
         "preprocessed_eager_int4_gemm": "baseline",
@@ -510,6 +790,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "preprocessed_torch_compile_int4_gemm-accuracy": "torch_compile_accuracy",
         "helion_int4_gemm_tritonbench-speedup": "helion_speedup",
         "helion_int4_gemm_tritonbench-accuracy": "helion_accuracy",
+        "helion_int4_gemm_tritonbench-latency": "helion_latency_ms",
     },
     "grouped_gemm": {
         "aten_grouped_mm": "baseline",
@@ -519,12 +800,14 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_grouped_gemm-accuracy": "torch_compile_accuracy",
         "helion_grouped_gemm_jagged_persistent_tritonbench-speedup": "helion_speedup",
         "helion_grouped_gemm_jagged_persistent_tritonbench-accuracy": "helion_accuracy",
+        "helion_grouped_gemm_jagged_persistent_tritonbench-latency": "helion_latency_ms",
     },
     "jagged_layer_norm": {
         "torch_compile_nested_tensor_integration-speedup": "torch_compile_speedup",
         "torch_compile_nested_tensor_integration-accuracy": "torch_compile_accuracy",
         "helion_jagged_layer_norm_tritonbench-speedup": "helion_speedup",
         "helion_jagged_layer_norm_tritonbench-accuracy": "helion_accuracy",
+        "helion_jagged_layer_norm_tritonbench-latency": "helion_latency_ms",
     },
     "jagged_sum": {
         "triton_jagged_sum_no_pad_simple_fused-speedup": "triton_speedup",
@@ -533,6 +816,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_nested_tensor_integration-accuracy": "torch_compile_accuracy",
         "helion_jagged_sum_tritonbench-speedup": "helion_speedup",
         "helion_jagged_sum_tritonbench-accuracy": "helion_accuracy",
+        "helion_jagged_sum_tritonbench-latency": "helion_latency_ms",
     },
     "addmm": {
         "aten_addmm": "baseline",
@@ -542,6 +826,17 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "pt2_addmm_maxautotune-accuracy": "torch_compile_accuracy",
         "helion_addmm_tritonbench-speedup": "helion_speedup",
         "helion_addmm_tritonbench-accuracy": "helion_accuracy",
+        "helion_addmm_tritonbench-latency": "helion_latency_ms",
+    },
+    "addmm-bwd": {
+        "aten_addmm": "baseline",
+        "triton_addmm-speedup": "triton_speedup",
+        "triton_addmm-accuracy": "triton_accuracy",
+        "pt2_addmm_maxautotune-speedup": "torch_compile_speedup",
+        "pt2_addmm_maxautotune-accuracy": "torch_compile_accuracy",
+        "helion_addmm_tritonbench-speedup": "helion_speedup",
+        "helion_addmm_tritonbench-accuracy": "helion_accuracy",
+        "helion_addmm_tritonbench-latency": "helion_latency_ms",
     },
     # "ragged_attention": {
     #     "triton_ragged_attention-speedup": "triton_speedup",
@@ -559,6 +854,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_embedding-accuracy": "torch_compile_accuracy",
         "helion_embedding_tritonbench-speedup": "helion_speedup",
         "helion_embedding_tritonbench-accuracy": "helion_accuracy",
+        "helion_embedding_tritonbench-latency": "helion_latency_ms",
     },
     "jagged_mean": {
         "torch_jagged_mean_torch_sum": "baseline",
@@ -568,15 +864,17 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_jagged_mean_torch_sum-accuracy": "torch_compile_accuracy",
         "helion_jagged_mean_tritonbench-speedup": "helion_speedup",
         "helion_jagged_mean_tritonbench-accuracy": "helion_accuracy",
+        "helion_jagged_mean_tritonbench-latency": "helion_latency_ms",
     },
     "flash_attention": {
-        "aten": "baseline",
+        "sdpa": "baseline",
         "triton_tutorial_flash_v2_tma_ws_persistent-speedup": "triton_speedup",
         "triton_tutorial_flash_v2_tma_ws_persistent-accuracy": "triton_accuracy",
         "flex_attention-speedup": "torch_compile_speedup",
         "flex_attention-accuracy": "torch_compile_accuracy",
         "helion_attention-speedup": "helion_speedup",
         "helion_attention-accuracy": "helion_accuracy",
+        "helion_attention-latency": "helion_latency_ms",
     },
     "fp8_attention": {
         "triton_flash_v2": "baseline",
@@ -584,6 +882,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "triton_flash_v2_ws-accuracy": "triton_accuracy",
         "helion_fp8_attention_tritonbench-speedup": "helion_speedup",
         "helion_fp8_attention_tritonbench-accuracy": "helion_accuracy",
+        "helion_fp8_attention_tritonbench-latency": "helion_latency_ms",
     },
     "jagged_softmax": {
         "torch_jagged_softmax_torch_sum": "baseline",
@@ -593,6 +892,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_jagged_softmax_torch_sum-accuracy": "torch_compile_accuracy",
         "helion_jagged_softmax_tritonbench-speedup": "helion_speedup",
         "helion_jagged_softmax_tritonbench-accuracy": "helion_accuracy",
+        "helion_jagged_softmax_tritonbench-latency": "helion_latency_ms",
     },
     "fused_linear_jsd": {
         "torch_lm_head_jsd": "baseline",
@@ -602,6 +902,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_fused_linear_jsd-accuracy": "torch_compile_accuracy",
         "helion_fused_linear_jsd_fwd_tritonbench-speedup": "helion_speedup",
         "helion_fused_linear_jsd_fwd_tritonbench-accuracy": "helion_accuracy",
+        "helion_fused_linear_jsd_fwd_tritonbench-latency": "helion_latency_ms",
     },
     "gemm": {
         "aten_matmul": "baseline",
@@ -611,6 +912,17 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
         "helion_matmul_tritonbench-speedup": "helion_speedup",
         "helion_matmul_tritonbench-accuracy": "helion_accuracy",
+        "helion_matmul_tritonbench-latency": "helion_latency_ms",
+    },
+    "gemm-bwd": {
+        "aten_matmul": "baseline",
+        "triton_tutorial_matmul-speedup": "triton_speedup",
+        "triton_tutorial_matmul-accuracy": "triton_accuracy",
+        "pt2_triton_matmul-speedup": "torch_compile_speedup",
+        "pt2_triton_matmul-accuracy": "torch_compile_accuracy",
+        "helion_matmul_tritonbench-speedup": "helion_speedup",
+        "helion_matmul_tritonbench-accuracy": "helion_accuracy",
+        "helion_matmul_tritonbench-latency": "helion_latency_ms",
     },
     "fp8_gemm": {
         "torch_fp8_gemm": "baseline",
@@ -620,6 +932,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         f"{'blackwell_pt2' if IS_B200 else 'pt2'}_fp8_gemm-accuracy": "torch_compile_accuracy",
         "helion_fp8_gemm_tritonbench-speedup": "helion_speedup",
         "helion_fp8_gemm_tritonbench-accuracy": "helion_accuracy",
+        "helion_fp8_gemm_tritonbench-latency": "helion_latency_ms",
     },
     "low_mem_dropout": {
         "seeded_dropout-accuracy": "triton_accuracy",
@@ -628,6 +941,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_dropout-speedup": "torch_compile_speedup",
         "helion_low_mem_dropout_tritonbench-accuracy": "helion_accuracy",
         "helion_low_mem_dropout_tritonbench-speedup": "helion_speedup",
+        "helion_low_mem_dropout_tritonbench-latency": "helion_latency_ms",
     },
     "bf16xint16_gemm": {
         "bf16xbf16": "baseline",
@@ -637,6 +951,7 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "torch_compile_bf16xbf16-accuracy": "torch_compile_accuracy",
         "helion_bf16xint16_gemm_tritonbench-speedup": "helion_speedup",
         "helion_bf16xint16_gemm_tritonbench-accuracy": "helion_accuracy",
+        "helion_bf16xint16_gemm_tritonbench-latency": "helion_latency_ms",
     },
     "blackwell_attentions": {
         "aten": "baseline",
@@ -646,27 +961,38 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "flex_attention-accuracy": "torch_compile_accuracy",
         "helion_blackwell_attention_tritonbench-speedup": "helion_speedup",
         "helion_blackwell_attention_tritonbench-accuracy": "helion_accuracy",
+        "helion_blackwell_attention_tritonbench-latency": "helion_latency_ms",
     },
     "mamba2_chunk_scan": {
         "eager": "baseline",
-        "compile_speedup": "torch_compile_speedup",
-        "compile_accuracy": "torch_compile_accuracy",
-        "helion_mamba2_chunk_scan_kernel_speedup": "helion_speedup",
-        "helion_mamba2_chunk_scan_kernel_accuracy": "helion_accuracy",
+        "mamba_ssm-speedup": "triton_speedup",
+        "mamba_ssm-accuracy": "triton_accuracy",
+        "mamba_ssm-latency": "triton_latency_ms",
+        "compile-speedup": "torch_compile_speedup",
+        "compile-accuracy": "torch_compile_accuracy",
+        "helion_mamba2_chunk_scan_kernel-speedup": "helion_speedup",
+        "helion_mamba2_chunk_scan_kernel-accuracy": "helion_accuracy",
+        "helion_mamba2_chunk_scan_kernel-latency": "helion_latency_ms",
     },
     "mamba2_chunk_state": {
         "eager": "baseline",
-        "compile_speedup": "torch_compile_speedup",
-        "compile_accuracy": "torch_compile_accuracy",
-        "helion_mamba2_chunk_state_kernel_speedup": "helion_speedup",
-        "helion_mamba2_chunk_state_kernel_accuracy": "helion_accuracy",
+        "mamba_ssm-speedup": "triton_speedup",
+        "mamba_ssm-accuracy": "triton_accuracy",
+        "mamba_ssm-latency": "triton_latency_ms",
+        "compile-speedup": "torch_compile_speedup",
+        "compile-accuracy": "torch_compile_accuracy",
+        "helion_mamba2_chunk_state_kernel-speedup": "helion_speedup",
+        "helion_mamba2_chunk_state_kernel-accuracy": "helion_accuracy",
+        "helion_mamba2_chunk_state_kernel-latency": "helion_latency_ms",
     },
     "gdn_fwd_h": {
         "eager": "baseline",
-        "compile_speedup": "torch_compile_speedup",
-        "compile_accuracy": "torch_compile_accuracy",
-        "helion_gdn_fwd_h_speedup": "helion_speedup",
-        "helion_gdn_fwd_h_accuracy": "helion_accuracy",
+        "fla-speedup": "triton_speedup",
+        "fla-accuracy": "triton_accuracy",
+        "fla-latency": "triton_latency_ms",
+        "helion_gdn_fwd_h_tb-speedup": "helion_speedup",
+        "helion_gdn_fwd_h_tb-accuracy": "helion_accuracy",
+        "helion_gdn_fwd_h_tb-latency": "helion_latency_ms",
     },
 }
 
@@ -997,6 +1323,7 @@ def run_kernel(
     results: list[RunResult],
     kernel_mappings: dict[str, tuple[str, ...]] | None = None,
     kernel_metric_mappings: dict[str, dict[str, str]] | None = None,
+    measure_compile_time: bool = False,
 ) -> None:
     """Run a kernel benchmark, handling both single and multiple variants."""
     # Use provided mappings or default to global mappings
@@ -1055,6 +1382,7 @@ def run_kernel(
         operator_args,
         results,
         active_metrics,
+        measure_compile_time=measure_compile_time,
     )
 
 
@@ -1067,6 +1395,7 @@ def run_kernel_variants(
     operator_args: dict[str, Any] | None,
     results: list[RunResult],
     kernel_metric_mappings: dict[str, dict[str, str]] | None = None,
+    measure_compile_time: bool = False,
 ) -> None:
     """Run kernel variants in the same benchmark run."""
 
@@ -1095,8 +1424,17 @@ def run_kernel_variants(
 
     # Add operator-specific default args if provided
     if operator_args:
+        # Remove flags that are incompatible with this operator
+        remove_flags = operator_args.get("remove_flags", [])
+        if remove_flags:
+            tritonbench_args = [
+                arg for arg in tritonbench_args if arg not in remove_flags
+            ]
+
         operator_custom_args_applied = {}
         for arg_name, arg_value in operator_args.items():
+            if arg_name == "remove_flags":
+                continue
             arg_flag = f"--{arg_name.replace('_', '-')}"
             # Only apply if not already specified on command line
             already_specified = any(
@@ -1135,6 +1473,9 @@ def run_kernel_variants(
     try:
         operator_module = importlib.import_module(tritonbench_module)
         Operator = operator_module.Operator
+        patch_rope_tritonbench_inputs(operator_name, Operator)
+        patch_mamba2_tritonbench_inputs(operator_name, Operator)
+        patch_gdn_tritonbench_accuracy(operator_name, Operator)
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
@@ -1147,6 +1488,9 @@ def run_kernel_variants(
     # Import register_benchmark API
     # pyrefly: ignore [missing-import]
     from tritonbench.utils.triton_op import register_benchmark
+
+    # Compile time tracking per variant
+    variant_compile_times: dict[str, list[float]] = {}
 
     # Register all variants as separate methods
     for module_path, func_name in variants:
@@ -1172,6 +1516,7 @@ def run_kernel_variants(
         def create_helion_method(
             mod: Any,  # noqa: ANN401
             kfunc: Callable[..., Any],
+            compile_time_list: list[float] | None = None,
         ) -> Callable[..., Any]:
             def helion_method(
                 self: object,
@@ -1193,6 +1538,9 @@ def run_kernel_variants(
                     attr = getattr(mod, attr_name)
                     if isinstance(attr, Kernel):
                         attr.reset()
+                        if attr.settings.autotune_cache == "AOTAutotuneCache":
+                            attr.settings.force_autotune = False
+                            continue
                         # Force autotuning unless HELION_AUTOTUNE_EFFORT=none is set
                         # This ensures we run autotuning even if the kernel has pre-specified configs
                         if os.environ.get("HELION_AUTOTUNE_EFFORT", "") != "none":
@@ -1203,20 +1551,56 @@ def run_kernel_variants(
 
                 if isinstance(kfunc, Kernel):
                     # Helion kernel - we call it in a lambda to delay execution until measurement
-                    measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
+                    if operator_name == "flash_attention":
+                        # examples.attention.attention returns (out, lse); the
+                        # tritonbench flash_attention operator only compares the
+                        # output tensor, so unwrap it before wrapping in a list.
+                        measured_func_callable = lambda: [  # noqa: E731
+                            kfunc(*args, **kwargs)[0]
+                        ]
+                    else:
+                        measured_func_callable = lambda: kfunc(*args, **kwargs)  # noqa: E731
                 else:
                     # tritonbench integration wrapper - pass tritonbench operator instance as first argument
                     # The wrapper must return a callable that does the actual computation, for delayed execution
                     measured_func_callable = kfunc(self, *args, **kwargs)
 
                 assert callable(measured_func_callable)
+
+                if compile_time_list is not None:
+                    original = measured_func_callable
+                    first_call = True
+                    ct_list = compile_time_list
+
+                    def timed_callable() -> object:
+                        nonlocal first_call
+                        if first_call:
+                            first_call = False
+                            torch.cuda.synchronize()
+                            reset_compile_time()
+                            try:
+                                result = original()
+                            except Exception:
+                                ct_list.append(get_compile_total_time())
+                                raise
+                            ct_list.append(get_compile_total_time())
+                            return result
+                        return original()
+
+                    return timed_callable
+
                 return measured_func_callable
 
             return helion_method
 
         # Method name for the benchmark
-        variant_name = func_name
-        helion_method_name = f"helion_{variant_name}"
+        helion_method_name = helion_benchmark_method_name(func_name)
+
+        # Set up compile time tracking for this variant
+        compile_times: list[float] | None = None
+        if measure_compile_time:
+            compile_times = []
+            variant_compile_times[func_name] = compile_times
 
         # Use register_benchmark decorator
         decorated_method = register_benchmark(
@@ -1226,7 +1610,7 @@ def run_kernel_variants(
             enabled=True,
             fwd_only=False,
             label=helion_method_name,
-        )(create_helion_method(module, kernel_func))
+        )(create_helion_method(module, kernel_func, compile_times))
 
         # Set the decorated method on the Operator class
         setattr(Operator, helion_method_name, decorated_method)
@@ -1315,29 +1699,43 @@ def run_kernel_variants(
         except Exception:
             logger.exception("failed to process results")
 
+    # Add compile time metrics (per-shape, same format as speedup)
+    if measure_compile_time and variant_compile_times:
+        # Get shapes from the most recent result for this kernel
+        kernel_results = [r for r in results if r.model == kernel_name]
+        shapes = kernel_results[-1].shape if kernel_results else []
+        device = get_device_name() or "unknown"
+        for func_name, times in variant_compile_times.items():
+            if not times:
+                continue
+            # Align compile times with shapes (both are in input order)
+            if len(times) != len(shapes):
+                logger.warning(
+                    f"Compile time count ({len(times)}) != shape count "
+                    f"({len(shapes)}) for {kernel_name}/{func_name}, skipping"
+                )
+                continue
+            metric_name = "helion_compile_time_s"
+            if len(variants) > 1:
+                metric_name = f"helion_{func_name}_compile_time_s"
+            results.append(
+                RunResult(
+                    model=kernel_name,
+                    device=device,
+                    shape=shapes,
+                    metrics={metric_name: times},
+                )
+            )
+            print(
+                f"Compile time for {kernel_name}/{func_name}: "
+                f"{', '.join(f'{t:.3f}s' for t in times)} "
+                f"({len(times)} shapes)",
+                file=sys.stderr,
+            )
+
     # Force garbage collection multiple times to ensure memory is freed
     for _ in range(3):
         gc.collect()
-
-
-@functools.cache
-def get_device_name() -> str:
-    """
-    Return name for the current torch.cuda device,
-    including ROCm GCN arch (when available) and normalizing NVIDIA H100 naming.
-    """
-    if torch.cuda.is_available():
-        device_idx = torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(device_idx)
-        arch = getattr(props, "gcnArchName", None)
-        name = torch.cuda.get_device_name(device_idx)
-        if torch.version.hip is not None and arch is not None:
-            return f"{name} {arch}"
-        # Inconsistent name reporting, so lets fix H100 to report simple name
-        if name.startswith("NVIDIA H100"):
-            return "NVIDIA H100"
-        return name
-    return "unknown"
 
 
 def process_result(
@@ -1359,13 +1757,13 @@ def process_result(
         )
         return
 
-    names = lines[0].strip().split(";")
+    reader = csv.reader(lines, delimiter=";")
+    names = next(reader)
 
     shape = []
     metrics = collections.defaultdict(list)
-    for row in lines[1:]:
-        row_data = row.strip().split(";")
-        if row_data[0] == "average" or len(row_data) == 1:
+    for row_data in reader:
+        if not row_data or row_data[0].strip() == "average" or len(row_data) == 1:
             continue
         for idx, (name, item) in enumerate(zip(names, row_data, strict=True)):
             if idx == 0:
@@ -1377,12 +1775,17 @@ def process_result(
                     if item == "":
                         # if benchmark failed, tritonbench emits empty string
                         item = 0.0
-                    metrics[active_metrics[kernel_name][name]].append(float(item))
+                    try:
+                        metrics[active_metrics[kernel_name][name]].append(float(item))
+                    except (ValueError, TypeError):
+                        # tritonbench may embed error messages in CSV cells
+                        # when a kernel config fails; treat as missing data
+                        metrics[active_metrics[kernel_name][name]].append(0.0)
 
     results.append(
         RunResult(
             model=kernel_name,
-            device=get_device_name(),
+            device=get_device_name() or "unknown",
             shape=shape,
             metrics=metrics,
         )
@@ -1407,6 +1810,7 @@ def write_results_to_json(
                         "name": "Helion Benchmark",
                         "extra_info": {
                             "device": result.device,
+                            "backend": _get_backend(),
                         },
                     },
                     "model": {
@@ -1435,6 +1839,105 @@ def write_results_to_json(
         json.dump(records, f, indent=2)
 
 
+def print_autotune_metrics(metrics: list[AutotuneMetrics]) -> None:
+    if not metrics:
+        return
+
+    headers = [
+        "Kernel",
+        "Input Shapes",
+        "Time (s)",
+        "Configs",
+        "Compile Fail",
+        "Accuracy Fail",
+        "Generations",
+        "Best Perf (ms)",
+        "Configs/s",
+    ]
+
+    rows = []
+    total_time = 0.0
+    total_configs = 0
+    total_compile_failures = 0
+    total_accuracy_failures = 0
+    total_generations = 0
+    total_configs_per_second = 0.0
+    n = len(metrics)
+
+    for m in metrics:
+        cps = m.num_configs_tested / m.autotune_time if m.autotune_time > 0 else 0.0
+
+        total_time += m.autotune_time
+        total_configs += m.num_configs_tested
+        total_compile_failures += m.num_compile_failures
+        total_accuracy_failures += m.num_accuracy_failures
+        total_generations += m.num_generations
+        total_configs_per_second += cps
+
+        rows.append(
+            [
+                m.kernel_name,
+                m.input_shapes,
+                f"{m.autotune_time:.2f}",
+                m.num_configs_tested,
+                m.num_compile_failures,
+                m.num_accuracy_failures,
+                m.num_generations,
+                f"{m.best_perf_ms:.4f}",
+                f"{cps:.2f}",
+            ]
+        )
+
+    rows.extend(
+        [
+            [
+                "AVERAGE",
+                "",
+                f"{total_time / n:.2f}",
+                f"{total_configs / n:.1f}",
+                f"{total_compile_failures / n:.1f}",
+                f"{total_accuracy_failures / n:.1f}",
+                f"{total_generations / n:.1f}",
+                "",
+                f"{total_configs_per_second / n:.2f}",
+            ],
+            [
+                "TOTAL",
+                "",
+                f"{total_time:.2f}",
+                total_configs,
+                total_compile_failures,
+                total_accuracy_failures,
+                total_generations,
+                "",
+                "",
+            ],
+        ]
+    )
+
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("Autotune Metrics", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    print(tabulate(rows, headers=headers, tablefmt="simple"), file=sys.stderr)
+    print(file=sys.stderr)
+
+
+def export_autotune_metrics(metrics: list[AutotuneMetrics], path: str) -> None:
+    if not metrics:
+        return
+
+    report = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        ),
+        "runs": [m.to_dict() for m in metrics],
+    }
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    print(f"Autotune metrics exported to: {path}", file=sys.stderr)
+
+
 def main() -> None:
     # Parse command line arguments
     parser = argparse.ArgumentParser(
@@ -1447,6 +1950,12 @@ def main() -> None:
         type=str,
         dest="kernel",
         help="Name(s) of the Helion kernel module(s) to run. Can be a single kernel or comma-separated list (e.g., vector_add or vector_add,rms_norm). If not specified, runs all kernels.",
+    )
+    parser.add_argument(
+        "--helion-backend",
+        choices=list_backends(),
+        default=None,
+        help="Helion code generation backend to benchmark. Defaults to HELION_BACKEND or triton.",
     )
     parser.add_argument(
         "--input-shard",
@@ -1474,9 +1983,32 @@ def main() -> None:
         help="Path to YAML or JSON configuration file for additional kernel mappings. "
         "Custom mappings extend and can override base mappings.",
     )
+    parser.add_argument(
+        "--autotune-metrics",
+        action="store_true",
+        default=os.environ.get("HELION_AUTOTUNE_METRICS", "0") == "1",
+        help="Print autotune metrics after benchmarking. "
+        "Also enabled by HELION_AUTOTUNE_METRICS=1.",
+    )
+    parser.add_argument(
+        "--autotune-metrics-json",
+        type=str,
+        default=os.environ.get("HELION_AUTOTUNE_METRICS_JSON"),
+        help="Export autotune metrics to a JSON file at the given path. "
+        "Also set via HELION_AUTOTUNE_METRICS_JSON=<path>.",
+    )
+    parser.add_argument(
+        "--measure-compile-time",
+        action="store_true",
+        help="Measure and report Helion kernel compile time (seconds) for each input shape. "
+        "Results are included in JSON output as helion_compile_time_s metric.",
+    )
 
     # Parse known args to get the kernel name, pass rest to tritonbench
     args, tritonbench_args = parser.parse_known_args()
+
+    if args.helion_backend:
+        os.environ["HELION_BACKEND"] = args.helion_backend
 
     # Add default tolerance values if not already specified
     if "--atol" not in tritonbench_args:
@@ -1596,6 +2128,13 @@ def main() -> None:
 
     results: list[RunResult] = []
 
+    if args.measure_compile_time:
+        enable_compile_time()
+
+    collected_metrics: list[AutotuneMetrics] = []
+    if args.autotune_metrics or args.autotune_metrics_json:
+        register_post_autotune_hook(collected_metrics.append)
+
     if args.kernel:
         # Parse comma-separated kernel names
         kernel_names = [k.strip() for k in args.kernel.split(",")]
@@ -1622,6 +2161,7 @@ def main() -> None:
                 results,
                 active_kernel_mappings,
                 active_metric_mappings,
+                measure_compile_time=args.measure_compile_time,
             )
         else:
             print(
@@ -1639,6 +2179,7 @@ def main() -> None:
                     results,
                     active_kernel_mappings,
                     active_metric_mappings,
+                    measure_compile_time=args.measure_compile_time,
                 )
     else:
         # Run all kernels
@@ -1656,12 +2197,18 @@ def main() -> None:
                 results,
                 active_kernel_mappings,
                 active_metric_mappings,
+                measure_compile_time=args.measure_compile_time,
             )
 
     if args.output:
         write_results_to_json(
             args.output, results, append_to_output=args.append_to_output
         )
+
+    if collected_metrics:
+        print_autotune_metrics(collected_metrics)
+        if args.autotune_metrics_json:
+            export_autotune_metrics(collected_metrics, args.autotune_metrics_json)
 
 
 if __name__ == "__main__":

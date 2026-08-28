@@ -4,7 +4,7 @@
 
 # Events
 
-- **June, 2026**: Helion Tutorial @ [PLDI 2026](https://pldi26.sigplan.org/) - Writing Performance-Portable Kernels Simplified with Helion
+- **June 15, 2026**: Helion Tutorial, [Writing Performance-Portable Kernels Simplified with Helion](https://pldi26.sigplan.org/details/pldi-2026-tutorials/1/Writing-Performance-Portable-Kernels-Simplified-with-Helion) @ PLDI 2026, Boulder, CO
 
 # About
 
@@ -303,6 +303,28 @@ export ENABLE_TILE=1
 ```
 
 For detailed documentation, see the [TileIR Backend Guide](docs/tileir_backend.md).
+
+## CuTe Backend (CUDA 13+)
+
+Helion has an experimental [CUTLASS CuTe DSL](https://github.com/NVIDIA/cutlass) backend that lowers kernels through CuTe instead of Triton.
+
+**Requirements:** PyTorch must be built against **CUDA 13 or later** (`torch.version.cuda >= "13"`). The backend will refuse to launch on older CUDA builds.
+
+To enable the CuTe backend:
+
+1. Install the pinned CuTe DSL release:
+
+   ```bash
+   pip install -e '.[cute]'
+   # or run the helper, which also handles the libs-cu13 reinstall ordering
+   ./scripts/install_cute.sh
+   ```
+
+2. Select the backend at runtime:
+
+   ```bash
+   export HELION_BACKEND=cute
+   ```
 
 ## Settings for Development and Debugging
 

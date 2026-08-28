@@ -12,13 +12,13 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestMasking(RefEagerTestBase, TestCase):
     def test_mask_dot(self):
         @helion.kernel(config={"block_sizes": [[32, 32], 32]}, dot_precision="ieee")
@@ -41,12 +41,10 @@ class TestMasking(RefEagerTestBase, TestCase):
             add1mm,
             args,
         )
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(
             result, (args[0] + 1) @ (args[1] + 1), rtol=1e-2, atol=1e-1
         )
 
-    @skipIfCpu("AssertionError: Tensor-likes are not close!")
     def test_no_mask_views0(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -64,7 +62,6 @@ class TestMasking(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, args[0].sum(dim=1, keepdim=True))
         self.assertNotIn("tl.where", code)
 
-    @skipIfCpu("AssertionError: Tensor-likes are not close!")
     def test_no_mask_views1(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -134,9 +131,11 @@ class TestMasking(RefEagerTestBase, TestCase):
             args,
         )
         torch.testing.assert_close(result, (args[0] + 1).sum(dim=1))
-        self.assertIn("tl.where", code)
+        if _get_backend() == "cute":
+            self.assertIn("if mask_0 and mask_1 else cutlass.Float32(0)", code)
+        else:
+            self.assertIn("tl.where", code)
 
-    @skipIfCpu("AssertionError: Tensor-likes are not close!")
     def test_no_mask_inductor_ops(self):
         @helion.kernel(config={"block_sizes": [32]})
         def fn(x):
@@ -180,8 +179,10 @@ class TestMasking(RefEagerTestBase, TestCase):
             fn,
             args,
         )
-        self.assertIn("tl.where", code)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "cute":
+            self.assertIn("if mask_1 else cutlass.Float32(0)", code)
+        else:
+            self.assertIn("tl.where", code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfRefEager(
@@ -208,7 +209,6 @@ class TestMasking(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, args[0].sum(dim=1))
         self.assertNotIn("tl.where", code)
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

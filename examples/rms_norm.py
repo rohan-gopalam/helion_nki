@@ -20,6 +20,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -73,7 +74,7 @@ def rms_norm_fwd(
     return out, inv_rms.reshape(-1, 1)
 
 
-@helion.kernel
+@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
 def rms_norm_bwd(
     grad_out: torch.Tensor,
     x: torch.Tensor,
@@ -217,8 +218,8 @@ def check(m: int, n: int) -> None:
         m: First dimension of the test tensor
         n: Second dimension of the test tensor
     """
-    x = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
-    weight = torch.randn([n], device=DEVICE, dtype=torch.float16)
+    x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+    weight = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE)
 
     # Test forward pass only
     print("\n=== Forward Pass Test ===")
@@ -228,16 +229,14 @@ def check(m: int, n: int) -> None:
         (x, weight, 1e-5),
         kernel_name="helion_fwd_kernel",
         baseline_name="torch",
-        rtol=1e-3,
-        atol=1e-3,
+        rtol=1e-2,
+        atol=1e-2,
     )
 
     # Test forward + backward pass
     print("\n\n=== Forward + Backward Pass Test ===")
-    x_grad = torch.randn([m, n], device=DEVICE, dtype=torch.float16, requires_grad=True)
-    weight_grad = torch.randn(
-        [n], device=DEVICE, dtype=torch.float16, requires_grad=True
-    )
+    x_grad = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
+    weight_grad = torch.randn([n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
 
     run_example(
         rms_norm,

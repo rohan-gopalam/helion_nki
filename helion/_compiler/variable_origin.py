@@ -123,6 +123,14 @@ class Origin:
         """Convert to a PyTorch source object."""
         raise NotImplementedError(type(self).__name__)
 
+    def root_rw_name(self) -> str | None:
+        """Host buffer name for inter-loop RAW tracking, after unwrapping wrappers.
+
+        Returns ``None`` when this origin is not rooted in a named host binding
+        (e.g. device temporaries, block sizes).
+        """
+        return None
+
 
 @dataclasses.dataclass
 class HostOrigin(Origin):
@@ -143,6 +151,9 @@ class NameOrigin(HostOrigin):
         return self.name
 
     def suggest_var_name(self) -> str:
+        return self.name
+
+    def root_rw_name(self) -> str | None:
         return self.name
 
 
@@ -175,6 +186,9 @@ class WrappedOrigin(Origin):
 
     def depth(self) -> int:
         return 1 + self.value.depth()
+
+    def root_rw_name(self) -> str | None:
+        return self.value.root_rw_name()
 
 
 @dataclasses.dataclass
@@ -287,3 +301,67 @@ class GridOrigin(Origin):
 
     def host_str(self) -> str:
         raise NotImplementedError
+
+
+@dataclasses.dataclass
+class TileBeginOrigin(GridOrigin):
+    def host_str(self) -> str:
+        from .device_function import DeviceFunction
+
+        return DeviceFunction.current().codegen.offset_var(self.block_id)
+
+
+@dataclasses.dataclass
+class TileEndOrigin(GridOrigin):
+    def host_str(self) -> str:
+        from .compile_environment import CompileEnvironment
+        from .device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        codegen = device_fn.codegen
+        offset = codegen.offset_var(self.block_id)
+        block_size = device_fn.block_size_var(self.block_id) or "1"
+        naive_end = f"{offset} + {block_size}"
+        mask = codegen.mask_var(self.block_id)
+        if mask is None:
+            return naive_end
+        end_var = (
+            codegen.active_device_loops[self.block_id][-1]
+            .block_id_to_info[self.block_id]
+            .end_var_name
+        )
+        assert end_var is not None
+        backend = CompileEnvironment.current().backend
+        return backend.minimum_expr(naive_end, end_var)
+
+
+@dataclasses.dataclass
+class TileCountOrigin(GridOrigin):
+    def host_str(self) -> str:
+        from .compile_environment import CompileEnvironment
+        from .device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        loop_info = device_fn.codegen.active_device_loops[self.block_id][
+            -1
+        ].block_id_to_info[self.block_id]
+        begin_var_name = loop_info.begin_var_name or "0"
+        end_var = loop_info.end_var_name
+        assert end_var is not None
+        block_size = device_fn.block_size_var(self.block_id) or "1"
+        backend = CompileEnvironment.current().backend
+        extent = f"({end_var}) - ({begin_var_name})"
+        return backend.cdiv_expr(extent, block_size, is_device=True)
+
+
+@dataclasses.dataclass
+class TileIdOrigin(GridOrigin):
+    def host_str(self) -> str:
+        from .device_function import DeviceFunction
+
+        device_fn = DeviceFunction.current()
+        offset = device_fn.codegen.offset_var(self.block_id)
+        block_size = device_fn.block_size_var(self.block_id)
+        if block_size is None:
+            return offset
+        return f"{offset} // {block_size}"

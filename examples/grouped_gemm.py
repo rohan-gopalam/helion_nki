@@ -222,9 +222,7 @@ def grouped_gemm_jagged_persistent(
                             b_blk = hl.load(
                                 B,
                                 [k_idx, col_idx],
-                                extra_mask=cols_valid[
-                                    None, :
-                                ],  # pyrefly: ignore[bad-index]
+                                extra_mask=cols_valid[None, :],  # pyrefly: ignore[bad-index]
                             )
 
                             # Perform tile-level matrix multiplication and accumulate
@@ -287,7 +285,11 @@ def _pack_group_inputs(
 
 # %%
 def grouped_gemm_jagged_tritonbench(
-    tb_op: object, group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+    tb_op: object,
+    group_A: list[torch.Tensor],
+    group_B: list[torch.Tensor],
+    w: torch.Tensor | None = None,
+    split: torch.Tensor | None = None,
 ) -> Callable[[], torch.Tensor]:
     """Adapter for basic grouped GEMM kernel to work with TritonBench benchmark suite."""
 
@@ -299,7 +301,11 @@ def grouped_gemm_jagged_tritonbench(
 
 
 def grouped_gemm_jagged_persistent_tritonbench(
-    tb_op: object, group_A: list[torch.Tensor], group_B: list[torch.Tensor]
+    tb_op: object,
+    group_A: list[torch.Tensor],
+    group_B: list[torch.Tensor],
+    w: torch.Tensor | None = None,
+    split: torch.Tensor | None = None,
 ) -> Callable[[], torch.Tensor]:
     """Adapter for persistent grouped GEMM kernel with dynamic work distribution for TritonBench."""
 

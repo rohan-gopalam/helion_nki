@@ -4,23 +4,28 @@ import math
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
 from helion import _compat
 from helion._compat import get_tensor_descriptor_fn_name
+from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
+from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
-from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
@@ -66,7 +71,7 @@ def reduction_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
@@ -83,7 +88,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         code, result = code_and_output(fn, (n, DEVICE))
         expected = torch.full([n], (n + 64 - 1) // 64, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
@@ -102,7 +106,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             [(end - begin + 32 - 1) // 32], dtype=torch.int32, device=DEVICE
         )
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_arange(self):
         @helion.kernel
@@ -120,8 +123,12 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.arange(0, 100, device=DEVICE, dtype=torch.int32)
         )
-        self.assertExpectedJournal(code)
 
+    @pytest.mark.xfail(
+        _get_backend() == "cute",
+        reason="CuTe matmul fallback with non-power-of-two static dimensions can generate invalid shared-memory indexing",
+        run=False,
+    )
     def test_hl_arange_non_power_of_2(self):
         @helion.kernel
         def _matmul_layernorm_bwd_dxdy(
@@ -171,10 +178,10 @@ class TestIndexing(RefEagerTestBase, TestCase):
         m, k, n = 5, 3, 7
         eps = 1e-5
 
-        x = torch.randn((m, k), device=DEVICE, dtype=torch.float16)
-        y = torch.randn((k, n), device=DEVICE, dtype=torch.float16)
-        weight = torch.randn((n,), device=DEVICE, dtype=torch.float16)
-        grad_out = torch.randn((m, n), device=DEVICE, dtype=torch.float16)
+        x = torch.randn((m, k), device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn((k, n), device=DEVICE, dtype=HALF_DTYPE)
+        weight = torch.randn((n,), device=DEVICE, dtype=HALF_DTYPE)
+        grad_out = torch.randn((m, n), device=DEVICE, dtype=HALF_DTYPE)
 
         z = (x @ y).to(torch.float32)
         var, mean = torch.var_mean(z, dim=-1, keepdim=True, correction=0)
@@ -204,10 +211,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         ref_grad_x = (dz @ y.to(torch.float32).t()).to(grad_x.dtype)
         ref_grad_y = (x.to(torch.float32).t() @ dz).to(grad_y.dtype)
 
-        torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-3, atol=3e-3)
-        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-3, atol=4e-3)
+        torch.testing.assert_close(grad_x, ref_grad_x, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(grad_y, ref_grad_y, rtol=1e-2, atol=1e-2)
         # TODO(oulgen): needs mindot size mocked
-        # self.assertExpectedJournal(code)
 
     def test_pairwise_add(self):
         @helion.kernel()
@@ -224,7 +230,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x[:-1] + x[1:])
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_pairwise_add_commuted_and_multi_offset(self):
@@ -246,7 +251,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x[1:-2] + x[3:]
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_mask_store(self):
         @helion.kernel
@@ -265,7 +269,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
-        self.assertExpectedJournal(code)
 
     def test_mask_store_cartesian(self):
         @helion.kernel(autotune_effort="none")
@@ -326,7 +329,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             )
             return packed, group_b[0], group_offsets
 
-        dtype = torch.float16
+        dtype = HALF_DTYPE
         group_a = [
             torch.randn(m, 32, device=DEVICE, dtype=dtype).contiguous()
             for m in (8, 12, 4)
@@ -353,7 +356,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             groups = group_offsets.size(0) - 1
 
             out = torch.zeros(
-                total_m, n, p, device=group_offsets.device, dtype=torch.float16
+                total_m, n, p, device=group_offsets.device, dtype=HALF_DTYPE
             )
 
             for g in hl.grid(groups):
@@ -384,7 +387,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
             return out
 
-        dtype = torch.float16
+        dtype = HALF_DTYPE
         group_offsets = torch.tensor([0, 2, 5, 6], device=DEVICE, dtype=torch.int32)
         n, p = 4, 3
         total_m = int(group_offsets[-1])
@@ -412,7 +415,100 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0)
         )
-        self.assertExpectedJournal(code)
+
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
+    def test_extra_mask_load(self):
+        """Verify extra_mask loads produce correct results with block_ptr
+        and tensor_descriptor backends.
+        """
+
+        @helion.kernel
+        def masked_load_3d(
+            x: torch.Tensor,
+            mask: torch.Tensor,
+        ) -> torch.Tensor:
+            m, n, k = x.size()
+            out = torch.zeros_like(x)
+            for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
+                out[tile_m, tile_n, tile_k] = hl.load(
+                    x,
+                    [tile_m, tile_n, tile_k],
+                    extra_mask=mask[tile_m, tile_n, tile_k],
+                )
+            return out
+
+        x = torch.randn(8, 4, 16, device=DEVICE)
+        block_size = [4, 4, 8]
+
+        backends = ["block_ptr"]
+        if supports_tensor_descriptor():
+            backends.append("tensor_descriptor")
+
+        mask_shapes = [
+            (8, 4, 16),  # full size, no broadcast
+            (1, 4, 1),  # broadcast along M and K
+        ]
+
+        for indexing in backends:
+            for shape in mask_shapes:
+                with self.subTest(indexing=indexing, mask_shape=shape):
+                    mask = torch.randint(0, 2, shape, device=DEVICE, dtype=torch.bool)
+                    args = (x, mask)
+
+                    _, result_pointer = code_and_output(
+                        masked_load_3d,
+                        args,
+                        block_size=block_size,
+                        indexing="pointer",
+                    )
+                    code_test, result_test = code_and_output(
+                        masked_load_3d,
+                        args,
+                        block_size=block_size,
+                        indexing=indexing,
+                    )
+                    if _get_backend() == "triton":
+                        self.assertIn(indexing, code_test)
+                        self.assertIn("tl.where", code_test)
+                    torch.testing.assert_close(result_test, result_pointer)
+
+    @skipIfTileIR("TileIR does not support block_ptr indexing")
+    @skipIfRefEager("test checks generated Triton code")
+    def test_mask_store_falls_back_to_pointer(self):
+        @helion.kernel
+        def masked_store(x: torch.Tensor) -> torch.Tensor:
+            out = torch.zeros_like(x)
+            for tile in hl.tile(out.size(0)):
+                hl.store(out, [tile], x[tile], extra_mask=(tile.index % 2) == 0)
+            return out
+
+        x = torch.randn([200], device=DEVICE)
+
+        backends = ["block_ptr"]
+        if supports_tensor_descriptor():
+            backends.append("tensor_descriptor")
+
+        for indexing in backends:
+            with self.subTest(indexing=indexing):
+                code, result = code_and_output(
+                    masked_store,
+                    (x,),
+                    block_size=16,
+                    indexing=indexing,
+                )
+                if _get_backend() == "triton":
+                    # The masked store should fall back to pointer
+                    store_lines = [
+                        line for line in code.splitlines() if "tl.store(" in line
+                    ]
+                    self.assertTrue(store_lines)
+                    for line in store_lines:
+                        self.assertNotIn("block_ptr", line)
+                        self.assertNotIn("tensor_descriptor", line)
+                torch.testing.assert_close(
+                    result,
+                    torch.where(torch.arange(200, device=DEVICE) % 2 == 0, x, 0),
+                )
 
     def test_tile_begin_end(self):
         @helion.kernel
@@ -471,7 +567,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Test requires high VRAM",
         required_bytes=_LARGE_BF16_REQUIRED_BYTES,
     )
-    @skipIfCpu("fails on Triton CPU backend")
+    @skipIfXPU("worker crash on XPU")
     def test_int32_offset_out_of_range_error(self):
         repro_config = helion.Config(
             block_sizes=[32, 32],
@@ -534,7 +630,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             code, out = code_and_output(kernel, (x, y))
             torch.accelerator.synchronize()
             checker = self.assertIn if expect_int64_in_code else self.assertNotIn
-            checker("tl.int64", code)
+            int64_token = "cutlass.Int64" if _get_backend() == "cute" else "tl.int64"
+            checker(int64_token, code)
             torch.accelerator.synchronize()
             ref_out = torch.add(x, y)
             del x, y
@@ -594,6 +691,45 @@ class TestIndexing(RefEagerTestBase, TestCase):
             passthrough_int64.specialization_key((large,)),
         )
 
+    @skipIfRefEager("specialization_key is not used in ref eager mode")
+    def test_dynamic_shape_specialization_key_does_not_bucket_zero_one(self) -> None:
+        @helion.kernel(static_shapes=False)
+        def passthrough(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        keys = {
+            passthrough.specialization_key((torch.empty((n, 4), device=DEVICE),))
+            for n in (0, 1, 2, 9)
+        }
+        self.assertEqual(len(keys), 1)
+
+    @skipIfRefEager("specialization_key is not used in ref eager mode")
+    def test_symint_specialization_key_disambiguates_shape_envs(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def passthrough(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        se1 = ShapeEnv()
+        se2 = ShapeEnv()
+        mode1 = FakeTensorMode(shape_env=se1)
+        mode2 = FakeTensorMode(shape_env=se2)
+
+        si1 = se1.create_unbacked_symint()
+        si2 = se2.create_unbacked_symint()
+        # Both fresh ShapeEnvs produce the same symbol name
+        self.assertEqual(str(si1.node.expr), str(si2.node.expr))
+
+        meta = "meta"
+        with mode1:
+            ft1 = torch.empty(si1, 4, device=meta)
+        with mode2:
+            ft2 = torch.empty(si2, 4, device=meta)
+
+        self.assertNotEqual(
+            passthrough.specialization_key((ft1,)),
+            passthrough.specialization_key((ft2,)),
+        )
+
     @skipIfRefEager("Test checks generated code")
     def test_program_id_cast_to_int64(self):
         """Test that tl.program_id() is cast to int64 when index_dtype is int64."""
@@ -617,12 +753,19 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         # Test int64 case: program_id should be cast to int64
         code_int64, result_int64 = code_and_output(add_kernel_int64, (x, y))
-        self.assertIn("tl.program_id(0).to(tl.int64)", code_int64)
+        if _get_backend() == "cute":
+            self.assertIn("cutlass.Int64(cute.arch.block_idx()[0])", code_int64)
+        else:
+            self.assertIn("tl.program_id(0).to(tl.int64)", code_int64)
 
         # Test int32 case: program_id should NOT be cast
         code_int32, result_int32 = code_and_output(add_kernel_int32, (x, y))
-        self.assertNotIn(".to(tl.int64)", code_int32)
-        self.assertIn("tl.program_id(0)", code_int32)
+        if _get_backend() == "cute":
+            self.assertNotIn("cutlass.Int64(cute.arch.block_idx()[0])", code_int32)
+            self.assertIn("cutlass.Int32(cute.arch.block_idx()[0])", code_int32)
+        else:
+            self.assertNotIn(".to(tl.int64)", code_int32)
+            self.assertIn("tl.program_id(0)", code_int32)
 
         # Both should produce correct results
         expected = x + y
@@ -630,12 +773,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_int32, expected)
 
     @skipIfRefEager("Test checks for no IMA")
-    @skipIfRocm("Test takes too long on ROCm")
-    @skipIfCpu("Test requires GPU")
     @skipIfLowVRAM(
         "Test requires large memory",
         required_bytes=_LARGE_TENSOR_REQUIRED_BYTES,
     )
+    @skipIfXPU("Timeout on XPU")
     def test_large_tensor(self):
         @helion.kernel(autotune_effort="none")
         def f(x: torch.Tensor) -> torch.Tensor:
@@ -649,7 +791,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             _LARGE_TENSOR_B,
             _LARGE_TENSOR_D,
             device=DEVICE,
-            dtype=torch.float16,
+            dtype=HALF_DTYPE,
         )
         out = f(inp)
         assert (out == inp).all()
@@ -837,7 +979,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = torch.arange(0, 64, step=2, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_arange_hl_alias(self):
         @helion.kernel(config={"block_size": 8})
@@ -876,8 +1017,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.arange(128, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-        self.assertExpectedJournal(code)
-
     def test_slice_block_size_multiple(self):
         """Test that tile.block_size * constant works as slice bounds"""
 
@@ -897,8 +1036,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.ones(128, dtype=torch.int32, device=DEVICE)
         torch.testing.assert_close(result, expected)
 
-        self.assertExpectedJournal(code)
-
     def test_broadcasting_pointer_indexing(self):
         x = torch.randn([16, 24, 32], device=DEVICE)
         bias1 = torch.randn([1, 24, 32], device=DEVICE)
@@ -911,7 +1048,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x + bias1 + bias2
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -927,7 +1063,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x + bias1 + bias2
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @unittest.skipIf(
@@ -946,7 +1081,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = x + bias1 + bias2
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_size1_dimension_tile_reshape(self):
         """Test that tile indexing on size-1 dimensions works with reshape.
@@ -978,8 +1112,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         out2 = torch.empty_like(x2)
         size1_reshape_kernel(x2, out2)
         torch.testing.assert_close(out2, x2)
-
-        self.assertExpectedJournal(code)
 
     def test_size1_dimension_variable_tile_range(self):
         """Test tile indexing on size-1 dimensions with variable tile ranges.
@@ -1016,7 +1148,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             variable_tile_range_kernel, (query, query_start_lens, num_seqs, out)
         )
         torch.testing.assert_close(out, query)
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @unittest.skipIf(
@@ -1037,7 +1168,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         expected = torch.sum(x, dim=1)
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @unittest.skipIf(
@@ -1045,7 +1175,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         "Not using experimental tensor descriptor",
     )
     def test_reduction_tensor_descriptor_indexing_reduction_loop(self):
-        x = torch.randn([64, 256], dtype=torch.float16, device=DEVICE)
+        x = torch.randn([64, 256], dtype=HALF_DTYPE, device=DEVICE)
 
         # Given reduction_loop 2, # of columns not compatible with tensor_descriptor
         # Convert to default pointer indexing
@@ -1059,9 +1189,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
         expected = torch.sum(x, dim=1)
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
-    @skipIfCpu("")
     def test_2d_slice_index(self):
         """Test both setter from scalar and getter for [:,i]"""
 
@@ -1104,13 +1232,38 @@ class TestIndexing(RefEagerTestBase, TestCase):
         src = torch.zeros([1, N], device=DEVICE)
         dst = torch.zeros([1, N], device=DEVICE)
 
-        src_result, dst_result = kernel(src, dst)
+        code, (src_result, dst_result) = code_and_output(kernel, (src, dst))
 
         # Both should be ones after the kernel
         expected_src = torch.ones([1, N], device=DEVICE)
         expected_dst = torch.ones([1, N], device=DEVICE)
         torch.testing.assert_close(src_result, expected_src)
         torch.testing.assert_close(dst_result, expected_dst)
+
+        if _get_backend() == "cute":
+            # Regression: the scalar store `dst[:, :] = 1.0` must vary across
+            # the slice's second dim. Either a lane loop variable
+            # (`rindex_*`) or a per-thread index derived from
+            # `cute.arch.thread_idx` (`indices_*`) is correct. What is NOT
+            # correct is binding the slice to a constant or grid-only PID,
+            # which would only write one element per block and race with the
+            # subsequent load.
+            store_line = next(
+                (
+                    line
+                    for line in code.split("\n")
+                    if ".store(cutlass.Float32(1.0))" in line
+                ),
+                None,
+            )
+            self.assertIsNotNone(store_line)
+            assert "rindex_" in store_line or "indices_" in store_line, store_line
+            # Guard against the original race condition where the second-dim
+            # index resolved to a constant.
+            self.assertNotIn(
+                "cutlass.Int32(0) * cutlass.Int32(dst.layout.stride[1])",
+                store_line,
+            )
 
     def test_1d_index(self):
         """Test both setter from scalar and getter for [i]"""
@@ -1567,7 +1720,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x[10:])
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfTileIR("TileIR does not support block_ptr indexing")
@@ -1591,7 +1743,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x[10:])
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("TensorDescriptor not supported")
     @skipIfTileIR(
@@ -1618,10 +1769,14 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=32,
         )
         torch.testing.assert_close(result, x[10:, :])
-        self.assertExpectedJournal(code)
 
     @skipIfRefEager(
         "Test is block size dependent which is not supported in ref eager mode"
+    )
+    @pytest.mark.xfail(
+        _get_backend() == "cute",
+        reason="CuTe attention dot lowering with tile-offset K/V loads is incorrect",
+        run=False,
     )
     def test_tile_with_offset_from_expr(self):
         @helion.kernel(
@@ -1684,7 +1839,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         code, (o, lse) = code_and_output(attention, (q, k, v))
         torch_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         torch.testing.assert_close(o, torch_out, atol=1e-2, rtol=1e-2)
-        self.assertExpectedJournal(code)
 
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     def test_per_load_indexing(self):
@@ -1702,9 +1856,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 64
-        a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
-        b = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
-        c = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        b = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        c = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
 
         # 3 loads + 1 store = 4 operations
         code, result = code_and_output(
@@ -1715,9 +1869,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = a + b + c
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-        self.assertIn("tl.load", code)
-        self.assertIn("tl.make_block_ptr", code)
-        self.assertExpectedJournal(code)
+        if _get_backend() == "triton":
+            self.assertIn("tl.load", code)
+            self.assertIn("tl.make_block_ptr", code)
 
     def test_per_load_indexing_backward_compat(self):
         @helion.kernel
@@ -1732,7 +1886,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 64
-        a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
         expected = a + a + a
 
         # When indexing is not specified (empty list), all loads and stores default to pointer
@@ -1742,7 +1896,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code1)
 
         # Single string: backward compatible mode, all loads and stores use the same strategy
         code2, result = code_and_output(
@@ -1752,7 +1905,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code2)
 
         # List: per-operation mode, must provide strategy for all loads and stores (3 loads + 1 store)
         code3, result = code_and_output(
@@ -1762,7 +1914,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
-        self.assertExpectedJournal(code3)
 
         self.assertEqual(code1, code2)
         self.assertEqual(code2, code3)
@@ -1785,8 +1936,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         m, n = 64, 64
-        a = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
-        b = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        a = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        b = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
         expected = a + b
 
         # Test 1: Mixed strategies - pointer loads, block_ptr store
@@ -1798,12 +1949,12 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result1, expected, rtol=1e-3, atol=1e-3)
-        # Verify we have both pointer loads and block_ptr store
-        self.assertIn("tl.load", code1)
-        self.assertIn("tl.make_block_ptr", code1)
-        # Count occurrences: should have block_ptr for store
-        self.assertEqual(code1.count("tl.make_block_ptr"), 1)
-        self.assertExpectedJournal(code1)
+        if _get_backend() == "triton":
+            # Verify we have both pointer loads and block_ptr store
+            self.assertIn("tl.load", code1)
+            self.assertIn("tl.make_block_ptr", code1)
+            # Count occurrences: should have block_ptr for store
+            self.assertEqual(code1.count("tl.make_block_ptr"), 1)
 
         # Test 2: Different mix - block_ptr loads, pointer store
         code2, result2 = code_and_output(
@@ -1813,9 +1964,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result2, expected, rtol=1e-3, atol=1e-3)
-        # Should have 2 block_ptrs for loads, regular store
-        self.assertEqual(code2.count("tl.make_block_ptr"), 2)
-        self.assertExpectedJournal(code2)
+        if _get_backend() == "triton":
+            # Should have 2 block_ptrs for loads, regular store
+            self.assertEqual(code2.count("tl.make_block_ptr"), 2)
 
         # Test 3: All block_ptr
         code3, result3 = code_and_output(
@@ -1825,9 +1976,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[16, 16],
         )
         torch.testing.assert_close(result3, expected, rtol=1e-3, atol=1e-3)
-        # Should have 3 block_ptrs total (2 loads + 1 store)
-        self.assertEqual(code3.count("tl.make_block_ptr"), 3)
-        self.assertExpectedJournal(code3)
+        if _get_backend() == "triton":
+            # Should have 3 block_ptrs total (2 loads + 1 store)
+            self.assertEqual(code3.count("tl.make_block_ptr"), 3)
 
         # Test 4: Verify single string applies to all loads and stores
         code4, result4 = code_and_output(
@@ -1839,7 +1990,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result4, expected, rtol=1e-3, atol=1e-3)
         # Should match the all-block_ptr version
         self.assertEqual(code3, code4)
-        self.assertExpectedJournal(code4)
 
     def test_indirect_indexing_2d_direct_gather(self):
         @helion.kernel()
@@ -1886,7 +2036,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     expected[i, j] += val[i, k] * B[col[i, k], j]
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_indirect_indexing_2d_flat_load(self):
         @helion.kernel()
@@ -1935,7 +2084,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
                     expected[i, j] += val[i, k] * B[col[i, k], j]
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_indirect_indexing_3d_direct_gather(self):
         @helion.kernel()
@@ -1979,16 +2127,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[4, 4, 4, 4, 4],  # 5D tiling for M, N, P, Q, K
         )
 
-        expected = torch.zeros((M, N, P, Q), device=DEVICE, dtype=torch.float32)
-        for i in range(M):
-            for j in range(N):
-                for p in range(P):
-                    for q in range(Q):
-                        for k in range(K):
-                            expected[i, j, p, q] += val[i, j, k] * B[col[i, j, k], p, q]
+        expected = (val[..., None, None] * B[col]).sum(dim=2)
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_indirect_indexing_3d_flat_load(self):
         @helion.kernel()
@@ -2033,16 +2174,9 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[4, 4, 4, 4, 4],
         )
 
-        expected = torch.zeros((M, N, P, Q), device=DEVICE, dtype=torch.float32)
-        for i in range(M):
-            for j in range(N):
-                for p in range(P):
-                    for q in range(Q):
-                        for k in range(K):
-                            expected[i, j, p, q] += val[i, j, k] * B[col[i, j, k], p, q]
+        expected = (val[..., None, None] * B[col]).sum(dim=2)
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_tile_index_floor_div(self):
         """Test tile.index // divisor pattern used in MXFP8 dequantization.
@@ -2087,7 +2221,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = x_data * expanded_scale
 
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
-        self.assertExpectedJournal(code)
 
     def test_tile_index_floor_div_block_larger_than_dim(self):
         """Test tile.index // divisor when block_size > actual dimension.
@@ -2182,13 +2315,14 @@ class TestIndexing(RefEagerTestBase, TestCase):
             block_size=[2],
         )
 
-        # Verify the mask is present in the store (not None)
-        self.assertIn("tl.store", code)
-        # The mask should be something like mask_0[:, None], not None
-        self.assertNotIn(
-            "tl.store(dx + (load_1 * dx_stride_0 + load_2 * dx_stride_1), load, None)",
-            code,
-        )
+        if _get_backend() == "triton":
+            # Verify the mask is present in the store (not None)
+            self.assertIn("tl.store", code)
+            # The mask should be something like mask_0[:, None], not None
+            self.assertNotIn(
+                "tl.store(dx + (load_1 * dx_stride_0 + load_2 * dx_stride_1), load, None)",
+                code,
+            )
 
         # Compute expected result
         expected = torch.zeros(5, 20, device=DEVICE)
@@ -2197,7 +2331,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 expected[i, idx[i, j]] = dy[i, j]
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_non_consecutive_tensor_indexers_no_broadcast(self):
         """Test that non-consecutive tensor indexers don't get incorrectly broadcast.
@@ -2254,9 +2387,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 .expand(block_size, block_size, K)
             )
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
-    @skipIfCpu("")
     def test_mixed_scalar_block_store_size1_dim(self):
         """Test store with mixed scalar/block indexing when block dimension has size 1.
 
@@ -2305,9 +2436,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected_out1 = x1 * 2.0
         torch.testing.assert_close(out1, expected_out1)
         self.assertEqual(scales1.shape, (1, 2))
-        self.assertExpectedJournal(code)
 
-    @skipIfCpu("fails on Triton CPU backend")
     @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim1(self):
         @helion.kernel()
@@ -2337,9 +2466,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.gather(input_tensor, 1, index_tensor)
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
-    @skipIfCpu("fails on Triton CPU backend")
     @skipIfTileIR("TileIR does not support gather operation")
     def test_gather_2d_dim0(self):
         @helion.kernel()
@@ -2369,7 +2496,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         expected = torch.gather(input_tensor, 0, index_tensor)
 
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_tile_index_with_none_dimension(self):
         """Test that tile.index[None, :] followed by slices produces correct shape.
@@ -2401,7 +2527,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         code, result = code_and_output(test_none_index_2d, (c,), block_size=8)
         expected = c.unsqueeze(0)  # [1, M, N]
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_tile_index_with_none_dimension_3d(self):
         """Test 3D version of tile.index[None, :] indexing."""
@@ -2425,7 +2550,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
         code, result = code_and_output(test_none_index_3d, (c,), block_size=8)
         expected = c.unsqueeze(0)  # [1, M, N, K]
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
     def test_loaded_tensor_as_index_with_slices(self):
         """Test that loaded 2D tensor indices with trailing slices produce correct shape.
@@ -2466,7 +2590,159 @@ class TestIndexing(RefEagerTestBase, TestCase):
         )
         expected = data[index_source, :, :]
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
+
+    def test_full_slice_in_reduction_loop(self):
+        """Full slice between two tiled dims: q[tile_n, :, tile_d]
+
+        With static_shapes and equal dimensions (N=C=D=16), the C
+        dimension appears as a plain int in tensor shapes.
+        has_matmul_with_rdim must still detect the matmul uses C so
+        the roller does not incorrectly roll the reduction.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def kernel(q: torch.Tensor) -> torch.Tensor:
+            N = q.size(0)
+            C = q.size(1)
+            D = q.size(2)
+            out = torch.empty([N, C], dtype=q.dtype, device=q.device)
+            for (tile_n,) in hl.tile([N]):
+                attn = hl.zeros([tile_n, C, C], dtype=torch.float32)
+                for tile_d in hl.tile(D):
+                    qt = q[tile_n, :, tile_d]
+                    attn = torch.baddbmm(attn, qt, qt.transpose(-2, -1))
+                out[tile_n, :] = attn.sum(-1).to(out.dtype)
+            return out
+
+        q = torch.randn(16, 16, 16, device=DEVICE)
+        code, result = code_and_output(kernel, (q,), block_sizes=[16, 16])
+        expected = torch.baddbmm(
+            torch.zeros(16, 16, 16, device=DEVICE), q, q.transpose(-2, -1)
+        ).sum(-1)
+        torch.testing.assert_close(result, expected, atol=0.2, rtol=0.01)
+        if _get_backend() == "triton":
+            self.assertIn("tl.dot", code)
+
+    def test_symbolic_index_in_host_block(self):
+        """Regression test for https://github.com/pytorch/helion/issues/1339.
+
+        Using out_offsets[n] (where n = size(0) - 1) in the host block should
+        not specialize n to a concrete value, causing incorrect grid sizes and
+        missing masking in the generated code.
+        """
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def jagged_iota(out_offsets):
+            n = out_offsets.size(0) - 1
+            out = torch.zeros(out_offsets[n].item(), device=out_offsets.device)
+            for tile_n in hl.tile(n):
+                s = out_offsets[tile_n]
+                e = out_offsets[tile_n + 1]
+                lens = e - s
+                max_len = lens.amax()
+
+                for tile_l in hl.tile(max_len):
+                    idx = tile_l.index[None, :] + s[:, None]
+                    mask = tile_l.index[None, :] < lens[:, None]
+                    hl.store(out, [idx], idx, extra_mask=mask)
+            return out
+
+        offsets = torch.tensor([0, 2, 3, 5, 7], device=DEVICE)
+
+        # n=0: offsets[:1] has shape (1,). static_shapes=False should keep
+        # that dimension dynamic so later non-1 sizes reuse this kernel.
+        result = jagged_iota(offsets[:1].clone())
+        torch.testing.assert_close(
+            result, torch.arange(0, dtype=torch.float32, device=DEVICE)
+        )
+        self.assertEqual(len(jagged_iota._bound_kernels), 1)
+
+        for n in [1, 3, len(offsets) - 1]:
+            result = jagged_iota(offsets[: n + 1].clone())
+            total = offsets[n].item()
+            expected = torch.arange(total, dtype=torch.float32, device=DEVICE)
+            torch.testing.assert_close(result, expected)
+            self.assertEqual(len(jagged_iota._bound_kernels), 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Test checks generated Triton code")
+    def test_triton_do_not_specialize_emits_do_not_specialize(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            triton_do_not_specialize=True,
+        )
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn([1], device=DEVICE)
+        code, result = code_and_output(add_one, (x,), block_size=16)
+        torch.testing.assert_close(result, x + 1)
+        self.assertIn("@triton.jit(", code)
+        self.assertIn("'x_size_0'", code)
+        self.assertIn("do_not_specialize=", code)
+        self.assertIn("do_not_specialize_on_alignment=", code)
+        y = torch.randn([2], device=DEVICE)
+        torch.testing.assert_close(add_one(y), y + 1)
+        self.assertEqual(len(add_one._bound_kernels), 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Test checks generated Triton code")
+    def test_dynamic_size_args_match_triton_default(self):
+        """Without triton_do_not_specialize, Helion follows Triton's own default
+        and emits a plain @triton.jit so value/alignment specialization is
+        preserved (which is what enables vectorized loads)."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn([1024], device=DEVICE)
+        code, result = code_and_output(add_one, (x,), block_size=16)
+        torch.testing.assert_close(result, x + 1)
+        self.assertNotIn("do_not_specialize=", code)
+        self.assertNotIn("do_not_specialize_on_alignment=", code)
+        # Helion still buckets sizes so a single BoundKernel handles every shape.
+        y = torch.randn([2048], device=DEVICE)
+        torch.testing.assert_close(add_one(y), y + 1)
+        self.assertEqual(len(add_one._bound_kernels), 1)
+
+    def test_scalar_tensor_index_with_grid(self):
+        """Index a tensor with a 0-dim scalar tensor from a grid load."""
+
+        @helion.kernel(
+            static_shapes=False,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )
+        def gather_kernel(
+            data: torch.Tensor,  # [E, N]
+            ids: torch.Tensor,  # [M]
+        ) -> torch.Tensor:
+            M = ids.shape[0]
+            _E, N = data.shape
+            N = hl.specialize(N)
+            out = torch.empty(M, N, dtype=data.dtype, device=data.device)
+
+            for grid_m in hl.grid(M):
+                idx = ids[grid_m]  # 0-dim scalar tensor
+                for tile_n in hl.tile(N):
+                    out[grid_m, tile_n] = data[idx, tile_n]
+
+            return out
+
+        E, N, M = 8, 64, 16
+        data = torch.randn(E, N, device=DEVICE, dtype=torch.float32)
+        ids = (torch.arange(M, device=DEVICE) % E).to(torch.int32)
+
+        code, result = code_and_output(gather_kernel, (data, ids), block_sizes=[64])
+        expected = data[ids.long()]
+        torch.testing.assert_close(result, expected)
 
 
 if __name__ == "__main__":

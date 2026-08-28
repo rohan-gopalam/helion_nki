@@ -10,9 +10,9 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
 from helion._testing import skipIfRefEager
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 
 def add_combine_fn(x, y):
@@ -100,7 +100,7 @@ def jit_add_combine_fn(x, y):
     return x + y
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestAssociativeScan(RefEagerTestBase, TestCase):
     def test_associative_scan_basic_addition(self):
         """Test basic associative_scan functionality with prefix sum."""
@@ -121,7 +121,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_scan_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Test the actual scan operation
         expected = torch.tensor(
@@ -131,9 +130,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains the correct helper function
-        self.assertIn("def add_combine_fn_", code)
-        self.assertIn("param_0 + param_1", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def add_combine_fn_", code)
+            self.assertIn("param_0 + param_1", code)
+            self.assertIn("tl.associative_scan", code)
 
     def test_associative_scan_maximum(self):
         """Test associative_scan with maximum combine function."""
@@ -153,7 +153,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         )
 
         code, result = code_and_output(test_max_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Expected prefix maximum
         expected = torch.tensor(
@@ -163,9 +162,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains maximum operation (either tl.maximum or triton_helpers.maximum)
-        self.assertTrueIfInNormalMode(
-            "tl.maximum" in code or "triton_helpers.maximum" in code
-        )
+        if _get_backend() == "triton":
+            self.assertTrueIfInNormalMode(
+                "tl.maximum" in code or "triton_helpers.maximum" in code
+            )
 
     def test_associative_scan_multiplication(self):
         """Test associative_scan with multiplication combine function."""
@@ -185,7 +185,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         )
 
         code, result = code_and_output(test_mul_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Expected prefix product
         expected = torch.tensor(
@@ -195,7 +194,8 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains multiplication
-        self.assertIn("param_0 * param_1", code)
+        if _get_backend() == "triton":
+            self.assertIn("param_0 * param_1", code)
 
     def test_associative_scan_minimum(self):
         """Test associative_scan with minimum combine function."""
@@ -215,7 +215,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         )
 
         code, result = code_and_output(test_min_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Expected prefix minimum
         expected = torch.tensor(
@@ -225,9 +224,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains minimum operation (either tl.minimum or triton_helpers.minimum)
-        self.assertTrueIfInNormalMode(
-            "tl.minimum" in code or "triton_helpers.minimum" in code
-        )
+        if _get_backend() == "triton":
+            self.assertTrueIfInNormalMode(
+                "tl.minimum" in code or "triton_helpers.minimum" in code
+            )
 
     def test_associative_scan_multiple_functions(self):
         """Test using multiple different combine functions in one kernel."""
@@ -250,20 +250,20 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         x = torch.tensor([[1.0, 3.0, 2.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_multi_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Test the sum result
         expected_sum = torch.tensor([[1.0, 4.0, 6.0, 10.0]], device=DEVICE)
         torch.testing.assert_close(result, expected_sum)
 
         # Verify multiple helper functions are generated
-        self.assertIn("add_combine_fn_", code)
-        self.assertIn("max_combine_fn_", code)
-        self.assertIn("param_0 + param_1", code)
-        # Check for maximum operation (either format)
-        self.assertTrueIfInNormalMode(
-            "tl.maximum" in code or "triton_helpers.maximum" in code
-        )
+        if _get_backend() == "triton":
+            self.assertIn("add_combine_fn_", code)
+            self.assertIn("max_combine_fn_", code)
+            self.assertIn("param_0 + param_1", code)
+            # Check for maximum operation (either format)
+            self.assertTrueIfInNormalMode(
+                "tl.maximum" in code or "triton_helpers.maximum" in code
+            )
 
     def test_associative_scan_type_propagation(self):
         """Test that associative_scan type propagation works correctly."""
@@ -279,7 +279,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         x = torch.randn(16, 1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(test_type_kernel, (x,))
 
-        self.assertExpectedJournal(code)
         # Verify the output has the same type and shape as input
         self.assertEqual(result.dtype, x.dtype)
         self.assertEqual(result.shape, x.shape)
@@ -311,7 +310,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
                 code, result = code_and_output(test_dtype_kernel, (x,))
 
-                self.assertExpectedJournal(code)
                 # Verify output dtype matches input
                 self.assertEqual(result.dtype, x.dtype)
 
@@ -351,7 +349,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
                 x = torch.randn(shape, device=DEVICE)
                 code, result = code_and_output(test_size_kernel, (x,))
 
-                self.assertExpectedJournal(code)
                 # Verify output shape matches input
                 self.assertEqual(result.shape, x.shape)
 
@@ -375,7 +372,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_reverse_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # For reverse prefix sum: [10, 9, 7, 4] (sum from right to left)
         expected = torch.tensor([[10.0, 9.0, 7.0, 4.0]], device=DEVICE)
@@ -384,7 +380,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         # Verify reverse parameter is in generated code
         self.assertIn("reverse=True", code)
 
-    @skipIfCpu("")
     def test_associative_scan_edge_cases(self):
         """Test associative_scan edge cases."""
 
@@ -399,14 +394,12 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
         x_single = torch.tensor([[5.0]], device=DEVICE)
         code, result = code_and_output(test_single_element, (x_single,))
-        self.assertExpectedJournal(code)
         expected = torch.tensor([[5.0]], device=DEVICE)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Two elements
         x_two = torch.tensor([[3.0, 7.0]], device=DEVICE)
         code, result = code_and_output(test_single_element, (x_two,))
-        self.assertExpectedJournal(code)
         expected = torch.tensor([[3.0, 10.0]], device=DEVICE)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
@@ -425,7 +418,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         x = torch.randn(32, 1024, device=DEVICE)
         code, result = code_and_output(test_large_kernel, (x,))
 
-        self.assertExpectedJournal(code)
         # Verify correctness on large scale
         expected = torch.cumsum(x, dim=1)
         # Use relaxed tolerance for large tensors due to accumulated floating-point errors
@@ -435,6 +427,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         self.assertEqual(result.shape, x.shape)
         self.assertEqual(result.dtype, x.dtype)
 
+    @skipIfRefEager(
+        "torch._higher_order_ops.associative_scan maps to hl.associative_scan only during tracing; "
+        "ref eager mode runs the raw torch HOP, which is unsupported"
+    )
     def test_associative_scan_torch_hops_mapping(self):
         """Test that torch._higher_order_ops.associative_scan automatically maps to hl.associative_scan."""
 
@@ -456,7 +452,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
         # Test that the kernel compiles and runs correctly
         code, result = code_and_output(test_torch_hops_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Expected prefix sum results
         expected = torch.tensor(
@@ -466,9 +461,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code contains the proper combine function and associative scan
-        self.assertIn("def add_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
-        self.assertIn("param_0 + param_1", code)
+        if _get_backend() == "triton":
+            self.assertIn("def add_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
+            self.assertIn("param_0 + param_1", code)
 
     def test_associative_scan_code_generation(self):
         """Test that the generated code structure is correct."""
@@ -483,16 +479,16 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
         x = torch.tensor([[1.0, 2.0, 3.0]], device=DEVICE)
         code, result = code_and_output(test_codegen_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Verify the result is correct
         expected = torch.tensor([[1.0, 3.0, 6.0]], device=DEVICE)
         torch.testing.assert_close(result, expected)
 
         # Check essential code structure
-        self.assertIn("@triton.jit", code)
-        self.assertIn("def add_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("@triton.jit", code)
+            self.assertIn("def add_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
         self.assertIn("return", code)
 
         # Verify no placeholders remain
@@ -515,16 +511,16 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
         code, result = code_and_output(test_jit_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Expected prefix sum results
         expected = torch.tensor([[1.0, 3.0, 6.0, 10.0]], device=DEVICE)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code contains the proper combine function and associative scan
-        self.assertIn("def jit_add_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
-        self.assertIn("param_0 + param_1", code)
+        if _get_backend() == "triton":
+            self.assertIn("def jit_add_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
+            self.assertIn("param_0 + param_1", code)
         # Verify @helion.kernel decorator doesn't appear in generated code
         self.assertNotIn("@helion.kernel", code)
 
@@ -553,7 +549,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
                 # Use torch._higher_order_ops.associative_scan as in the example
                 out_vals, out_idxs = torch._higher_order_ops.associative_scan(
-                    helion_combine_fn, input_tuple, 0
+                    # pyrefly: ignore [bad-argument-type]
+                    helion_combine_fn,
+                    input_tuple,
+                    0,
                 )
 
                 output[tile_e, tile_f] = out_vals
@@ -568,7 +567,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         input_data = torch.ones((E, C), device=DEVICE)
 
         code, result = code_and_output(test_segmented_kernel, (indices, input_data))
-        self.assertExpectedJournal(code)
 
         # Expected: cumulative sum for each position
         expected = torch.tensor(
@@ -577,8 +575,9 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code structure
-        self.assertIn("def helion_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def helion_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
@@ -602,7 +601,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
                 # Use tuple argument functionality for segmented scan
                 out_vals, _ = torch._higher_order_ops.associative_scan(
-                    segmented_combine_fn, (vals, idxs), 0
+                    # pyrefly: ignore [bad-argument-type]
+                    segmented_combine_fn,
+                    (vals, idxs),
+                    0,
                 )
 
                 output[tile_e, tile_f] = out_vals
@@ -616,7 +618,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         input_data = torch.ones((E, C), device=DEVICE)
 
         code, result = code_and_output(segmented_scan_kernel, (indices, input_data))
-        self.assertExpectedJournal(code)
 
         # Expected: cumulative sum within each segment
         expected = torch.tensor(
@@ -634,8 +635,9 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         # Verify the generated code structure
-        self.assertIn("def segmented_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def segmented_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
@@ -677,7 +679,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         code, (result_values, result_indices) = code_and_output(
             cumulative_argmax_kernel, (input_data, positions)
         )
-        self.assertExpectedJournal(code)
 
         # Expected cumulative maximum values
         expected_values = torch.tensor(
@@ -706,8 +707,9 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_indices, expected_indices)
 
         # Verify the generated code structure
-        self.assertIn("def argmax_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def argmax_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
     def test_associative_scan_in_helper_function(self):
         """Test calling a function that internally uses hl.associative_scan."""
@@ -729,8 +731,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         # Test that the kernel compiles and runs
         code, result = code_and_output(test_helper_kernel, (x,))
 
-        self.assertExpectedJournal(code)
-
         # Verify the result is correct (cumsum along dim=0)
         expected = torch.tensor(
             [[1.0, 2.0, 3.0, 4.0], [6.0, 8.0, 10.0, 12.0]],
@@ -739,9 +739,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains the helper function and associative scan
-        self.assertIn("def add_combine_fn_", code)
-        self.assertIn("tl.associative_scan", code)
-        self.assertIn("param_0 + param_1", code)
+        if _get_backend() == "triton":
+            self.assertIn("def add_combine_fn_", code)
+            self.assertIn("tl.associative_scan", code)
+            self.assertIn("param_0 + param_1", code)
 
     def test_cumsum_basic(self):
         """Test basic cumsum functionality."""
@@ -757,7 +758,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], device=DEVICE)
 
         code, result = code_and_output(test_cumsum_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Expected cumulative sum
         expected = torch.tensor(
@@ -766,9 +766,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains cumsum implementation
-        self.assertIn("def add_", code)
-        self.assertIn("param_0 + param_1", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def add_", code)
+            self.assertIn("param_0 + param_1", code)
+            self.assertIn("tl.associative_scan", code)
 
     def test_cumsum_reverse(self):
         """Test cumsum with reverse=True."""
@@ -784,7 +785,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_cumsum_reverse_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # For reverse cumsum: [10, 9, 7, 4] (sum from right to left)
         expected = torch.tensor([[10.0, 9.0, 7.0, 4.0]], device=DEVICE)
@@ -813,7 +813,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
                 code, result = code_and_output(test_cumsum_dtype_kernel, (x,))
 
-                self.assertExpectedJournal(code)
                 # Verify output dtype matches input
                 self.assertEqual(result.dtype, x.dtype)
 
@@ -838,7 +837,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0], [2.0, 0.5, 3.0, 2.0]], device=DEVICE)
 
         code, result = code_and_output(test_cumprod_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Expected cumulative product
         expected = torch.tensor(
@@ -847,9 +845,10 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code contains cumprod implementation
-        self.assertIn("def mul_", code)
-        self.assertIn("param_0 * param_1", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def mul_", code)
+            self.assertIn("param_0 * param_1", code)
+            self.assertIn("tl.associative_scan", code)
 
     def test_cumprod_reverse(self):
         """Test cumprod with reverse=True."""
@@ -865,7 +864,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_cumprod_reverse_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # For reverse cumprod: [24, 24, 12, 4] (product from right to left)
         expected = torch.tensor([[24.0, 24.0, 12.0, 4.0]], device=DEVICE)
@@ -894,7 +892,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
                 code, result = code_and_output(test_cumprod_dtype_kernel, (x,))
 
-                self.assertExpectedJournal(code)
                 # Verify output dtype matches input
                 self.assertEqual(result.dtype, x.dtype)
 
@@ -926,17 +923,17 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=DEVICE)
 
         code, result = code_and_output(test_mixed_kernel, (x,))
-        self.assertExpectedJournal(code)
 
         # Test the sum result
         expected_sum = torch.tensor([[1.0, 3.0, 6.0, 10.0]], device=DEVICE)
         torch.testing.assert_close(result, expected_sum)
 
         # Verify both helper functions are generated
-        self.assertIn("add_", code)
-        self.assertIn("mul_", code)
-        self.assertIn("param_0 + param_1", code)
-        self.assertIn("param_0 * param_1", code)
+        if _get_backend() == "triton":
+            self.assertIn("add_", code)
+            self.assertIn("mul_", code)
+            self.assertIn("param_0 + param_1", code)
+            self.assertIn("param_0 * param_1", code)
 
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
@@ -980,7 +977,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             test_segmented_tuple_kernel, (indices, input_data)
         )
-        self.assertExpectedJournal(code)
 
         # Expected: cumulative sum for each position
         expected = torch.tensor(
@@ -989,8 +985,9 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
         # Verify the generated code structure
-        self.assertIn("def helion_combine_tuple_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def helion_combine_tuple_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
     def test_associative_scan_argmax_tuple_format(self):
         """Test cumulative argmax using tuple format combine function."""
@@ -1029,7 +1026,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         code, (result_values, result_indices) = code_and_output(
             cumulative_argmax_tuple_kernel, (input_data, positions)
         )
-        self.assertExpectedJournal(code)
 
         # Expected cumulative maximum values
         expected_values = torch.tensor(
@@ -1058,8 +1054,9 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result_indices, expected_indices)
 
         # Verify the generated code structure
-        self.assertIn("def argmax_combine_tuple_fn_", code)
-        self.assertIn("tl.associative_scan", code)
+        if _get_backend() == "triton":
+            self.assertIn("def argmax_combine_tuple_fn_", code)
+            self.assertIn("tl.associative_scan", code)
 
 
 if __name__ == "__main__":

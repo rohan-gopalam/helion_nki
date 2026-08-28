@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import base64
+import ast
 import contextlib
+import copy
 import dataclasses
 import functools
 import inspect
@@ -15,6 +16,7 @@ import textwrap
 import time
 import types
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import Generic
 from typing import Hashable
@@ -25,26 +27,34 @@ from typing import overload
 from typing_extensions import Protocol
 
 import torch
+from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codecache import compiled_fx_graph_hash
 from torch._subclasses import FakeTensor
+import torch.distributed as dist
 from torch.utils._pytree import tree_map_only
 from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
+from .._compat import target_device_capability
 from .._compile_time import measure
 from .._compiler.ast_extension import unparse
-from .._compiler.backend import TritonBackend
+from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+from .._compiler.compile_environment import (
+    tensor_descriptor_layout_signature_from_strides,
+)
 from .._compiler.generate_ast import generate_ast
-from .._compiler.host_function import HostFunction
 from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
+from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
-from .._compiler.output_header import get_needed_imports
 from .._compiler.variable_origin import ArgumentOrigin
+from .._dist_utils import _find_process_group_name
+from .._dist_utils import check_config_consistancy as dist_check_config_consistancy
 from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
@@ -60,12 +70,35 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
 
     ConfigLike = Config | dict[str, object]
 
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> bool:
+    if indexing == "tensor_descriptor":
+        return True
+    if isinstance(indexing, list):
+        return index < len(indexing) and indexing[index] == "tensor_descriptor"
+    return False
+
+
+def _td_layout_guard_active_for_config(
+    guard: TensorDescriptorLayoutGuard, config: Config
+) -> bool:
+    return any(
+        _indexing_config_uses_tensor_descriptor(config.indexing, index)
+        for index in guard.memory_op_indices
+    ) or any(
+        _indexing_config_uses_tensor_descriptor(config.atomic_indexing, index)
+        for index in guard.atomic_op_indices
+    )
+
+
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
 
@@ -106,12 +139,29 @@ def _resolve_index_dtype(
     return index_dtype
 
 
+def _device_specialization_key(
+    args: Sequence[object],
+) -> tuple[str | None, tuple[int, int] | None]:
+    """Return the recursive argument device key used by bound-kernel caching.
+
+    `_find_device` intentionally searches tensors and bare `torch.device`
+    objects inside supported containers to match binding device selection.
+    Capability splits mixed-sm cache entries. Device index remains excluded so
+    same-capability devices share bound kernels, matching prior behavior.
+    """
+    try:
+        device = _find_device(tuple(args))
+    except exc.NoTensorArgs:
+        return None, None
+    return device.type, target_device_capability(device)
+
+
 class Kernel(Generic[_R]):
     def __init__(
         self,
         fn: Callable[..., _R],
         *,
-        configs: list[ConfigLike] | None = None,
+        configs: Sequence[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
     ) -> None:
@@ -135,8 +185,8 @@ class Kernel(Generic[_R]):
         self._key_fn: Callable[..., Hashable] | None = key
         self.configs: list[Config] = [
             # pyrefly: ignore [bad-argument-type]
-            Config(**c) if isinstance(c, dict) else c
-            for c in configs or []
+            Config(**config) if isinstance(config, dict) else config
+            for config in configs or []
         ]
         self._bound_kernels: dict[BoundKernelInMemoryCacheKey, BoundKernel] = {}
         self._specialize_extra: dict[
@@ -218,7 +268,7 @@ class Kernel(Generic[_R]):
                 raise TypeError(
                     f"Too many arguments passed to the kernel, expected: {self._num_params} got: {len(args)}."
                 )
-            signature = self.specialization_key(args)
+            signature = self._base_specialization_key(args)
             cache_key = self._get_bound_kernel_cache_key(args, signature)
             bound_kernel = (
                 None if cache_key is None else self._bound_kernels.get(cache_key, None)
@@ -237,20 +287,14 @@ class Kernel(Generic[_R]):
                 self._bound_kernels[cache_key] = bound_kernel
             return bound_kernel
 
-    def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
+    def _base_specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
         """
-        Generate a specialization key for the given arguments.
-
-        This method generates a unique key for the arguments based on their types
-        and the corresponding extractor functions defined in `_specialization_extractors`.
-
-        Args:
-            args: The arguments to generate a specialization key for.
-
-        Returns:
-            Hashable: A hashable key representing the specialization of the arguments.
+        Generate the base specialization key from input argument metadata only,
+        using the per-type extractor functions defined in `_specialization_extractors`,
+        without any extras discovered during compilation. Used internally for
+        _specialize_extra lookups.
         """
-        result = []
+        result: list[Hashable] = []
         assert len(args) <= len(self._annotations)
         for value, annotation in zip(args, self._annotations, strict=False):
             if isinstance(value, ConstExpr):
@@ -259,9 +303,31 @@ class Kernel(Generic[_R]):
                 result.append(value)
             else:
                 result.append(self._specialization_key(value))
+        device_type, device_capability = _device_specialization_key(args)
         if self._key_fn is not None:
-            return (*result, self._key_fn(*args))
-        return (*result,)
+            return (*result, device_type, device_capability, self._key_fn(*args))
+        return (*result, device_type, device_capability)
+
+    def specialization_key(self, args: Sequence[object]) -> tuple[Hashable, ...]:
+        """
+        Generate the full specialization key for the given arguments, including
+        any additional specialization constraints discovered during compilation
+        (e.g. from hl.specialize() calls).
+
+        Before the first compilation, these extras are not yet known and the
+        key may be incomplete.
+
+        Args:
+            args: The arguments to generate a specialization key for.
+
+        Returns:
+            Hashable: A hashable key representing the specialization of the arguments.
+        """
+        base = self._base_specialization_key(args)
+        extra_fns = self._specialize_extra.get(base)
+        if extra_fns is not None:
+            return base + tuple([s(args) for s in extra_fns])
+        return base
 
     def _specialization_key(self, obj: object) -> Hashable:
         """
@@ -276,21 +342,22 @@ class Kernel(Generic[_R]):
         Returns:
             Hashable: A hashable key representing the specialization of the object.
         """
-        try:
-            extractor = _specialization_extractors[type(obj)]
-        except KeyError:
+        extractor = _specialization_extractors.get(type(obj))
+        if extractor is None:
             if isinstance(obj, torch.fx.GraphModule):
                 # GraphModule subclasses need special handling
                 extractor = _specialization_extractors[torch.fx.GraphModule]
+            elif isinstance(obj, torch.Tensor):
+                # torch.Tensor subclasses (e.g. the JAX-export adapter)
+                # share the standard tensor specialization key.
+                extractor = _specialization_extractors[torch.Tensor]
             elif isinstance(obj, tuple) and hasattr(obj, "_fields"):
                 # this is a namedtuple
                 extractor = _specialization_extractors["namedtuple"]
             elif dataclasses.is_dataclass(obj):
                 extractor = _specialization_extractors["dataclass"]
             else:
-                raise TypeError(
-                    f"unsupported argument type: {type(obj).__name__}"
-                ) from None
+                raise TypeError(f"unsupported argument type: {type(obj).__name__}")
         return extractor(self, obj)
 
     def normalize_args(self, *args: object, **kwargs: object) -> tuple[object, ...]:
@@ -357,6 +424,28 @@ class Kernel(Generic[_R]):
         """
         self._bound_kernels.clear()
 
+    @property
+    def jax_fn(self) -> Callable[..., Any]:
+        """A pure-JAX callable view of this Helion kernel.
+
+        Pallas-backend kernels can be called directly with JAX arrays
+        or tracers (i.e. inside ``jax.jit``) by going through this
+        property.  The kernel's compile/specialize path runs the first
+        time the callable is invoked; subsequent calls reuse the
+        cached compilation just like ``__call__``.
+
+        This only supports kernels compiled for the Pallas backend.
+        """
+        from .pallas_jax_export import make_jax_fn
+
+        cached = getattr(self, "_jax_fn_callable", None)
+        if cached is not None:
+            return cast("Callable[..., Any]", cached)
+        rv = make_jax_fn(self)
+        # pyrefly: ignore [unsupported-attribute-set]
+        self._jax_fn_callable = rv
+        return rv
+
 
 class BoundKernel(_AutotunableKernel, Generic[_R]):
     def __init__(
@@ -395,6 +484,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return
 
         with self.env:
+            self._env.process_group_name = _find_process_group_name(kernel.fn, args)
+
             assert len(args) == len(self.kernel.signature.parameters)
             self.fake_args: list[object] = []
             constexpr_args = {}
@@ -427,9 +518,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 measure("BoundKernel.create_host_function"),
             ):
                 try:
-                    # pyrefly: ignore [bad-assignment]
-                    self.host_function: HostFunction = HostFunction(
-                        # pyrefly: ignore [bad-argument-type]
+                    compiler = KernelCompiler(self.env)
+                    self.host_function: HostFunction = compiler.compile(
                         self.kernel.fn,
                         self.fake_args,
                         constexpr_args,
@@ -438,6 +528,62 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     config = self.env.config_spec.default_config()
                     self.maybe_log_repro(log.warning, args, config=config)
                     raise
+
+                self.env.config_spec.configure_epilogue_subtile_autotune(args)
+                self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
+                    self.env,
+                    self.host_function.device_ir,
+                )
+
+                # Post-compile FX-graph scan to detect kernels
+                # whose tcgen05 matmul is followed by an
+                # aux-fused store
+                # (``out[tile] = (acc + residual[tile]).to(...)``
+                # and variants — see
+                # ``host_function_has_tcgen05_aux_kernel_pattern``
+                # for the accepted shapes). When detected, the
+                # autotune surface widens to admit
+                # ``tcgen05_strategy=ROLE_LOCAL_WITH_SCHEDULER``
+                # + ``tcgen05_warp_spec_c_input_warps=1`` so the
+                # productive C-input warp lift is reachable from
+                # the normal autotune path. For pure-matmul
+                # kernels the detector returns False and the
+                # autotune surface keeps the narrow
+                # ``MONOLITHIC + c_input_warps=0`` shape so
+                # autotune cannot sample the strictly-worse
+                # inert C-input warp configuration.
+                # The exact-shape detector is narrower: it gates the
+                # ``tcgen05_aux_load_mode=tma`` seed/search axis.
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_aux_kernel_pattern,
+                )
+                from .._compiler.cute.aux_tensor import (
+                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
+                )
+                from .._compiler.cute.aux_tensor import (
+                    host_function_matmul_has_non_tcgen05_operand,
+                )
+
+                self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
+                    host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
+                )
+                self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
+                    host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
+                        self.host_function
+                    )
+                )
+                self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
+                    host_function_matmul_has_non_tcgen05_operand(self.host_function)
+                )
+                if not self.env.settings.disable_autotuner_heuristics:
+                    for seed_config in self.env.config_spec.autotune_seed_configs():
+                        if (
+                            seed_config
+                            not in self.env.config_spec.compiler_seed_configs
+                        ):
+                            self.env.config_spec.compiler_seed_configs.append(
+                                seed_config
+                            )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -479,13 +625,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
     @property
     def configs(self) -> list[Config]:
-        """
-        Alias for `self.kernel.configs`.
-
-        Returns:
-            list[Config]: The list of configurations.
-        """
+        """Return the kernel's configured configs (alias for `self.kernel.configs`)."""
         return self.kernel.configs
+
+    def _normalize_config(self, config: ConfigLike) -> Config:
+        if isinstance(config, Config):
+            return config
+        # pyrefly: ignore [bad-argument-type]
+        return Config(**config)
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
@@ -497,7 +644,54 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             parts.append(f"index_dtype={settings.index_dtype}")
         return f"@helion.kernel({', '.join(parts)})"
 
-    def to_triton_code(
+    def _complete_nki_partial_config(self, config: Config) -> None:
+        if self.env.backend.name != "nki":
+            return
+        block_sizes = config.config.get("block_sizes")
+        if block_sizes is None:
+            return
+
+        def _flatten(values: object) -> list[object]:
+            if isinstance(values, (list, tuple)):
+                result: list[object] = []
+                for value in values:
+                    result.extend(_flatten(value))
+                return result
+            return [values]
+
+        values = _flatten(block_sizes)
+        expected = len(self.env.config_spec.block_sizes)
+        if not values or len(values) >= expected:
+            return
+        default_block_sizes = self.env.config_spec.default_config().config.get(
+            "block_sizes", []
+        )
+        if not isinstance(default_block_sizes, list) or len(default_block_sizes) < expected:
+            return
+        safe_defaults = list(default_block_sizes)
+        for i, spec in enumerate(self.env.config_spec.block_sizes):
+            if i >= len(safe_defaults):
+                break
+            if i == 0:
+                continue
+            size_hint = int(max(spec.size_hint, 1))
+            safe = min(int(safe_defaults[i]), 128)
+            while safe > 1 and size_hint % safe != 0:
+                safe //= 2
+            safe_defaults[i] = max(safe, 1)
+        config.config["block_sizes"] = [
+            *values,
+            *safe_defaults[len(values) : expected],
+        ]
+
+    @staticmethod
+    def _clone_config(config: Config) -> Config:
+        return Config(
+            platform_target=config.platform_target,
+            **copy.deepcopy(config.config),
+        )
+
+    def to_code(
         self,
         config: ConfigLike | None = None,
         *,
@@ -505,21 +699,28 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         output_origin_lines: bool | None = None,
     ) -> str:
         """
-        Generate Triton code for the kernel based on the given configuration.
+        Generate backend-specific code for the kernel based on the given configuration.
 
         Args:
             config: The configuration to use for code generation.
-            emit_repro_caller: Emits a main function to call the triton kernel with example inputs.
+            emit_repro_caller: Emits a main function to call the kernel with example inputs.
 
         Returns:
-            str: The generated Triton code as a string.
+            str: The generated code as a string.
         """
         if config is None:
             config = self._require_implicit_config()
-        with self.env, measure("BoundKernel.to_triton_code"):
-            if not isinstance(config, Config):
-                # pyrefly: ignore [bad-argument-type]
-                config = Config(**config)
+        with self.env, measure("BoundKernel.to_code"):
+            config = self._normalize_config(config)
+            # Work on a copy so the caller's Config is not mutated with
+            # normalize defaults (e.g. indexing, load_eviction_policies)
+            # specific to this BoundKernel's config_spec.  Without this,
+            # reusing the same Config across compilations with different
+            # constexpr values carries stale entries from an earlier call.
+            # _clone_config preserves platform_target (NKI), which a plain
+            # Config(**config.config) would drop.
+            config = self._clone_config(config)
+            self._complete_nki_partial_config(config)
             self.env.config_spec.normalize(config)
             with measure("BoundKernel.generate_ast"):
                 # pyrefly: ignore [bad-argument-type]
@@ -527,9 +728,41 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if output_origin_lines is None:
                 output_origin_lines = self.settings.output_origin_lines
             with measure("BoundKernel.unparse"):
-                return get_needed_imports(root) + unparse(
-                    root, output_origin_lines=output_origin_lines
-                )
+                import_lines: list[str] = []
+                body_start = 0
+                for i, stmt in enumerate(root.body):
+                    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                        if not (
+                            isinstance(stmt, ast.ImportFrom)
+                            and stmt.module == "__future__"
+                        ):
+                            import_lines.append(ast.unparse(stmt))
+                        continue
+                    body_start = i
+                    break
+                else:
+                    body_start = len(root.body)
+                body_root = ast.Module(body=root.body[body_start:], type_ignores=[])
+                ast.fix_missing_locations(body_root)
+                imports = "\n".join(import_lines)
+                body = unparse(body_root, output_origin_lines=output_origin_lines)
+                if imports:
+                    return f"from __future__ import annotations\n\n{imports}\n\n{body}"
+                return f"from __future__ import annotations\n\n{body}"
+
+    def to_triton_code(
+        self,
+        config: ConfigLike | None = None,
+        *,
+        emit_repro_caller: bool = False,
+        output_origin_lines: bool | None = None,
+    ) -> str:
+        """Backward-compatible alias for :meth:`to_code`."""
+        return self.to_code(
+            config,
+            emit_repro_caller=emit_repro_caller,
+            output_origin_lines=output_origin_lines,
+        )
 
     def compile_config(
         self, config: ConfigLike | None = None, *, allow_print: bool = True
@@ -546,25 +779,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self._normalize_config(config)
+        dist_check_config_consistancy(
+            config, process_group_name=self._env.process_group_name
+        )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
-        if (
-            isinstance(self.env.backend, TritonBackend)
-            and "TRITON_CACHE_DIR" not in os.environ
-        ):
-            from ..autotuner.local_cache import helion_triton_cache_dir
-
-            device_index = (
-                self._env.device.index if self._env.device.index is not None else 0
-            )
-            triton_dir = helion_triton_cache_dir(device_index)
-            os.environ["TRITON_CACHE_DIR"] = triton_dir
-            log.debug("Set TRITON_CACHE_DIR=%s", triton_dir)
+        device_index = (
+            self._env.device.index if self._env.device.index is not None else 0
+        )
+        self.env.backend.setup_compile_cache_dir(device_index)
         try:
             print("      [Profile] Starting to_triton_code...", file=sys.stderr)
             t_start = time.time()
@@ -590,7 +814,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if allow_print:
             log.info("Output code written to: %s", module.__file__)
             log.debug("Debug string: \n%s", LazyString(lambda: self._debug_str()))
-            if self.settings.print_output_code:
+
+            # for distributed kernel, print rank1 code since rank0
+            # code can skip some offset computation.
+            if (
+                not dist.is_initialized() or dist.get_rank() == 1
+            ) and self.settings.print_output_code:
                 log.info("Output code: \n%s", triton_code)
                 print(f"# Output code written to: {module.__file__}", file=sys.stderr)
                 print(triton_code, file=sys.stderr)
@@ -598,6 +827,27 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         self._compile_cache[config] = rv
         self._cache_path_map[config] = module.__file__
         return rv
+
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., object]:
+        return self.compile_config(config, allow_print=allow_print)
+
+    def extra_cache_key(self) -> str:
+        """Return extra data folded into the disk-cache key.
+
+        Returns ``""`` by default, leaving the cache key unchanged.
+        """
+        return ""
+
+    def supports_subprocess_benchmark(self) -> bool:
+        return True
+
+    def is_cacheable(self) -> bool:
+        return True
 
     def get_cached_path(self, config: ConfigLike | None = None) -> str | None:
         """
@@ -610,11 +860,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         if config is None:
             config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self._normalize_config(config)
         return self._cache_path_map.get(config, None)
 
     def _debug_str(self) -> str:
@@ -654,7 +900,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             Config: The best configuration found during autotuning.
         """
-        config = self.env.backend.autotune(self, args, force=force, **kwargs)
+        ephemeral = self.env.backend.make_ephemeral_cache()
+        ctx = ephemeral if ephemeral is not None else contextlib.nullcontext()
+        with ctx:
+            config = self.env.backend.autotune(self, args, force=force, **kwargs)
+        if ephemeral is not None:
+            self.env.backend.finalize_ephemeral_cache(self, config)
         self.set_config(config)
         return config
 
@@ -667,13 +918,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Args:
             config: The configuration to set.
         """
-        if not isinstance(config, Config):
-            config = Config(
-                # pyrefly: ignore [bad-argument-type]
-                **config
-            )
+        config = self._normalize_config(config)
         self._run = self.compile_config(config)
         self._config = config
+        counters["best_config_decorator"][
+            self.format_kernel_decorator(config, self.settings)
+        ] = 1
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
@@ -683,7 +933,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
-        if not self.env.specialized_vars:
+        if (
+            not self.env.specialized_vars
+            and not self.env.tensor_descriptor_layout_guards
+        ):
             return []
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
@@ -724,6 +977,19 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
                     return stride_extractor
                 raise exc.SpecializeArgType(v)
+            if isinstance(v, GetItemSource):
+                if not isinstance(v.index, int) or v.index_is_slice:
+                    raise exc.SpecializeArgType(v)
+                inner = make_extractor(v.base)
+
+                def getitem_extractor(
+                    args: Sequence[object],
+                    _inner: Callable[[Sequence[object]], Hashable] = inner,
+                    _index: int = v.index,
+                ) -> Hashable:
+                    return cast("Sequence[object]", _inner(args))[_index]
+
+                return getitem_extractor
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
                 return operator.itemgetter(index)
@@ -732,34 +998,85 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         arg_name_to_index: dict[str, int] = {
             n: i for i, n in enumerate(self.kernel.signature.parameters.keys())
         }
-        extractors = []
+        extractors: list[Callable[[Sequence[object]], Hashable]] = []
         for v in sorted(self.env.specialized_vars, key=lambda v: v.name):
             source = self.env.shape_env.var_to_sources[v][0]
             extractors.append(make_extractor(source))
+        implicit_config = self._fixed_config_for_td_layout_guards()
+        for source, guard in sorted(
+            self.env.tensor_descriptor_layout_guards.items(),
+            key=lambda item: repr(item[0]),
+        ):
+            if implicit_config is not None and not _td_layout_guard_active_for_config(
+                guard, implicit_config
+            ):
+                continue
+            extract_tensor = make_extractor(source)
+
+            def td_layout_extractor(
+                args: Sequence[object],
+                _extract_tensor: Callable[
+                    [Sequence[object]], Hashable
+                ] = extract_tensor,
+                _ndim: int = guard.ndim,
+                _element_size: int = guard.element_size,
+            ) -> Hashable:
+                tensor = cast("torch.Tensor", _extract_tensor(args))
+                if tensor.ndim != _ndim:
+                    return ("ndim", tensor.ndim)
+                return tensor_descriptor_layout_signature_from_strides(
+                    tensor.stride(),
+                    _element_size,
+                )
+
+            extractors.append(td_layout_extractor)
         return extractors
+
+    def _fixed_config_for_td_layout_guards(self) -> Config | None:
+        """Return the fixed config if TD layout guards can be filtered safely."""
+        if self._config is not None:
+            return self._config
+        if self.kernel.settings.autotune_effort == "none" and (
+            len(self.kernel.configs) == 0 or self.settings.force_autotune
+        ):
+            return self.config_spec.default_config()
+        if self.settings.force_autotune:
+            return None
+        if len(self.kernel.configs) == 1:
+            return self.kernel.configs[0]
+        return None
+
+    def _user_provided_config(self) -> Config | None:
+        """Return a config if the user explicitly provided one, else None.
+
+        Checks the kernel's config list and settings to determine if
+        a config can be resolved without autotuning.
+        """
+        configs = self.kernel.configs
+        if self.kernel.settings.autotune_effort == "none" and (
+            len(configs) == 0 or self.settings.force_autotune
+        ):
+            config = self.config_spec.default_config()
+            if not is_ref_mode_enabled(self.kernel.settings):
+                kernel_decorator = self.format_kernel_decorator(config, self.settings)
+                print(
+                    f"Using implicit config: {kernel_decorator}",
+                    file=sys.stderr,
+                )
+            return config
+        if self.settings.force_autotune:
+            return None
+        if len(configs) == 1:
+            return configs[0]
+        return None
 
     def _implicit_config(self) -> Config | None:
         """
         Returns a single config that is implicitly used by this kernel, if any.
         """
-        configs = self.kernel.configs
         if self._config is not None:
             return self._config
-        if self.settings.force_autotune:
-            # If force autotune is enabled, do not pick an implicit config
-            return None
-        if len(configs) == 1:
-            return configs[0]
-        if len(configs) == 0 and self.kernel.settings.autotune_effort == "none":
-            config = self.config_spec.default_config()
-            if not is_ref_mode_enabled(self.kernel.settings):
-                kernel_decorator = self.format_kernel_decorator(config, self.settings)
-                print(
-                    f"Using default config: {kernel_decorator}",
-                    file=sys.stderr,
-                )
-            return config
-        return None
+        return self._user_provided_config()
 
     def _require_implicit_config(self) -> Config:
         """
@@ -810,14 +1127,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
-        if is_ref_mode_enabled(self.kernel.settings):
-            if (config := self._implicit_config()) is not None:
-                self._config = config
-            return self.run_ref(*args)
-
         if self._run is None:
+            if is_ref_mode_enabled(self.kernel.settings):
+                if (config := self._implicit_config()) is not None:
+                    self._config = config
+                return self.run_ref(*args)
             self.ensure_config_exists(args)
             assert self._run is not None
+            self.maybe_log_repro(log.warning, args)
 
         assert self._config is not None
         counters["best_config_decorator"][
@@ -840,7 +1157,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         For the Triton backend, this is the base32 encoding of the SHA-256
         hash that Triton uses to cache compiled GPU binaries under
-        ``TRITON_CACHE_DIR/<key>/``.
+        ``TRITON_CACHE_DIR/<key>/``.  For the CuTe backend, it is the base32
+        encoding of the SHA-256 hash of the compiled IR module, which names the
+        ``CUTE_DSL_CACHE_DIR/<key>.mlir`` artifact.
 
         Args:
             config: The configuration to look up. Defaults to the implicit config.
@@ -849,35 +1168,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             str | None: The cache key, or None if the kernel hasn't been
             JIT-compiled yet or the backend doesn't support cache keys.
         """
-        if not isinstance(self.env.backend, TritonBackend):
-            return None
-
         if config is None:
             config = self._require_implicit_config()
-        if not isinstance(config, Config):
-            config = Config(**config)  # pyrefly: ignore [bad-argument-type]
+        config = self._normalize_config(config)
         compiled_fn = self._compile_cache.get(config)
         if compiled_fn is None:
             return None
-
-        # Get the jit_fn that - for helion - starts with _helion_
-        triton_jit_fn = compiled_fn.__globals__.get(f"_helion_{self.kernel.name}")
-        if triton_jit_fn is None:
-            return None
-
-        try:
-            for cache_tuple in triton_jit_fn.device_caches.values():
-                compiled_kernels = cache_tuple[0]
-                for compiled_kernel in compiled_kernels.values():
-                    h = getattr(compiled_kernel, "hash", None)
-                    if h is not None:
-                        return base64.b32encode(bytes.fromhex(h)).decode().rstrip("=")
-        except (AttributeError, IndexError, TypeError, ValueError):
-            # device_caches, cache-tuple layout, and CompiledKernel.hash are
-            # Triton-internal details that may change across Triton versions
-            # return None gracefully if this fails
-            return None
-        return None
+        return self.env.backend.compiled_cache_key(self, compiled_fn)
 
     def maybe_log_repro(
         self,
@@ -977,7 +1274,7 @@ def kernel(
     fn: Callable[..., _R],
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R]: ...
@@ -988,7 +1285,7 @@ def kernel(
     fn: None = None,
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> _KernelDecorator: ...
@@ -998,7 +1295,7 @@ def kernel(
     fn: Callable[..., _R] | None = None,
     *,
     config: ConfigLike | None = None,
-    configs: list[ConfigLike] | None = None,
+    configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
@@ -1039,24 +1336,75 @@ def kernel(
 
     if fn is None:
         return functools.partial(
-            kernel, configs=configs, settings=settings_obj, key=key
+            kernel,
+            configs=configs,
+            settings=settings_obj,
+            key=key,
         )
-    return Kernel(fn, configs=configs, settings=settings_obj, key=key)
+    return Kernel(
+        fn,
+        configs=configs,
+        settings=settings_obj,
+        key=key,
+    )
+
+
+def _hashable_dim(s: int | torch.SymInt) -> Hashable:
+    if isinstance(s, torch.SymInt):
+        return (id(s.node.shape_env), s.node.expr)
+    return s
+
+
+def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
+    if isinstance(s, torch.SymInt):
+        return (id(s.node.shape_env), s.node.expr)
+    # Dynamic-shape kernels should not get separate bound kernels for sizes
+    # 0 or 1.  Keep 2 as the canonical "dynamic dimension" bucket that was
+    # already used for all concrete sizes >= 2.
+    return 2
+
+
+_EMPTY_FROZENSET: frozenset[int] = frozenset()
+
+
+def _bucketed_size(obj: torch.Tensor) -> tuple[Hashable, ...]:
+    sz = obj.size()
+    n = len(sz)
+    if n == 1:
+        return (_safe_bucket_dim(sz[0]),)
+    if n == 2:
+        return (_safe_bucket_dim(sz[0]), _safe_bucket_dim(sz[1]))
+    if n == 3:
+        return (
+            _safe_bucket_dim(sz[0]),
+            _safe_bucket_dim(sz[1]),
+            _safe_bucket_dim(sz[2]),
+        )
+    return tuple(_safe_bucket_dim(s) for s in sz)
+
+
+def _hashable_dims(dims: Sequence[int | torch.SymInt]) -> tuple[Hashable, ...]:
+    n = len(dims)
+    if n == 1:
+        return (_hashable_dim(dims[0]),)
+    if n == 2:
+        return (_hashable_dim(dims[0]), _hashable_dim(dims[1]))
+    if n == 3:
+        return (_hashable_dim(dims[0]), _hashable_dim(dims[1]), _hashable_dim(dims[2]))
+    return tuple(_hashable_dim(s) for s in dims)
 
 
 def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
-    # NOTE: If a machine has two different gpu types on the same machine,
-    # obj.device.type will incorrectly hit
-    static_indices = frozenset(getattr(obj, "_dynamo_static_indices", ()))
+    si = getattr(obj, "_dynamo_static_indices", None)
+    static_indices = frozenset(si) if si is not None else _EMPTY_FROZENSET
     if fn.settings.static_shapes:
         return (
             obj.dtype,
-            obj.device.type,
-            (*obj.size(),),
-            (*obj.stride(),),
+            _hashable_dims(obj.size()),
+            _hashable_dims(obj.stride()),
             static_indices,
         )
-    bucketed = tuple([min(s, 2) for s in obj.size()])
+    bucketed = _bucketed_size(obj)
     if fn.settings.index_dtype is None:
         try:
             needs_int64 = bool(obj.numel() > _INT32_INDEX_LIMIT)
@@ -1064,14 +1412,12 @@ def _tensor_key(fn: Kernel, obj: torch.Tensor) -> Hashable:
             needs_int64 = True  # unbacked SymInt
         return (
             obj.dtype,
-            obj.device.type,
             bucketed,
             needs_int64,
             static_indices,
         )
     return (
         obj.dtype,
-        obj.device.type,
         bucketed,
         static_indices,
     )
@@ -1142,7 +1488,7 @@ _specialization_extractors: dict[
     dict: lambda fn, x: _mapping_key(fn, x, type(x)),
     # pyrefly: ignore [missing-attribute]
     "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
-    # pyrefly: ignore [no-matching-overload]
+    # pyrefly: ignore [no-matching-overload, bad-argument-type]
     "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,

@@ -4,63 +4,68 @@ import abc
 import collections
 import contextlib
 import dataclasses
-import datetime
 import functools
-import inspect
-from itertools import count
-from itertools import starmap
 import logging
 import math
 from math import inf
-import multiprocessing as mp
-from multiprocessing import connection
 import os
-from pathlib import Path
-import pickle
-import pprint
 import random
+import re
 import sys
-import tempfile
 import time
-import traceback
 import types
 from typing import TYPE_CHECKING
-from typing import Any
 from typing import Callable
-from typing import Iterable
 from typing import Literal
-from typing import NamedTuple
-from typing import NoReturn
 from typing import Protocol
 from typing import cast
 from unittest.mock import patch
-import uuid
 
 import torch
-from torch.utils._pytree import tree_flatten
-from torch.utils._pytree import tree_map
+import torch.distributed as dist
 from torch.utils._pytree import tree_map_only
-from torch.utils._pytree import tree_unflatten
 
 from .. import exc
-from ..runtime.precompile_shim import already_compiled
-from ..runtime.precompile_shim import make_precompiler
+from .._compat import extract_device
+from .._compat import get_device_name
+from ..runtime.settings import _env_get_int
+from .benchmark_provider import BenchmarkProvider
+from .benchmark_provider import BenchmarkResult
+from .benchmark_provider import LocalBenchmarkProvider
+from .benchmark_provider import _clone_args
+from .benchmark_provider import _unset_fn
+from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import interleaved_bench
-from .logger import SUPPRESSED_TRITON_CODE_MSG
-from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
-from .logger import _get_failure_dump_dir
-from .logger import capture_output
-from .logger import classify_triton_exception
-from .logger import format_triton_compile_failure
-from .logger import log_generated_triton_code_debug
-from .logger import match_unrecoverable_runtime_error
-from .logger import maybe_dump_triton_failure
-from .progress_bar import iter_with_progress
+from .metrics import AutotuneMetrics
+from .metrics import _run_post_autotune_hooks
+from .precompile_future import PrecompileFuture as PrecompileFuture
+from helion._dist_utils import all_gather_object
+from helion._dist_utils import is_master_rank
+from helion._dist_utils import sync_object
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from collections.abc import Sequence
+
+    from ..runtime.config import Config
+    from ..runtime.settings import Settings
+    from . import ConfigSpec
+    from .config_generation import ConfigGeneration
+    from .config_generation import FlatConfig
+    from .local_cache import SavedBestConfig
+    from helion.autotuner.effort_profile import AutotuneEffortProfile
 
 
-class _HasDevice(Protocol):
+# Use the standard do_bench effort for confirmation instead of the adaptive
+# rebenchmark repeat, which can amplify a single optimistic subprocess timing.
+_SUSPICIOUS_REBENCHMARK_WARMUP = 25
+_SUSPICIOUS_REBENCHMARK_REP = 100
+
+
+class _HasDeviceAndProcessGroupName(Protocol):
     device: torch.device
+    process_group_name: str | None
 
 
 class _AutotunableKernel(Protocol):
@@ -71,7 +76,7 @@ class _AutotunableKernel(Protocol):
     def settings(self) -> Settings: ...
 
     @property  # pyrefly: ignore[bad-return]
-    def env(self) -> _HasDevice: ...
+    def env(self) -> _HasDeviceAndProcessGroupName: ...
 
     @property
     def configs(self) -> Sequence[Config]: ...
@@ -81,7 +86,23 @@ class _AutotunableKernel(Protocol):
         config: Config | dict[str, object] | None = None,
         *,
         allow_print: bool = True,
-    ) -> Callable[..., object]: ...
+    ) -> Callable[..., object]:
+        """Compile a kernel for the given config, used for accuracy checking."""
+        ...
+
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., object]:
+        """Compile a kernel for the given config, used for benchmarking.
+
+        By default this is the same as compile_config. Override to return
+        a different callable for benchmarking, e.g. a fused kernel that
+        includes prologue/epilogue code from Inductor.
+        """
+        ...
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str: ...
 
@@ -102,17 +123,69 @@ class _AutotunableKernel(Protocol):
         config: Config | None = None,
     ) -> None: ...
 
+    def extra_cache_key(self) -> str:
+        """Return extra data folded into the disk-cache key.
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
+        Implementations should return ``""`` to leave the cache key
+        unchanged, or a non-empty string to differentiate cache entries
+        for the same kernel source and args.
+        """
+        ...
 
+    def supports_subprocess_benchmark(self) -> bool:
+        """Whether autotuning may benchmark compiled configs in a subprocess."""
+        ...
+
+    def is_cacheable(self) -> bool:
+        """Whether this kernel supports the autotuning disk cache."""
+        ...
+
+
+_CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
+
+
+class _CodeSentinel:
+    """Stable stand-in for types.CodeType so spec key comparison is repr-independent."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<code>"
+
+
+_CODE_SENTINEL = _CodeSentinel()
+
+
+def normalize_autotune_seed_configs(settings: Settings) -> tuple[Config, ...]:
+    """Return user-provided autotune seed configs from settings as concrete Configs."""
     from ..runtime.config import Config
-    from ..runtime.kernel import BoundKernel
-    from ..runtime.kernel import CompiledConfig
-    from ..runtime.settings import Settings
-    from . import ConfigSpec
-    from .config_generation import ConfigGeneration
-    from .config_generation import FlatConfig
+
+    seed_configs = settings.autotune_seed_configs
+    if seed_configs is None:
+        return ()
+    if isinstance(seed_configs, Config):
+        return (seed_configs,)
+    if isinstance(seed_configs, dict):
+        return (Config.from_dict(seed_configs),)
+    return tuple(
+        Config.from_dict(seed_config) if isinstance(seed_config, dict) else seed_config
+        for seed_config in seed_configs
+    )
+
+
+def _normalize_spec_key(key: object) -> object:
+    """Replace types.CodeType with a stable sentinel in a spec key tree."""
+    return tree_map_only(types.CodeType, lambda _: _CODE_SENTINEL, key)
+
+
+def _normalize_spec_key_str(s: str) -> str:
+    """Normalize a specialization_key string for cache comparison.
+
+    Replaces code object repr strings with a stable '<code>' sentinel,
+    allowing FROM_BEST_AVAILABLE to match function arguments based
+    on their closure values only, ignoring code object identity.
+    """
+    return _CODE_OBJECT_RE.sub("<code>", s)
 
 
 class BaseAutotuner(abc.ABC):
@@ -123,61 +196,6 @@ class BaseAutotuner(abc.ABC):
     @abc.abstractmethod
     def autotune(self, *, skip_cache: bool = False) -> Config:
         raise NotImplementedError
-
-
-class BenchmarkResult(NamedTuple):
-    """Result tuple returned by parallel_benchmark."""
-
-    config: Config
-    fn: Callable[..., object]
-    perf: float
-    status: Literal["ok", "error", "timeout"]
-    compile_time: float | None
-
-
-_FP8_DTYPES = {
-    torch.float8_e4m3fn,
-    torch.float8_e5m2,
-    torch.float8_e4m3fnuz,
-    torch.float8_e5m2fnuz,
-    torch.float8_e8m0fnu,
-}
-
-
-def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
-    """Like torch.testing.assert_close but handles fp8 tensors."""
-
-    def convert(obj: object) -> object:
-        return tree_map_only(
-            torch.Tensor,
-            lambda t: t.view(torch.uint8) if t.dtype in _FP8_DTYPES else t,
-            obj,
-        )
-
-    torch.testing.assert_close(convert(actual), convert(expected), atol=atol, rtol=rtol)
-
-
-def _clone_args(
-    args: Sequence[object],
-    idx_to_clone: Sequence[int] | None = None,
-) -> Sequence[object]:
-    """
-    Clone the given arguments, but cloning only the tensors specified by
-      idx_to_clone. If idx_to_clone is None, clone all tensors.
-    """
-
-    args_flat, tree_spec = tree_flatten(args)
-    tensor_idx = 0
-    for i, arg in enumerate(args_flat):
-        if not isinstance(arg, torch.Tensor):
-            continue
-        if idx_to_clone is None or tensor_idx in idx_to_clone:
-            clone = arg.detach().clone()
-            clone.requires_grad_(arg.requires_grad)
-            args_flat[i] = clone
-        tensor_idx += 1
-
-    return tree_unflatten(args_flat, tree_spec)
 
 
 class BaseSearch(BaseAutotuner):
@@ -193,15 +211,12 @@ class BaseSearch(BaseAutotuner):
         counters: A counter to track various metrics during the search.
     """
 
-    _baseline_output: object
-    _mutated_arg_indices: Sequence[int] = []
-    _baseline_post_args: Sequence[object] | None
-    _jobs: int
-    _precompile_result_counter: count[int]
-    _effective_atol: float
-    _effective_rtol: float
-
-    def __init__(self, kernel: _AutotunableKernel, args: Sequence[object]) -> None:
+    def __init__(
+        self,
+        kernel: _AutotunableKernel,
+        args: Sequence[object],
+        benchmark_provider_cls: type[BenchmarkProvider] = LocalBenchmarkProvider,
+    ) -> None:
         """
         Initialize the BaseSearch object.
 
@@ -214,360 +229,80 @@ class BaseSearch(BaseAutotuner):
         self.settings: Settings = kernel.settings
         self.config_spec: ConfigSpec = kernel.config_spec
         self.args: Sequence[object] = args
-        self.counters: collections.Counter[str] = collections.Counter()
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
+        self._benchmark_provider_cls = benchmark_provider_cls
+        self._prepared = False
+        self._skip_cache = False
+        self._autotune_budget_start: float | None = None
+
+    def _prepare(self) -> None:
+        """Some initialization deferred until autotuning actually runs.
+
+        This is called at the start of autotune() so that cache hits skip it.
+        """
+        if self._prepared:
+            return
+        self._prepared = True
+        self._autotune_budget_start = time.perf_counter()
         seed = self.settings.autotune_random_seed
         random.seed(seed)
         self.log(f"Autotune random seed: {seed}")
-        self._original_args: Sequence[object] = _clone_args(self.args)
-        self._precompile_tmpdir: tempfile.TemporaryDirectory[str] | None = None
-        self._precompile_args_path: str | None = None
-        self._precompile_result_counter = count()
-        (
-            self._baseline_output,
-            self._mutated_arg_indices,
-            self._baseline_post_args,
-        ) = self._compute_baseline()
-        self._effective_atol, self._effective_rtol = (
-            self._compute_effective_tolerances()
+        budget = self.settings.autotune_budget_seconds
+        if budget is not None:
+            self.log(f"Autotune budget: {budget}s")
+        self._autotune_metrics: AutotuneMetrics = AutotuneMetrics(
+            kernel_name=getattr(getattr(self.kernel, "kernel", None), "name", ""),
+            input_shapes=str(
+                [tuple(arg.shape) for arg in self.args if isinstance(arg, torch.Tensor)]
+            ),
+            hardware=get_device_name(extract_device(self.args)) or "",
+            random_seed=self.settings.autotune_random_seed,
+            search_algorithm=type(self).__name__,
         )
-        self._jobs = self._decide_num_jobs()
-        self._current_generation: int = 0
-
-    def _next_precompile_result_path(self) -> str:
-        assert self._precompile_tmpdir is not None
-        return os.path.join(
-            self._precompile_tmpdir.name,
-            f"result_{next(self._precompile_result_counter)}.pkl",
+        self.benchmark_provider = self._benchmark_provider_cls(
+            kernel=self.kernel,
+            settings=self.settings,
+            config_spec=self.config_spec,
+            args=self.args,
+            log=self.log,
+            autotune_metrics=self._autotune_metrics,
         )
+        self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
 
-    def cleanup(self) -> None:
-        if self._precompile_tmpdir is not None:
-            self._precompile_tmpdir.cleanup()
-            self._precompile_tmpdir = None
-        self._precompile_args_path = None
-        self._precompile_result_counter = count()
-
-    def _compute_baseline(
-        self,
-    ) -> tuple[object, Sequence[int], Sequence[object] | None]:
-        """
-        Compute baseline output for accuracy validation during autotuning.
-        Also detect if the kernel mutates any of its input arguments.
-
-        The baseline is computed in one of two ways:
-        - If settings.autotune_baseline_fn is provided, use that custom function
-        - Otherwise, run the kernel with the default config
-        """
-        new_args = _clone_args(self._original_args)
-
-        # Use custom baseline function if provided
-        if self.settings.autotune_baseline_fn is not None:
-            try:
-                baseline_output = self.settings.autotune_baseline_fn(*new_args)
-                torch.accelerator.synchronize()
-            except Exception as e:
-                raise exc.AutotuneError(
-                    "Custom baseline function failed while computing baseline.\n"
-                    f"Baseline function: {self.settings.autotune_baseline_fn}\n"
-                ) from e
-        else:
-            # Use default config
-            baseline_config = self.config_spec.default_config()
-            try:
-                baseline_output = self.kernel.compile_config(
-                    baseline_config, allow_print=False
-                )(*new_args)
-                torch.accelerator.synchronize()
-            except Exception as e:
-                decorator = self.kernel.format_kernel_decorator(
-                    baseline_config, self.settings
-                )
-                log_generated_triton_code_debug(
-                    self.log,
-                    self.kernel,
-                    baseline_config,
-                    prefix=f"Generated Triton code for {decorator}:",
-                )
-                self.kernel.maybe_log_repro(self.log.error, new_args, baseline_config)
-                raise exc.InvalidConfig(
-                    "Default config failed while computing baseline.\n"
-                    f"Default config: {decorator}\n"
-                    f"{SUPPRESSED_TRITON_CODE_MSG}\n"
-                    "To work around this error, you could set `@helion.kernel(autotune_baseline_fn=...)` "
-                    "to provide a custom baseline function (e.g. PyTorch eager implementation of your kernel)."
-                ) from e
-
-        original_args_flat, _ = tree_flatten(self._original_args)
-        new_args_flat, _ = tree_flatten(new_args)
-        mutated_tensor_idxs = []
-        # we should only count tensors, since they won't be bound or removed
-        tensor_idx = 0
-        for old, new in zip(original_args_flat, new_args_flat, strict=False):
-            if not (isinstance(old, torch.Tensor) and isinstance(new, torch.Tensor)):
-                continue
-            if not torch.equal(new, old):
-                mutated_tensor_idxs.append(tensor_idx)
-            tensor_idx += 1
-        baseline_post_args = _clone_args(new_args, idx_to_clone=mutated_tensor_idxs)
-        return baseline_output, mutated_tensor_idxs, baseline_post_args
-
-    def _compute_effective_tolerances(self) -> tuple[float, float]:
-        """
-        Compute effective tolerances based on the dtypes in the baseline output.
-
-        For low-precision dtypes (fp8), we need stricter tolerances to ensure
-        bitwise comparison works correctly. This method automatically detects
-        such dtypes and adjusts tolerances accordingly.
-
-        Returns:
-            A tuple of (atol, rtol) to use for accuracy validation.
-        """
-        # Default tolerance when not user-specified
-        DEFAULT_TOL = 1e-2
-
-        # Get user-specified or default tolerances
-        atol = self.settings.autotune_baseline_atol
-        rtol = self.settings.autotune_baseline_rtol
-
-        # Collect all dtypes from baseline output and mutated args
-        dtypes = set()
-
-        def collect_dtypes(obj: object) -> object:
-            if isinstance(obj, torch.Tensor):
-                dtypes.add(obj.dtype)
-            return obj
-
-        tree_map_only(torch.Tensor, collect_dtypes, self._baseline_output)
-        if len(self._mutated_arg_indices) > 0 and self._baseline_post_args is not None:
-            tree_map_only(torch.Tensor, collect_dtypes, self._baseline_post_args)
-
-        # Only apply strict tolerances if ALL dtypes are fp8
-        # Mixed dtypes (fp8 + fp32) would be too strict with atol=0.0, rtol=0.0
-        all_dtypes_are_fp8 = dtypes and all(dtype in _FP8_DTYPES for dtype in dtypes)
-
-        if all_dtypes_are_fp8:
-            # All dtypes are fp8 - use bitwise comparison
-            # unless the user explicitly set either tolerance value (i.e., not None)
-            if atol is None and rtol is None:
-                self.log(
-                    f"Detected fp8 dtype(s) in output: {dtypes}. "
-                    "Using bitwise comparison (atol=0.0, rtol=0.0) for autotuning accuracy check."
-                )
-                return 0.0, 0.0
-
-        # Use user-specified values or defaults
-        return (
-            atol if atol is not None else DEFAULT_TOL,
-            rtol if rtol is not None else DEFAULT_TOL,
-        )
-
-    def _decide_num_jobs(self) -> int:
-        if not self.settings.autotune_precompile:
-            return 1
-
-        jobs = self.settings.autotune_precompile_jobs
-        if not jobs:
-            jobs = os.cpu_count() or 1
-
-        if self.settings.autotune_precompile != "spawn":
-            return jobs
-
-        memory_per_job = _estimate_tree_bytes(self.args) + _estimate_tree_bytes(
-            self._baseline_output
-        )
-        memory_per_job *= 2  # safety factor
-        if memory_per_job <= 0:
-            return jobs
-
-        device = self.kernel.env.device
-        if device.type != "cuda":
-            # TODO(jansel): support non-cuda devices
-            return jobs
-
-        available_memory, _ = torch.cuda.mem_get_info(device)
-        jobs_by_memory = available_memory // memory_per_job
-        if jobs_by_memory < jobs:
-            gib_per_job = memory_per_job / (1024**3)
-            available_gib = available_memory / (1024**3)
-            if jobs_by_memory > 0:
-                self.log.warning(
-                    f"Reducing autotune precompile spawn jobs from {jobs} to {jobs_by_memory} "
-                    f"due to limited GPU memory (estimated {gib_per_job:.2f} GiB per job, "
-                    f"{available_gib:.2f} GiB free). "
-                    f"Set HELION_AUTOTUNE_PRECOMPILE_JOBS={jobs_by_memory} "
-                    "to make this lower cap persistent, "
-                    'set HELION_AUTOTUNE_PRECOMPILE="fork" to disable spawning, or reduce GPU memory usage.'
-                )
-            else:
-                raise exc.AutotuneError(
-                    "Autotune precompile spawn mode requires at least one job, but estimated "
-                    "memory usage exceeds available GPU memory."
-                    f"Estimated {gib_per_job:.2f} GiB per job, but only "
-                    f"{available_gib:.2f} GiB free. "
-                    'Set HELION_AUTOTUNE_PRECOMPILE="fork" to disable spawning, or reduce GPU memory usage.'
-                )
-            jobs = jobs_by_memory
-
-        return jobs
-
-    def _validate_against_baseline(
-        self, config: Config, output: object, args: Sequence[object]
-    ) -> bool:
-        try:
-            _assert_close(
-                output,
-                self._baseline_output,
-                atol=self._effective_atol,
-                rtol=self._effective_rtol,
-            )
-            if len(self._mutated_arg_indices) > 0:
-                _assert_close(
-                    args,
-                    self._baseline_post_args,
-                    atol=self._effective_atol,
-                    rtol=self._effective_rtol,
-                )
-        except AssertionError as e:
-            self.counters["accuracy_mismatch"] += 1
-            if not self.settings.autotune_ignore_errors:
-                self.log.warning(
-                    f"Skipping config with accuracy mismatch: {config!r}\n{e!s}\nUse HELION_AUTOTUNE_ACCURACY_CHECK=0 to disable this check.\n"
-                )
+    def _autotune_budget_exceeded(self) -> bool:
+        budget = self.settings.autotune_budget_seconds
+        if budget is None or self._autotune_budget_start is None:
             return False
+        elapsed = time.perf_counter() - self._autotune_budget_start
+        if elapsed < budget:
+            return False
+        self.log(
+            f"Autotune budget {budget}s exceeded "
+            f"(elapsed {elapsed:.1f}s); returning best-so-far."
+        )
         return True
 
-    def benchmark(self, config: Config) -> tuple[Callable[..., object], float]:
+    def _budgeted_range(self, *args: int) -> Iterator[int]:
+        """Yield ``range(*args)`` until the autotune budget is exhausted."""
+        for value in range(*args):
+            if self._autotune_budget_exceeded():
+                return
+            yield value
+
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
         """
-        Benchmark a specific configuration.
-
-        This method compiles the kernel with the given configuration and measures its performance.
-
-        Args:
-            config: The configuration to benchmark.
-
-        Returns:
-            The function and performance of the configuration in ms.
+        Retrieve extra kwargs from the effort profile for the autotuner.
         """
-        fn = self.kernel.compile_config(config, allow_print=False)
-        if self.create_precompile_future(config, fn)():
-            return fn, self.benchmark_function(config, fn)
-        return fn, inf
+        kwargs: dict[str, object] = {}
 
-    def benchmark_function(self, config: Config, fn: CompiledConfig) -> float:
-        """
-        Benchmark a compiled function.  This function is called by the autotuner to measure the
-        performance of a specific configuration.
+        if settings.autotune_max_generations is not None:
+            kwargs.setdefault("max_generations", settings.autotune_max_generations)
 
-        Args:
-            config: The configuration to benchmark.
-            fn: A precompiled version of config.
-
-        Returns:
-            The performance of the configuration in ms.
-        """
-        self.counters["benchmark"] += 1
-        self.log.debug(lambda: f"Running benchmark for {config!r}")
-        _captured_output: list[str] = [""]
-        _capture_ctx = (
-            capture_output()
-            if _get_failure_dump_dir()
-            else contextlib.nullcontext(_captured_output)
-        )
-        try:
-            # TODO(jansel): early exit with fewer trials if early runs are slow
-            self.log.debug(lambda: f"Running {config} at {datetime.datetime.now()}")
-            t0 = time.perf_counter()
-            if len(self._mutated_arg_indices) > 0:
-                self.args = _clone_args(
-                    self._original_args, idx_to_clone=self._mutated_arg_indices
-                )
-            torch.accelerator.synchronize()
-            with _capture_ctx as _captured_output:
-                output = fn(*self.args)  # make sure the kernel is compiled
-            torch.accelerator.synchronize()
-            if (
-                self.settings.autotune_accuracy_check
-                and not self._validate_against_baseline(config, output, self.args)
-            ):
-                # Accuracy check failed; reject this config
-                return inf
-            from triton.testing import do_bench
-
-            t1 = time.perf_counter()
-            res = do_bench(
-                functools.partial(fn, *self.args),
-                return_mode="median",
-                warmup=1,  # we are already warmed up above
-                rep=50,
-            )
-            t2 = time.perf_counter()
-            assert isinstance(res, float)
-            self.log.debug(
-                lambda: f"result: {res:.4f}ms (took {t1 - t0:.1f}s + {t2 - t1:.1f}s)",
-            )
-            if res < self.best_perf_so_far:
-                self.best_perf_so_far = res
-            return res
-        except Exception as e:
-            # e.__traceback__ holds references to all local variables in the call stack frames.
-            # When a Triton kernel fails, the output tensors allocated by the Helion kernel function
-            # were being held by the traceback, preventing them from being freed.
-            e.__traceback__ = None
-            maybe_dump_triton_failure(
-                self.kernel,
-                config,
-                e,
-                captured_output=_captured_output[0] or None,
-            )
-            if match_unrecoverable_runtime_error(e):
-                self.kernel.maybe_log_repro(self.log.error, self.args, config)
-                raise exc.TritonUnrecoverableRuntimeError(
-                    reason=str(e),
-                    decorator=self.kernel.format_kernel_decorator(
-                        config, self.settings
-                    ),
-                    error=f"{type(e).__qualname__}: {e}",
-                ) from e
-            action = classify_triton_exception(e)
-            if self.settings.autotune_ignore_errors:
-                pass
-            elif action == "raise":
-                decorator = self.kernel.format_kernel_decorator(config, self.settings)
-                log_generated_triton_code_debug(
-                    self.log,
-                    self.kernel,
-                    config,
-                    prefix=f"Generated Triton code for {decorator}:",
-                )
-                self.kernel.maybe_log_repro(self.log.error, self.args, config)
-                raise exc.TritonError(
-                    error=f"{type(e).__qualname__}: {e}",
-                    decorator=decorator,
-                    code=SUPPRESSED_TRITON_CODE_MSG,
-                ) from e
-            elif action == "warn":
-                decorator = self.kernel.format_kernel_decorator(config, self.settings)
-                log_generated_triton_code_debug(
-                    self.log,
-                    self.kernel,
-                    config,
-                    prefix=f"Generated Triton code for {decorator}:",
-                )
-                self.log.warning(format_triton_compile_failure(config, e, self.kernel))
-                self.kernel.maybe_log_repro(self.log.warning, self.args, config)
-            else:
-                decorator = self.kernel.format_kernel_decorator(config, self.settings)
-                log_generated_triton_code_debug(
-                    self.log,
-                    self.kernel,
-                    config,
-                    prefix=f"Generated Triton code for {decorator}:",
-                )
-                self.log.debug(f"Benchmarking failed: {type(e).__name__}: {e}")
-                self.kernel.maybe_log_repro(self.log.debug, self.args, config)
-            return inf
+        return kwargs
 
     def set_adaptive_compile_timeout(
         self,
@@ -624,188 +359,81 @@ class BaseSearch(BaseAutotuner):
             f"bounds=[{min_seconds}s, {original_timeout}s])"
         )
 
-    def create_precompile_future(
-        self, config: Config, fn: CompiledConfig
-    ) -> PrecompileFuture:
-        """
-        Run the kernel in a spawned subprocess to detect hangs during compilation or execution.
-        We use the subprocess timeout to guard against Triton kernels that never finish.
-        We also do this in parallel (when called from parallel_benchmark) to do faster autotuning.
-        Note that we compile in parallel, but we benchmark one-by-one to avoid noisy results.
-
-        Args:
-            config: The config that generated fn.
-            fn: The function to be precompiled.
-
-        Returns:
-            True if the compilation was successful, False if it hung.
-        """
-        if not self.settings.autotune_precompile:
-            return PrecompileFuture.skip(self, config, True)
-        mode = self.settings.autotune_precompile
-        if mode not in {"fork", "spawn"}:
-            raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
-        if len(self._mutated_arg_indices) > 0:
-            device_args = _clone_args(
-                self._original_args, idx_to_clone=self._mutated_arg_indices
-            )
-        else:
-            device_args = self.args
-
-        decorator = self.kernel.format_kernel_decorator(config, self.settings)
-
-        if mode == "spawn":
-            ctx = mp.get_context("spawn")
-            assert self._precompile_args_path is not None
-            try:
-                fn_spec = _serialize_compiled_fn(fn)
-            except RuntimeError as err:
-                raise exc.AutotuneError(
-                    "Failed to serialize compiled kernel for spawn precompile."
-                    ' Set HELION_AUTOTUNE_PRECOMPILE="fork" to fall back to fork mode.'
-                ) from err
-            result_path = self._next_precompile_result_path()
-            process = cast(
-                "mp.Process",
-                ctx.Process(
-                    target=_run_kernel_in_subprocess_spawn,
-                    args=(fn_spec, self._precompile_args_path, result_path, decorator),
-                ),
-            )
-            process.daemon = True
-        else:
-            precompiler = _prepare_precompiler_for_fork(
-                fn, device_args, config, self.kernel, decorator, self.log
-            )
-            if precompiler is None:
-                return PrecompileFuture.skip(self, config, True)
-            ctx = mp.get_context("fork")
-            result_path = self._next_precompile_result_path()
-            process = cast(
-                "mp.Process",
-                ctx.Process(
-                    target=_run_kernel_in_subprocess_fork,
-                    args=(precompiler, config, self.kernel, result_path, decorator),
-                ),
-            )
-            process.daemon = True
-        return PrecompileFuture(
-            search=self,
-            config=config,
-            process=process,
-            timeout=self.settings.autotune_compile_timeout,
-            result_path=result_path,
+    def _apply_config_filter(
+        self, configs: list[Config]
+    ) -> tuple[list[Config], list[int]]:
+        """Apply the user-provided config filter, returning passing configs and their indices."""
+        config_filter = self.settings.autotune_config_filter
+        if config_filter is None:
+            return configs, list(range(len(configs)))
+        filtered: list[Config | None] = [config_filter(c) for c in configs]
+        passing_indices = [i for i, fc in enumerate(filtered) if fc is not None]
+        passing_configs = cast(
+            "list[Config]",
+            [filtered[i] for i in passing_indices],
         )
+        return passing_configs, passing_indices
 
-    def parallel_benchmark(
+    def benchmark_batch(
         self, configs: list[Config], *, desc: str = "Benchmarking"
     ) -> list[BenchmarkResult]:
-        """
-        Benchmark multiple configurations in parallel.
+        """Compile and benchmark a batch of configurations.
+
+        Applies the config filter, delegates to the provider, and tracks
+        best performance.
 
         Args:
             configs: A list of configurations to benchmark.
             desc: Description for the progress bar.
 
         Returns:
-            A list of BenchmarkResult entries containing the configuration, compiled
-            callable, measured performance, status, and compilation time.
+            A list of BenchmarkResult entries, one per input config.
         """
-        fns: list[Callable[..., object]] = []
-        futures: list[PrecompileFuture] | None = None
-        for config in configs:
-            fn = self.kernel.compile_config(config, allow_print=False)
-            fns.append(fn)
-        if self.settings.autotune_precompile:
-            futures = list(
-                starmap(
-                    self.create_precompile_future,
-                    zip(configs, fns, strict=True),
-                )
-            )
-            precompile_desc = (
-                f"{desc} precompiling" if self.settings.autotune_progress_bar else None
-            )
-            is_workings = PrecompileFuture.wait_for_all(futures, desc=precompile_desc)
-            precompile_status: list[Literal["ok", "error", "timeout"]] = []
-            for future, ok in zip(futures, is_workings, strict=True):
-                reason = future.failure_reason
-                if ok:
-                    precompile_status.append("ok")
-                elif reason == "timeout":
-                    precompile_status.append("timeout")
-                else:
-                    precompile_status.append("error")
+        passing_configs, passing_indices = self._apply_config_filter(configs)
+        inner_results = self.benchmark_provider.benchmark(passing_configs, desc=desc)
+
+        if len(passing_indices) == len(configs):
+            results = inner_results
         else:
-            is_workings = [True] * len(configs)
-            precompile_status = ["ok"] * len(configs)
+            inner_iter = iter(inner_results)
+            passing_set = set(passing_indices)
+            results = []
+            for i, config in enumerate(configs):
+                if i in passing_set:
+                    results.append(next(inner_iter))
+                else:
+                    self.log.debug(
+                        f"Config filtered out by autotune_config_filter: {config!r}"
+                    )
+                    results.append(
+                        BenchmarkResult(
+                            config=config,
+                            fn=lambda *a, **kw: None,
+                            perf=inf,
+                            status="filtered",
+                            compile_time=None,
+                        )
+                    )
 
-        results: list[BenchmarkResult] = []
+        for r in results:
+            if r.perf < self.best_perf_so_far:
+                self.best_perf_so_far = r.perf
 
-        # Render a progress bar only when the user requested it.
-        iterator = iter_with_progress(
-            enumerate(zip(fns, is_workings, precompile_status, strict=True)),
-            total=len(configs),
-            description=f"{desc} exploring neighbors",
-            enabled=self.settings.autotune_progress_bar,
-        )
-        for index, (fn, is_working, reason) in iterator:
-            config = configs[index]
-            if futures is not None:
-                future = futures[index]
-                compile_time = (
-                    future.elapsed
-                    if future.process is not None and future.started
-                    else None
-                )
-            else:
-                compile_time = None
-            status: Literal["ok", "error", "timeout"]
-            if is_working:
-                # Log started before benchmarking to help identify hangs
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._current_generation,
-                        status="started",
-                        perf_ms=None,
-                        compile_time=compile_time,
-                        config=config,
-                    )
-                )
-                # benchmark one-by-one to avoid noisy results
-                perf = self.benchmark_function(config, fn)
-                status = "ok" if math.isfinite(perf) else "error"
-                # Log completion after benchmarking
-                self.log.record_autotune_entry(
-                    AutotuneLogEntry(
-                        generation=self._current_generation,
-                        status=status,
-                        perf_ms=perf if math.isfinite(perf) else None,
-                        compile_time=compile_time,
-                        config=config,
-                    )
-                )
-                results.append(
-                    BenchmarkResult(
-                        config=config,
-                        fn=fn,
-                        perf=perf,
-                        status=status,
-                        compile_time=compile_time,
-                    )
-                )
-            else:
-                status = "timeout" if reason == "timeout" else "error"
-                results.append(
-                    BenchmarkResult(
-                        config=config,
-                        fn=fn,
-                        perf=inf,
-                        status=status,
-                        compile_time=compile_time,
-                    )
-                )
         return results
+
+    def benchmark(self, config: Config) -> BenchmarkResult:
+        """Compile and benchmark a single configuration.
+
+        Convenience wrapper around ``benchmark_batch`` for the
+        single-config case.
+
+        Args:
+            config: The configuration to benchmark.
+
+        Returns:
+            A BenchmarkResult with the compiled function and performance.
+        """
+        return self.benchmark_batch([config])[0]
 
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """
@@ -816,35 +444,51 @@ class BaseSearch(BaseAutotuner):
         Returns:
             The best configuration found during autotuning.
         """
+        self._skip_cache = skip_cache
+        self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         with exit_stack:
             if self.settings.autotune_log:
                 exit_stack.enter_context(self.log.autotune_logging())
             self.log.reset()
-            # Autotuner triggers bugs in remote triton compile service
-            exit_stack.enter_context(
-                patch.dict(os.environ, {"TRITON_LOCAL_BUILD": "1"}, clear=False)
-            )
-            assert self._precompile_tmpdir is None
-            tempdir = tempfile.TemporaryDirectory()
-            self._precompile_tmpdir = tempdir
-            if self.settings.autotune_precompile == "spawn":
-                args_path = os.path.join(tempdir.name, "args.pt")
-                torch.save(self.args, args_path)
-                self._precompile_args_path = args_path
-            exit_stack.callback(self.cleanup)
-            best = self._autotune()
+            # Autotuner triggers bugs in remote triton compile service.
+            # Skip storing Triton intermediate IRs (.ttir, .ttgir, .llir, etc.)
+            # during autotuning to reduce cache size by ~40%. Only binaries and
+            # metadata are needed for execution.
+            env_overrides = {"TRITON_LOCAL_BUILD": "1"}
+            if "TRITON_STORE_BINARY_ONLY" not in os.environ:
+                env_overrides["TRITON_STORE_BINARY_ONLY"] = "1"
+            exit_stack.enter_context(patch.dict(os.environ, env_overrides, clear=False))
+            self.benchmark_provider.setup()
+            exit_stack.callback(self.benchmark_provider.cleanup)
+            try:
+                best = self._autotune()
+            finally:
+                self._finalize_autotune_metrics()
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
+
         self.log(
-            f"Autotuning complete in {end - start:.1f}s after searching {self.counters['benchmark']} configs.\n"
+            f"Autotuning complete in {end - start:.1f}s after searching {self._autotune_metrics.num_configs_tested} configs.\n"
             "One can hardcode the best config and skip autotuning with:\n"
             f"    {kernel_decorator}\n",
             level=logging.INFO + 5,
         )
+        if self._autotune_metrics.num_accuracy_failures:
+            self.log.warning(
+                f"{self._autotune_metrics.num_accuracy_failures} of "
+                f"{self._autotune_metrics.num_configs_tested} configs failed due "
+                "to accuracy checks."
+            )
+        if self._autotune_metrics.num_compile_failures:
+            self.log.warning(
+                f"{self._autotune_metrics.num_compile_failures} of "
+                f"{self._autotune_metrics.num_configs_tested} configs failed due "
+                "to compile failures."
+            )
         cached_path = self.kernel.get_cached_path(best)
-        if cached_path is not None:
+        if cached_path is not None and is_master_rank():
             self.log(f"Code of selected kernel: {cached_path}")
         self.kernel.maybe_log_repro(self.log.warning, self.args, best)
         if self.settings.print_output_code:
@@ -852,6 +496,106 @@ class BaseSearch(BaseAutotuner):
             if triton_code is not None:
                 print(triton_code, file=sys.stderr)
         return best
+
+    def _get_current_hardware_and_specialization(
+        self,
+    ) -> tuple[str | None, str | None]:
+        """Return (hardware, specialization_key) for matching cached configs."""
+        hardware = get_device_name(extract_device(self.args))
+
+        inner_kernel = getattr(self.kernel, "kernel", None)
+        if inner_kernel is None or not hasattr(
+            inner_kernel, "_base_specialization_key"
+        ):
+            return hardware, None
+        spec_key = inner_kernel._base_specialization_key(self.args)
+        specialization_key = str(_normalize_spec_key(spec_key))
+
+        return hardware, specialization_key
+
+    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
+        """Return cached configs matching hardware, specialization_key, and config_spec_hash; empty if cache is skipped.
+
+        Scans the local cache first; if more configs are needed and a remote
+        backend is configured, queries it via ``RemoteCacheBackend.list()``
+        and merges the results, deduplicating against local entries.
+        """
+        from .base_cache import should_skip_cache
+
+        if self._skip_cache or should_skip_cache():
+            return []
+
+        from .local_cache import get_helion_cache_dir
+        from .local_cache import iter_cache_entries
+        from .local_cache import parse_cache_entry
+        from .remote_cache import _load_remote_backend_if_configured
+
+        current_hardware, current_spec_key = (
+            self._get_current_hardware_and_specialization()
+        )
+        if current_hardware is None or current_spec_key is None:
+            return []
+
+        current_fingerprint_hash = self.config_spec.structural_fingerprint_hash(
+            advanced_controls_files=self.settings.autotune_search_acf or None
+        )
+
+        def is_compatible(entry: SavedBestConfig) -> bool:
+            return (
+                entry.flat_config is not None
+                and entry.hardware == current_hardware
+                and _normalize_spec_key_str(entry.specialization_key)
+                == current_spec_key
+                and entry.config_spec_hash == current_fingerprint_hash
+            )
+
+        matching: list[SavedBestConfig] = []
+        seen: set[str] = set()
+
+        def consider(entry: SavedBestConfig) -> bool:
+            """Return True once we have enough matches to stop scanning."""
+            if not is_compatible(entry):
+                return False
+            assert entry.flat_config is not None
+            dedup_key = repr(entry.flat_config)
+            if dedup_key in seen:
+                return False
+            matching.append(entry)
+            seen.add(dedup_key)
+            return len(matching) >= max_configs
+
+        for entry in iter_cache_entries(
+            get_helion_cache_dir(),
+            max_scan=self.settings.autotune_best_available_max_cache_scan,
+        ):
+            if consider(entry):
+                return matching
+
+        backend = _load_remote_backend_if_configured()
+        if backend is None:
+            return matching
+
+        # Over-fetch 2x to absorb filtered / duplicate entries.
+        remaining = max_configs - len(matching)
+        try:
+            # Materialize eagerly so any backend failure surfaces here, not
+            # mid-iteration when partial results are already in `matching`.
+            raw_entries = list(backend.list(max_results=remaining * 2))
+        except Exception:
+            self.log.warning(
+                "Remote cache list failed, using local matches only", exc_info=True
+            )
+            return matching
+
+        for raw in raw_entries:
+            try:
+                entry = parse_cache_entry(raw)
+            except ValueError:
+                continue
+            if consider(entry):
+                break
+
+        return matching
 
     def _autotune(self) -> Config:
         """
@@ -863,6 +607,38 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+    def _autotune_seed_configs(self) -> Sequence[Config]:
+        """Return user-provided autotune seed configs normalized from settings."""
+        return normalize_autotune_seed_configs(self.settings)
+
+    def set_generation(self, generation: int) -> None:
+        self._autotune_metrics.num_generations = generation
+
+    def _finalize_autotune_metrics(self) -> None:
+        self._autotune_metrics.best_perf_ms = (
+            self.best_perf_so_far if math.isfinite(self.best_perf_so_far) else 0.0
+        )
+        self._autotune_metrics.finalize()
+        _run_post_autotune_hooks(self._autotune_metrics)
+
+
+def check_population_consistency(
+    population: Sequence[PopulationMember],
+    process_group_name: str | None = None,
+) -> None:
+    if os.getenv("HELION_DEBUG_DISTRIBUTED") != "1" or not dist.is_initialized():
+        return
+
+    # remove unpickled fields
+    sanitized_population = tuple((p.config, p.perfs) for p in population)
+    all_sanitized_population = all_gather_object(
+        sanitized_population, process_group_name=process_group_name
+    )
+    if all_sanitized_population != all_sanitized_population[:1] * len(
+        all_sanitized_population
+    ):
+        raise exc.InconsistantConfigsAcrossRanks
 
 
 @dataclasses.dataclass
@@ -881,7 +657,9 @@ class PopulationMember:
     perfs: list[float]
     flat_values: FlatConfig
     config: Config
-    status: Literal["ok", "error", "timeout", "unknown"] = "unknown"
+    status: Literal[
+        "ok", "error", "timeout", "peer_compilation_fail", "filtered", "unknown"
+    ] = "unknown"
     compile_time: float | None = None
 
     @property
@@ -902,31 +680,6 @@ def performance(member: PopulationMember) -> float:
     return member.perf
 
 
-def _estimate_tree_bytes(obj: object) -> int:
-    """Estimate the memory usage of a pytree of objects, counting shared storage only once."""
-    total = 0
-    seen_ptrs: set[int] = set()
-
-    def _accumulate(tensor: torch.Tensor) -> torch.Tensor:
-        nonlocal total
-        size = tensor.element_size() * tensor.numel()
-        try:
-            storage = tensor.untyped_storage()
-        except RuntimeError:
-            pass
-        else:
-            ptr = storage.data_ptr()
-            if ptr in seen_ptrs:
-                return tensor
-            seen_ptrs.add(ptr)
-            size = storage.nbytes()
-        total += size
-        return tensor
-
-    tree_map_only(torch.Tensor, _accumulate, obj)
-    return total
-
-
 class PopulationBasedSearch(BaseSearch):
     """
     Base class for search algorithms that use a population of configurations.
@@ -936,12 +689,12 @@ class PopulationBasedSearch(BaseSearch):
         flat_spec (list[ConfigSpecFragment]): The flattened configuration specification.
     """
 
-    finishing_rounds: int = 0
-
     def __init__(
         self,
         kernel: _AutotunableKernel,
         args: Sequence[object],
+        *,
+        finishing_rounds: int = 0,
     ) -> None:
         """
         Initialize the PopulationBasedSearch object.
@@ -949,13 +702,41 @@ class PopulationBasedSearch(BaseSearch):
         Args:
             kernel: The kernel to be tuned.
             args: The arguments to be passed to the kernel.
+            finishing_rounds: Number of finishing rounds to run after the main search.
         """
         super().__init__(kernel, args)
+        self.finishing_rounds = finishing_rounds
         self.population: list[PopulationMember] = []
-        self._current_generation: int = 0
+        # Population members corresponding to compiler-seeded configs from
+        # ``ConfigSpec.compiler_seed_configs``.  Tracked separately so the
+        # final-pick verification phase can re-include them as candidates
+        # even when the surrogate-driven search has pruned them away from
+        # ``self.population``.
+        self._compiler_seed_members: list[PopulationMember] = []
+        self._best_available_seed_configs: list[Config] = []
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
+            advanced_controls_files=self.settings.autotune_search_acf or None,
+            process_group_name=kernel.env.process_group_name,
         )
+
+    @classmethod
+    def get_kwargs_from_profile(
+        cls, profile: AutotuneEffortProfile, settings: Settings
+    ) -> dict[str, object]:
+        """
+        Retrieve extra kwargs from the effort profile for the autotuner.
+        """
+        from ..runtime.settings import _env_get_optional_int
+
+        finishing_rounds = _env_get_optional_int("HELION_AUTOTUNE_FINISHING_ROUNDS")
+        if finishing_rounds is None:
+            finishing_rounds = profile.finishing_rounds
+
+        return {
+            "finishing_rounds": finishing_rounds,
+            **super().get_kwargs_from_profile(profile, settings),
+        }
 
     @property
     def best(self) -> PopulationMember:
@@ -973,8 +754,28 @@ class PopulationBasedSearch(BaseSearch):
         idx = min(range(len(self.population)), key=lambda i: self.population[i].perf)
         self.population[idx] = value
 
-    def set_generation(self, generation: int) -> None:
-        self._current_generation = generation
+    def capture_compiler_seed_members(
+        self, members: Sequence[PopulationMember]
+    ) -> None:
+        """Record which ``members`` came from compiler-seeded configs (TPU only).
+
+        Only the TPU/Pallas final-pick consumes this, so it's a no-op elsewhere.
+        Matches members against ``config_gen.seed_flat_config_pairs()`` so the
+        final-pick phase can re-include a seed even if the search later prunes it.
+        """
+        self._compiler_seed_members = []
+        if not self._final_pick_supported():
+            return
+        try:
+            seed_pairs = self.config_gen.seed_flat_config_pairs()
+        except Exception:
+            return
+        if not seed_pairs:
+            return
+        seed_flats: list[FlatConfig] = [flat for flat, _config in seed_pairs]
+        for member in members:
+            if member.flat_values in seed_flats:
+                self._compiler_seed_members.append(member)
 
     def benchmark_flat(self, flat_values: FlatConfig) -> PopulationMember:
         """
@@ -988,39 +789,165 @@ class PopulationBasedSearch(BaseSearch):
         """
         config = self.config_gen.unflatten(flat_values)
         member = PopulationMember(_unset_fn, [], flat_values, config)
-        self.parallel_benchmark_population([member], desc="Benchmarking")
+        self.benchmark_population([member], desc="Benchmarking")
         return member
 
-    def parallel_benchmark_flat(
+    def benchmark_flat_batch(
         self, to_check: list[FlatConfig]
     ) -> list[PopulationMember]:
         """
         Benchmark multiple flat configurations in parallel.
 
+        The returned list has the same length as ``to_check`` and preserves
+        positional correspondence.  Invalid configurations that cannot be
+        unflattened are represented as ``PopulationMember`` objects with
+        ``perf == inf`` and ``status == "error"`` (they are not benchmarked).
+
         Args:
             to_check: A list of flat configurations to benchmark.
 
         Returns:
-            A list of population members with the benchmark results.
+            A list of population members with the benchmark results, one per
+            entry in *to_check*.
         """
-        result = [*map(self.make_unbenchmarked, to_check)]
-        return self.parallel_benchmark_population(result)
+        from ..runtime.config import Config
 
-    def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember:
+        valid: list[PopulationMember] = []
+        result: list[PopulationMember] = []
+        for flat in to_check:
+            m = self.make_unbenchmarked(flat)
+            if m is not None:
+                valid.append(m)
+                result.append(m)
+            else:
+                result.append(
+                    PopulationMember(
+                        _unset_fn, [float("inf")], flat, Config(), status="error"
+                    )
+                )
+
+        self.benchmark_population(valid)
+        return result
+
+    def make_unbenchmarked(self, flat_values: FlatConfig) -> PopulationMember | None:
         """
         Create a population member with unbenchmarked configuration.  You
-        should pass the result of this to parallel_benchmark_population.
+        should pass the result of this to benchmark_population.
 
         Args:
             flat_values: The flat configuration values.
 
         Returns:
-            A population member with undefined performance.
+            A population member with undefined performance, or None if the
+            configuration is invalid.
         """
-        config = self.config_gen.unflatten(flat_values)
+        try:
+            config = self.config_gen.unflatten(flat_values)
+        except exc.InvalidConfig:
+            return None
         return PopulationMember(_unset_fn, [], flat_values, config)
 
-    def parallel_benchmark_population(
+    def _generate_best_available_population_flat(self) -> list[FlatConfig]:
+        """
+        Generate initial population using default config, explicit seed configs,
+        and cached configs.
+
+        Starts with the default configuration, then adds up to
+        MAX_BEST_AVAILABLE_CONFIGS matching cached configs from previous runs.
+        Explicit seed configs provided by the caller are added ahead of cached
+        configs and are not suppressed by cache-skip settings. No random configs
+        are added. Duplicate configs are discarded.
+
+        Returns:
+            A list of unique FlatConfig values for the initial population.
+            Minimum size is 1 (default), plus any valid unique explicit seed configs
+            and up to autotune_best_available_max_configs cached configs.
+        """
+        max_configs = self.settings.autotune_best_available_max_configs
+
+        seen: set[Config] = set()
+        default_flat = self.config_gen.default_flat()
+        default_config = self.config_gen.unflatten(default_flat)
+        seen.add(default_config)
+        result: list[FlatConfig] = [default_flat]
+        self.log("Starting with default config")
+
+        # User seed configs are explicit requests, so try them before compiler-owned
+        # seeds and cached configs while still deduplicating normalized configs.
+        for flat, transferred_config in self.config_gen.user_seed_flat_config_pairs(
+            self._autotune_seed_configs(), self.log
+        ):
+            if transferred_config not in seen:
+                seen.add(transferred_config)
+                result.append(flat)
+
+        # Compiler-owned seeds come from ConfigSpec.compiler_seed_configs;
+        # they encode backend/compiler heuristics and complement user seed configs.
+        for flat, transferred_config in self.config_gen.seed_flat_config_pairs(
+            self.log
+        ):
+            if transferred_config not in seen:
+                seen.add(transferred_config)
+                result.append(flat)
+
+        for config in self._best_available_seed_configs:
+            try:
+                flat = self.config_gen.flatten(config)
+                transferred_config = self.config_gen.unflatten(flat)
+                if transferred_config not in seen:
+                    seen.add(transferred_config)
+                    result.append(flat)
+            except (ValueError, TypeError, KeyError, AssertionError) as e:
+                self.log(f"Failed to transfer explicit seed config: {e}")
+
+        cached_entries = self._find_similar_cached_configs(max_configs)
+
+        if cached_entries:
+            self.log.debug(
+                f"Found {len(cached_entries)} cached config(s) from previous runs"
+            )
+
+        duplicates = 0
+        for i, entry in enumerate(cached_entries):
+            try:
+                self.log.debug(f"Cached config {i + 1}: {entry.config}")
+                flat = entry.to_mutable_flat_config()
+                transferred_config = self.config_gen.unflatten(flat)
+                if transferred_config in seen:
+                    duplicates += 1
+                    self.log.debug(
+                        f"Cached config {i + 1} is a duplicate, skipping: {transferred_config}"
+                    )
+                    continue
+                seen.add(transferred_config)
+                result.append(flat)
+                self.log.debug(
+                    f"Cached config {i + 1} (transferred): {transferred_config}"
+                )
+            except (
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+                exc.InvalidConfig,
+            ) as e:
+                self.log(f"Failed to transfer cached config {i + 1}: {e}")
+                continue
+
+        if duplicates > 0:
+            self.log.debug(f"Discarded {duplicates} duplicate config(s)")
+
+        self.log(f"Initial population: {len(result)} total")
+
+        return result
+
+    def set_best_available_seed_configs(
+        self,
+        configs: Sequence[Config],
+    ) -> None:
+        self._best_available_seed_configs = list(configs)
+
+    def benchmark_population(
         self, members: list[PopulationMember], *, desc: str = "Benchmarking"
     ) -> list[PopulationMember]:
         """
@@ -1030,7 +957,7 @@ class PopulationBasedSearch(BaseSearch):
             members: The list of population members to benchmark.
             desc: Description for the progress bar.
         """
-        results = self.parallel_benchmark([m.config for m in members], desc=desc)
+        results = self.benchmark_batch([m.config for m in members], desc=desc)
         for member, result in zip(members, results, strict=True):
             assert result.config is member.config
             member.perfs.append(result.perf)
@@ -1089,18 +1016,92 @@ class PopulationBasedSearch(BaseSearch):
             else 1000
         )
         repeat = min(1000, max(3, base_repeat))
-        iterator = [functools.partial(m.fn, *self.args) for m in members]
-        bench_fn: Callable[..., list[float]] = (
-            self.settings.autotune_benchmark_fn or interleaved_bench
-        )
-        if self.settings.autotune_progress_bar:
-            new_timings = bench_fn(iterator, repeat=repeat, desc=desc)
+        if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
+            repeat = min(repeat, int(capstr))
+        if len(self.benchmark_provider.mutated_arg_indices) > 0:
+            benchmark_args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                idx_to_clone=self.benchmark_provider.mutated_arg_indices,
+            )
         else:
-            new_timings = bench_fn(iterator, repeat=repeat)
+            benchmark_args = self.args
+
+        def make_rebenchmark_callable(member: PopulationMember) -> Callable[[], object]:
+            run_member = functools.partial(member.fn, *benchmark_args)
+
+            def wrapped() -> object:
+                try:
+                    return run_member()
+                finally:
+                    clear_jit_fast_path_caches(member.fn, self.log)
+
+            return wrapped
+
+        iterator = [make_rebenchmark_callable(m) for m in members]
+        _backend = getattr(getattr(self, "config_spec", None), "backend", None)
+        interleaved_benchmark = (
+            _backend.get_interleaved_bench() if _backend is not None else None
+        ) or interleaved_bench
+        benchmark_function: Callable[..., list[float]] = (
+            self.settings.autotune_benchmark_fn or interleaved_benchmark
+        )
+        try:
+            if self.settings.autotune_progress_bar:
+                new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
+            else:
+                new_timings = benchmark_function(iterator, repeat=repeat)
+        finally:
+            for m in members:
+                clear_jit_fast_path_caches(m.fn, self.log)
+        new_timings = self._confirm_suspicious_rebenchmark_timings(
+            members,
+            new_timings,
+            desc=desc,
+        )
+        new_timings = sync_object(
+            new_timings, process_group_name=self.kernel.env.process_group_name
+        )
         for m, t in zip(members, new_timings, strict=True):
             m.perfs.append(t)
             if t < self.best_perf_so_far:
                 self.best_perf_so_far = t
+
+    def _confirm_suspicious_rebenchmark_timings(
+        self,
+        members: list[PopulationMember],
+        timings: list[float],
+        *,
+        desc: str,
+    ) -> list[float]:
+        ratio = self.settings.get_suspicious_rebenchmark_ratio()
+        if ratio is None or ratio <= 0:
+            return timings
+
+        suspicious = [
+            i
+            for i, (member, timing) in enumerate(zip(members, timings, strict=True))
+            if math.isfinite(timing)
+            and math.isfinite(member.perf)
+            and timing < ratio * member.perf
+        ]
+        if not suspicious:
+            return timings
+
+        confirmed = self.benchmark_provider.benchmark_isolated(
+            [members[i].fn for i in suspicious],
+            warmup=_SUSPICIOUS_REBENCHMARK_WARMUP,
+            rep=_SUSPICIOUS_REBENCHMARK_REP,
+            desc=f"{desc}: confirming suspicious timings",
+        )
+        if confirmed is None:
+            return timings
+
+        updated = list(timings)
+        for i, timing in zip(suspicious, confirmed, strict=True):
+            if timing is not None:
+                updated[i] = timing
+        return updated
 
     def rebenchmark_population(
         self,
@@ -1153,7 +1154,7 @@ class PopulationBasedSearch(BaseSearch):
         default_flat = self.config_gen.default_flat()
         current = best
 
-        for round_num in range(1, rounds + 1):
+        for round_num in self._budgeted_range(1, rounds + 1):
             simplified = False
             candidates: list[PopulationMember] = [current]
 
@@ -1164,8 +1165,8 @@ class PopulationBasedSearch(BaseSearch):
                     new_flat = [*current.flat_values]
                     new_flat[i] = default_flat[i]
                     candidate = self.make_unbenchmarked(new_flat)
-                    # Only add if this produces a different config
-                    if candidate.config != current.config:
+                    # Only add if valid and produces a different config
+                    if candidate is not None and candidate.config != current.config:
                         candidates.append(candidate)
 
             if len(candidates) <= 1:
@@ -1175,8 +1176,8 @@ class PopulationBasedSearch(BaseSearch):
             # Benchmark the candidates
             unbenchmarked = [m for m in candidates if len(m.perfs) == 0]
             if unbenchmarked:
-                self.set_generation(self._current_generation + 1)
-                self.parallel_benchmark_population(
+                self.set_generation(self._autotune_metrics.num_generations + 1)
+                self.benchmark_population(
                     unbenchmarked, desc=f"Finishing round {round_num}"
                 )
 
@@ -1209,8 +1210,8 @@ class PopulationBasedSearch(BaseSearch):
                         if c.flat_values[i] != current.flat_values[i]:
                             combined_flat[i] = c.flat_values[i]
                 combined = self.make_unbenchmarked(combined_flat)
-                if combined.config != current.config:
-                    self.parallel_benchmark_population(
+                if combined is not None and combined.config != current.config:
+                    self.benchmark_population(
                         [combined],
                         desc=f"Finishing round {round_num}: combined",
                     )
@@ -1249,6 +1250,166 @@ class PopulationBasedSearch(BaseSearch):
         self.log(f"Finishing phase complete: final config={current.config}")
         return current
 
+    def _final_pick_supported(self) -> bool:
+        """True only on Pallas/TPU; final-pick is untested on other backends."""
+        return self.config_spec.backend_name == "pallas"
+
+    def run_final_pick_verification(
+        self,
+        best: PopulationMember,
+        top_k: int | None = None,
+    ) -> PopulationMember:
+        """Re-benchmark the top-``top_k`` candidates once and re-pick the fastest.
+
+        Beats the noisy single search-time median.  Compiler seeds are merged in.
+        Knob: ``HELION_AUTOTUNE_FINAL_PICK_TOP_K`` (10).
+        """
+        if top_k is None:
+            top_k = max(0, _env_get_int("HELION_AUTOTUNE_FINAL_PICK_TOP_K", 10))
+        if top_k <= 1:
+            return best
+
+        # Candidates: ``best`` first, then the finite population + compiler seeds
+        # (so a search-pruned seed still competes), ranked by perf and deduped by
+        # identity, capped at top_k.  getattr covers ``__new__`` test scaffolds.
+        seed_members = getattr(self, "_compiler_seed_members", []) or []
+        ranked = sorted(
+            (m for m in (*self.population, *seed_members) if math.isfinite(m.perf)),
+            key=performance,
+        )
+        candidates: list[PopulationMember] = []
+        seen: set[int] = set()
+        for member in (best, *ranked):
+            if id(member) in seen:
+                continue
+            seen.add(id(member))
+            candidates.append(member)
+            if len(candidates) >= top_k:
+                break
+        if len(candidates) < 2:
+            return best
+
+        # TPU/Pallas: re-rank by per-call on-device µs when available; else fall
+        # back to the absolute-median rebench.
+        device_micros_bench = self._resolve_device_micros_paired_bench()
+        if device_micros_bench is not None:
+            return self._run_final_pick_verification_device_micros(
+                best, candidates, device_micros_bench=device_micros_bench
+            )
+        return self._rebench_and_pick(best, candidates)
+
+    def _rebench_and_pick(
+        self, best: PopulationMember, candidates: list[PopulationMember]
+    ) -> PopulationMember:
+        """Re-benchmark ``candidates`` by absolute median and return the fastest."""
+        self.rebenchmark(candidates, desc="Final-pick verification")
+        best_member = min(candidates, key=performance)
+        if not math.isfinite(best_member.perf):
+            return best
+        if best_member is not best:
+            self.log(
+                f"Final-pick re-picked {best_member.config} "
+                f"({best_member.perf:.4f}ms) over {best.config}"
+            )
+        self.best_perf_so_far = min(self.best_perf_so_far, best_member.perf)
+        return best_member
+
+    def _finalize(self) -> Config:
+        """Finishing phase + final-pick re-rank; return the chosen config.
+
+        Shared tail of the search ``_autotune`` methods; the final-pick re-rank
+        runs only on TPU/Pallas (see ``_final_pick_supported``).
+        """
+        best = self.run_finishing_phase(self.best, self.finishing_rounds)
+        if self._final_pick_supported():
+            best = self.run_final_pick_verification(best)
+        return best.config
+
+    def _resolve_device_micros_paired_bench(
+        self,
+    ) -> Callable[..., list[tuple[float, float]]] | None:
+        """Paired device-µs bench from the backend, or None.
+
+        Pallas/TPU returns a ``jax.profiler`` closure (per-call on-chip µs) when
+        ``static_shapes`` is on and ``HELION_AUTOTUNE_PALLAS_RANK_BY=device_time`` (the
+        default); other backends and the ``wall_time`` opt-out return None.
+        """
+        # settings/config_spec are unset on the minimal final-pick test scaffolds;
+        # real searches always have them.
+        settings = getattr(self, "settings", None)
+        config_spec = getattr(self, "config_spec", None)
+        if settings is None or config_spec is None or not settings.static_shapes:
+            return None
+        return config_spec.backend.get_paired_device_micros_bench()
+
+    def _run_final_pick_verification_device_micros(
+        self,
+        best: PopulationMember,
+        candidates: list[PopulationMember],
+        *,
+        device_micros_bench: Callable[..., list[tuple[float, float]]],
+    ) -> PopulationMember:
+        """Re-rank the cohort by per-call on-chip µs instead of wall-clock.
+
+        ``device_micros_bench`` returns ``(device_micros, delta-vs-best)`` per candidate;
+        per-call device µs isn't masked by the ~125µs dispatch overhead. Picks the
+        smallest delta (tie-broken by absolute device µs). Device µs is not folded
+        into ``perfs`` (those are wall-clock ms). Falls back to the absolute-median
+        rebench on any error.
+        """
+        if len(self.benchmark_provider.mutated_arg_indices) > 0:
+            benchmark_args = _clone_args(
+                self.args,
+                self.kernel.env.process_group_name,
+                idx_to_clone=self.benchmark_provider.mutated_arg_indices,
+            )
+        else:
+            benchmark_args = self.args
+        candidate_fns: list[Callable[..., object]] = [
+            functools.partial(member.fn, *benchmark_args) for member in candidates
+        ]
+        reference_fn: Callable[..., object] = functools.partial(
+            best.fn, *benchmark_args
+        )
+        desc = (
+            "Final-pick verification device_micros"
+            if self.settings.autotune_progress_bar
+            else None
+        )
+        try:
+            results = device_micros_bench(candidate_fns, reference_fn, desc=desc)
+        except Exception as err:
+            self.log(f"Device-µs re-rank failed ({err!r}); falling back to rebench.")
+            return self._rebench_and_pick(best, candidates)
+
+        # results[i] == (absolute device µs, paired delta vs best).
+        device_micros_by_slot = [device_micros for device_micros, _ in results]
+        delta_by_slot = [delta for _, delta in results]
+        if not any(math.isfinite(u) and math.isfinite(d) for u, d in results):
+            self.log(
+                "Device-µs re-rank got no finite readings; falling back to rebench."
+            )
+            return self._rebench_and_pick(best, candidates)
+
+        def _device_key(slot: int) -> tuple[float, float]:
+            delta, device_micros = delta_by_slot[slot], device_micros_by_slot[slot]
+            if not math.isfinite(delta) or not math.isfinite(device_micros):
+                return (inf, inf)
+            return (delta, device_micros)
+
+        best_slot = min(range(len(candidates)), key=_device_key)
+        if not math.isfinite(delta_by_slot[best_slot]):
+            return best
+        best_member = candidates[best_slot]
+
+        if best_member is not best:
+            self.log(
+                f"Final-pick re-picked {best_member.config} (delta "
+                f"{delta_by_slot[best_slot]:+.3f}µs, absolute "
+                f"{device_micros_by_slot[best_slot]:.3f}µs) over {best.config}"
+            )
+        return best_member
+
 
 def population_statistics(population: list[PopulationMember]) -> str:
     """
@@ -1280,645 +1441,18 @@ def population_statistics(population: list[PopulationMember]) -> str:
             status_counts["ok"] += 1
     if len(working) == 0:
         raise exc.NoConfigFound
-    parts: list[str] = []
-    for label in ("error", "timeout", "ok"):
-        count = status_counts.get(label, 0)
-        if count:
-            parts.append(f"{label}={count}")
-
-    parts.extend(
-        (
-            f"min={working[0].perf:.4f}",
-            f"mid={working[len(working) // 2].perf:.4f}",
-            f"max={working[-1].perf:.4f}",
-            f"best={pprint.pformat(dict(population[0].config), width=100, compact=True)}",
-        )
+    count_parts = [
+        f"{label}={status_counts[label]}"
+        for label in ("error", "timeout", "ok")
+        if status_counts[label]
+    ]
+    perf_parts = (
+        f"min={working[0].perf:.4f}",
+        f"mid={working[len(working) // 2].perf:.4f}",
+        f"max={working[-1].perf:.4f}",
     )
-    return "\n" + "\n".join(parts)
-
-
-@dataclasses.dataclass
-class PrecompileFuture:
-    """
-    Wraps a child process where we are precompiling a kernel.
-
-    Attributes:
-        search (BaseSearch): The search object that initiated the precompilation.
-        config (Config): The configuration to be precompiled.
-        process (mp.Process | None): The process running the precompilation.
-        timeout (float): The timeout for the precompilation.
-        start_time (float): The time when the precompilation started.
-        end_time (float | None): The time when the precompilation ended.
-        ok (bool | None): The result of the precompilation (True if successful, False otherwise).
-    """
-
-    search: BaseSearch
-    config: Config
-    process: mp.Process | None
-    timeout: float
-    # Set when the process is actually started. For queued futures this is None.
-    start_time: float | None = None
-    end_time: float | None = None
-    ok: bool | None = None
-    result_path: str | None = None
-    _result_received: bool = False
-    remote_error: RemoteError | None = None
-    _remote_error_handled: bool = False
-    failure_reason: Literal["ok", "error", "timeout"] | None = None
-
-    @property
-    def elapsed(self) -> float:
-        """Return the elapsed time since the start of the precompilation."""
-        if self.start_time is None:
-            return 0.0
-        if self.end_time is not None:
-            return self.end_time - self.start_time
-        return time.time() - self.start_time
-
-    def seconds_left(self) -> float:
-        """Return the number of seconds left before the timeout."""
-        if self.end_time is not None:
-            return 0
-        if self.start_time is None:
-            return self.timeout
-        return self.timeout - (time.time() - self.start_time)
-
-    def is_alive(self) -> bool:
-        """Check if the precompilation process is still alive."""
-        if (p := self.process) is None:
-            return False
-        return p.is_alive()
-
-    @property
-    def started(self) -> bool:
-        """Whether the process has been started."""
-        return self.start_time is not None
-
-    def start(self) -> None:
-        """Start the underlying process and set the timer if not already started."""
-        if self.process is None or self.started:
-            return
-        self.start_time = time.time()
-        self.process.start()
-
-    @staticmethod
-    def skip(search: BaseSearch, config: Config, ok: bool) -> PrecompileFuture:
-        """Dummy precompile future that is already done."""
-        ts = time.time()
-        return PrecompileFuture(
-            search=search,
-            config=config,
-            process=None,
-            timeout=0,
-            ok=ok,
-            start_time=ts,
-            end_time=ts,
-            result_path=None,
-            _result_received=True,
-            remote_error=None,
-            _remote_error_handled=True,
-            failure_reason="ok" if ok else "error",
-        )
-
-    def __call__(self) -> bool:
-        """Wait for the precompilation to finish and return true on success."""
-        if self.ok is not None:
-            return self.ok
-        process = self.process
-        assert process is not None
-        try:
-            # Start now if not already started (single-future path)
-            if not self.started:
-                self.start()
-            process.join(self.seconds_left())
-        finally:
-            self._mark_complete()
-        self._consume_result(raise_on_raise=True)
-        assert self.ok is not None
-        return self.ok
-
-    @staticmethod
-    def wait_for_all(
-        futures: list[PrecompileFuture],
-        desc: str | None = None,
-    ) -> list[bool]:
-        """
-        Wait for all precompile futures to complete.
-
-        Args:
-            futures: A list of PrecompileFuture objects.
-            desc: Optional description used for the progress display.
-
-        Returns:
-            A list of boolean values indicating completion status.
-        """
-        progress = iter_with_progress(
-            range(len(futures)),
-            total=len(futures),
-            description=desc,
-            enabled=desc is not None,
-        )
-        next(progress, None)  # display the progress bar immediately
-        progress_left = len(futures)
-        remaining = [f for f in futures if f.ok is None]
-        try:
-            while remaining:
-                remaining = PrecompileFuture._wait_for_all_step(remaining)
-                while progress_left > len(remaining):
-                    next(progress, None)
-                    progress_left -= 1
-        except BaseException:
-            PrecompileFuture._cancel_all(futures)
-            raise
-        result = []
-        for f in futures:
-            assert f.ok is not None
-            if f.failure_reason is None:
-                f.failure_reason = "ok" if f.ok else "error"
-            result.append(f.ok)
-        return result
-
-    @staticmethod
-    def _wait_for_all_step(
-        futures: list[PrecompileFuture],
-    ) -> list[PrecompileFuture]:
-        """Start up to the concurrency cap, wait for progress, and return remaining futures."""
-        cap = futures[0].search._jobs if futures else 1
-        running = [f for f in futures if f.started and f.ok is None and f.is_alive()]
-
-        # Start queued futures up to the cap
-        queued = collections.deque(f for f in futures if not f.started and f.ok is None)
-        while len(running) < cap and queued:
-            job = queued.popleft()
-            job.start()
-            if job.is_alive():
-                running.append(job)
-
-        # Wait for at least one to finish or time out
-        timeout = min([f.seconds_left() for f in running], default=0.0)
-        handles = [f.process.sentinel for f in running if f.process is not None]
-        if handles and timeout > 0:
-            connection.wait(handles, timeout)
-        remaining: list[PrecompileFuture] = []
-        for f in futures:
-            if f.ok is not None:
-                continue
-            if f.started and (not f.is_alive() or f.seconds_left() <= 0):
-                f._mark_complete()
-                f._consume_result(raise_on_raise=True)
-            else:
-                remaining.append(f)
-        return remaining
-
-    @staticmethod
-    def _cancel_all(futures: Iterable[PrecompileFuture]) -> None:
-        """Cancel any futures that have not completed."""
-        active = [future for future in futures if future.ok is None]
-        for future in active:
-            with contextlib.suppress(Exception):
-                future._kill_without_wait()
-        for future in active:
-            with contextlib.suppress(Exception):
-                future.cancel()
-
-    def _kill_without_wait(self) -> None:
-        """Issue a hard kill to the underlying process without waiting for exit."""
-        process = self.process
-        if process is None or not self.started:
-            return
-        if process.is_alive():
-            with contextlib.suppress(Exception):
-                process.kill()
-
-    def cancel(self) -> None:
-        """Terminate the underlying process (if any) without waiting for success."""
-        self.end_time = time.time()
-        process = self.process
-        if process is not None:
-            if self.started:
-                with contextlib.suppress(Exception):
-                    if process.is_alive():
-                        process.kill()
-                    process.join()
-        if self.ok is None:
-            self.ok = False
-        if self.failure_reason is None:
-            self.failure_reason = "error"
-        self._consume_result(raise_on_raise=False)
-
-    def _mark_complete(self) -> bool:
-        """
-        Mark the precompile future as complete and kill the process if needed.
-
-        Returns:
-            True if the precompilation was successful, False otherwise.
-        """
-        self.end_time = time.time()
-        process = self.process
-        assert process is not None
-        # If the process hasn't been started yet (shouldn't happen in normal flow),
-        # start and immediately terminate to maintain invariants.
-        if not self.started:
-            self.start()
-        if not process.is_alive():
-            self.ok = process.exitcode == 0
-            self._consume_result(raise_on_raise=False)
-            if self.ok:
-                self.failure_reason = "ok"
-            elif self.failure_reason is None:
-                self.failure_reason = "error"
-            return self.ok
-        process.terminate()
-        process.join(10)
-        msg = f"Timeout after {self.elapsed:.0f}s compiling {self.config}"
-        if process.is_alive():
-            if not self.search.settings.autotune_ignore_errors:
-                self.search.log.warning(
-                    msg,
-                    "(SIGKILL required)",
-                )
-            process.kill()
-            process.join()
-        else:
-            if not self.search.settings.autotune_ignore_errors:
-                self.search.log.warning(msg)
-
-        self.ok = False
-        self.failure_reason = "timeout"
-        self._consume_result(raise_on_raise=False)
-        return False
-
-    def _consume_result(self, *, raise_on_raise: bool) -> None:
-        if not self._result_received and self.result_path is not None:
-            message_data: dict[str, object] | None = None
-            try:
-                with open(self.result_path, "rb") as f:
-                    message_data = pickle.load(f)
-            except FileNotFoundError:
-                message_data = None
-            except Exception as err:
-                if self.remote_error is None:
-                    self.remote_error = RemoteError(
-                        exc_type=type(err).__name__,
-                        exc_module=type(err).__module__,
-                        exc_args=(str(err),),
-                        traceback=None,
-                        classification="warn",
-                    )
-            finally:
-                with contextlib.suppress(Exception):
-                    os.remove(self.result_path)
-            if message_data is None:
-                if self.failure_reason == "timeout":
-                    # Timeout warnings have already been emitted; suppress secondary EOF logs.
-                    self.remote_error = None
-                    self._remote_error_handled = True
-                elif self.remote_error is None:
-                    self.remote_error = RemoteError(
-                        exc_type="EOFError",
-                        exc_module=__name__,
-                        exc_args=("No result received from subprocess.",),
-                        traceback=None,
-                        classification="debug",
-                    )
-            elif message_data["status"] == "ok":
-                if self.ok is None:
-                    self.ok = True
-                assert self.remote_error is None
-            else:
-                exc_args_obj = message_data["exc_args"]
-                if isinstance(exc_args_obj, tuple):
-                    exc_args_tuple: tuple[object, ...] = exc_args_obj
-                else:
-                    exc_args_tuple = tuple(cast("Iterable[object]", exc_args_obj))
-                self.remote_error = RemoteError(
-                    exc_type=cast("str", message_data["exc_type"]),
-                    exc_module=cast("str | None", message_data["exc_module"]),
-                    exc_args=exc_args_tuple,
-                    traceback=cast("str | None", message_data["traceback"]),
-                    classification=cast("str | None", message_data["classification"]),
-                    captured_output=cast(
-                        "str | None", message_data.get("captured_output")
-                    ),
-                )
-                self.ok = False
-            self.result_path = None
-            self._result_received = True
-
-        error = self.remote_error
-        if error is None or self._remote_error_handled:
-            return
-        exc_obj = error.to_exception()
-        maybe_dump_triton_failure(
-            self.search.kernel,
-            self.config,
-            exc_obj,
-            remote_traceback=error.traceback,
-            captured_output=error.captured_output,
-        )
-        classification = error.classification or classify_triton_exception(exc_obj)
-        ignore_errors = self.search.settings.autotune_ignore_errors
-        if ignore_errors:
-            classification = "debug"
-        if classification == "raise":
-            if raise_on_raise:
-                self._remote_error_handled = True
-                decorator = self.search.kernel.format_kernel_decorator(
-                    self.config, self.search.settings
-                )
-                log_generated_triton_code_debug(
-                    self.search.log,
-                    self.search.kernel,
-                    self.config,
-                    prefix=f"Generated Triton code for {decorator}:",
-                )
-                self.search.kernel.maybe_log_repro(
-                    self.search.log.error, self.search.args, self.config
-                )
-                raise exc.TritonError(
-                    error=f"{type(exc_obj).__qualname__}: {exc_obj}",
-                    decorator=decorator,
-                    code=SUPPRESSED_TRITON_CODE_MSG,
-                ) from exc_obj
-            return
-
-        decorator = self.search.kernel.format_kernel_decorator(
-            self.config, self.search.settings
-        )
-        log_generated_triton_code_debug(
-            self.search.log,
-            self.search.kernel,
-            self.config,
-            prefix=f"Generated Triton code for {decorator}:",
-        )
-        formatted = format_triton_compile_failure(
-            self.config, exc_obj, self.search.kernel
-        )
-        if error.traceback:
-            formatted = (
-                f"{formatted}\nRemote traceback (spawned process):\n{error.traceback}"
-            )
-        if classification == "warn":
-            self.search.log.warning(formatted)
-            self.search.kernel.maybe_log_repro(
-                self.search.log.warning, self.search.args, self.config
-            )
-        elif not ignore_errors:
-            self.search.log.debug(formatted)
-            self.search.kernel.maybe_log_repro(
-                self.search.log.debug, self.search.args, self.config
-            )
-        self._remote_error_handled = True
-
-
-def _clone_tree(tree: object) -> object:
-    def _clone(leaf: object) -> object:
-        if isinstance(leaf, torch.Tensor):
-            clone = leaf.detach().clone()
-            clone.requires_grad_(leaf.requires_grad)
-            return clone
-        return leaf
-
-    return tree_map(_clone, tree)
-
-
-def _assert_args_close(
-    actual: Sequence[object],
-    expected: Sequence[object],
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
-) -> None:
-    actual_flat, _ = tree_flatten(actual)
-    expected_flat, _ = tree_flatten(expected)
-    for act, exp in zip(actual_flat, expected_flat, strict=False):
-        if isinstance(act, torch.Tensor) and isinstance(exp, torch.Tensor):
-            torch.testing.assert_close(act, exp, atol=atol, rtol=rtol)
-
-
-def _write_result_file(result_path: str, message: dict[str, object]) -> None:
-    tmp_path = f"{result_path}.tmp"
-    with open(tmp_path, "wb") as f:
-        pickle.dump(message, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, result_path)
-
-
-def _run_kernel_in_subprocess_spawn(
-    fn_spec: SerializedCompiledFunction,
-    args_path: str,
-    result_path: str,
-    decorator: str,
-) -> None:
-    status = 0
-    _cap: list[str] = [""]
-    try:
-        fn = _load_compiled_fn(fn_spec)
-        args = torch.load(args_path)
-        assert isinstance(args, (tuple, list))
-        torch.accelerator.synchronize()
-        with capture_output() as _cap:
-            fn(*args)
-        torch.accelerator.synchronize()
-        _write_result_file(result_path, {"status": "ok"})
-    except Exception as exc:
-        status = 1
-        with contextlib.suppress(Exception):
-            try:
-                exc_args = tuple(exc.args)
-            except Exception:
-                exc_args = (str(exc),)
-            try:
-                classification = classify_triton_exception(exc)
-            except Exception:
-                classification = None
-            _write_result_file(
-                result_path,
-                {
-                    "status": "error",
-                    "traceback": traceback.format_exc(),
-                    "decorator": decorator,
-                    "exc_type": type(exc).__name__,
-                    "exc_module": type(exc).__module__,
-                    "exc_args": exc_args,
-                    "classification": classification,
-                    "captured_output": _cap[0] or None,
-                },
-            )
-    finally:
-        os._exit(status)
-
-
-def _prepare_precompiler_for_fork(
-    fn: CompiledConfig,
-    args: Sequence[object],
-    config: Config,
-    kernel: _AutotunableKernel,
-    decorator: str,
-    logger: AutotuningLogger,
-) -> Callable[[], None] | None:
-    def extract_launcher(
-        triton_kernel: object,
-        grid: tuple[int, ...],
-        *launch_args: object,
-        **launch_kwargs: object,
-    ) -> NoReturn:
-        raise _ExtractedLaunchArgs(triton_kernel, grid, launch_args, launch_kwargs)
-
-    try:
-        fn(*args, _launcher=extract_launcher)
-        raise RuntimeError("Expected _ExtractedLaunchArgs to be raised")
-    except _ExtractedLaunchArgs as extracted:
-        precompiler = make_precompiler(
-            cast("Any", extracted.kernel),
-            config,
-            cast("BoundKernel", kernel),
-        )(*extracted.args, **extracted.kwargs)
-        if precompiler is already_compiled:
-            return None
-        return precompiler
-    except Exception as e:
-        maybe_dump_triton_failure(kernel, config, e)
-        log_generated_triton_code_debug(
-            logger,
-            kernel,
-            config,
-            prefix=f"Generated Triton code for {decorator}:",
-        )
-        logger.warning(
-            "Helion autotuner precompile error for %s. %s",
-            decorator,
-            SUPPRESSED_TRITON_CODE_MSG,
-            exc_info=True,
-        )
-        raise
-
-
-def _run_kernel_in_subprocess_fork(
-    precompiler: Callable[[], None],
-    config: Config,
-    kernel: _AutotunableKernel,
-    result_path: str,
-    decorator: str,
-) -> None:
-    status = 0
-    _cap: list[str] = [""]
-    try:
-        with capture_output() as _cap:
-            precompiler()
-        _write_result_file(result_path, {"status": "ok"})
-    except Exception as exc:
-        status = 1
-        with contextlib.suppress(Exception):
-            try:
-                exc_args = tuple(exc.args)
-            except Exception:
-                exc_args = (str(exc),)
-            try:
-                classification = classify_triton_exception(exc)
-            except Exception:
-                classification = None
-            _write_result_file(
-                result_path,
-                {
-                    "status": "error",
-                    "traceback": traceback.format_exc(),
-                    "decorator": decorator,
-                    "exc_type": type(exc).__name__,
-                    "exc_module": type(exc).__module__,
-                    "exc_args": exc_args,
-                    "classification": classification,
-                    "captured_output": _cap[0] or None,
-                },
-            )
-    finally:
-        os._exit(status)
-
-
-class _ExtractedLaunchArgs(Exception):
-    """Exception that carries kernel launch arguments for precompiler extraction."""
-
-    def __init__(
-        self,
-        kernel: object,
-        grid: tuple[int, ...],
-        args: tuple[object, ...],
-        kwargs: dict[str, object],
-    ) -> None:
-        super().__init__()
-        self.kernel = kernel
-        self.grid = grid
-        self.args = args
-        self.kwargs = kwargs
-
-
-def _unset_fn(*args: object) -> NoReturn:
-    raise RuntimeError("Uninitialized function")
-
-
-@dataclasses.dataclass
-class SerializedCompiledFunction:
-    function_name: str
-    source_code: str
-    filename: str | None
-    module_name: str | None
-
-
-@dataclasses.dataclass
-class RemoteError:
-    exc_type: str
-    exc_module: str | None
-    exc_args: tuple[object, ...]
-    traceback: str | None
-    classification: str | None
-    captured_output: str | None = None
-
-    def to_exception(self) -> Exception:
-        exc_cls = types.new_class(self.exc_type, (Exception,))
-        exc_cls.__module__ = self.exc_module or __name__
-        exc_obj = exc_cls(*self.exc_args)
-        exc_obj.remote_traceback = self.traceback
-        return exc_obj
-
-
-def _serialize_compiled_fn(fn: CompiledConfig) -> SerializedCompiledFunction:
-    if "<locals>" in getattr(fn, "__qualname__", ""):
-        raise RuntimeError("Unable to serialize nested compiled functions")
-    module_name = getattr(fn, "__module__", None)
-    module = sys.modules.get(module_name) if module_name is not None else None
-    filename: str | None = None
-    source_code: str | None = None
-    if module is not None:
-        filename = getattr(module, "__file__", None)
-        if filename is not None and os.path.exists(filename):
-            source_code = Path(filename).read_text(encoding="utf-8")
-        if source_code is None:
-            with contextlib.suppress(OSError, TypeError):
-                source_code = inspect.getsource(module)
-    if source_code is None:
-        raise RuntimeError("Unable to capture source for compiled kernel")
-    return SerializedCompiledFunction(
-        function_name=fn.__name__,
-        source_code=source_code,
-        filename=filename,
-        module_name=module_name,
-    )
-
-
-def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:
-    module_name = f"_helion_autotune_subprocess_{uuid.uuid4().hex}"
-    module = types.ModuleType(module_name)
-    module.__file__ = fn_spec.filename or "<helion-autotune-subprocess>"
-    module.__loader__ = None
-    module.__package__ = None
-    sys.modules[module_name] = module
-    exec(
-        compile(fn_spec.source_code, module.__file__, "exec"),
-        module.__dict__,
-    )
-    fn = getattr(module, fn_spec.function_name, None)
-    if fn is None:
-        raise RuntimeError(
-            f"Unable to locate compiled kernel '{fn_spec.function_name}' in generated module"
-        )
-    return fn
+    lines = [f"{' '.join(count_parts)} | {' '.join(perf_parts)}", "best:"]
+    best_config = dict(population[0].config)
+    key_width = max((len(k) for k in best_config), default=0)
+    lines.extend(f"  {k:<{key_width}} = {v!r}" for k, v in best_config.items())
+    return "\n" + "\n".join(lines)

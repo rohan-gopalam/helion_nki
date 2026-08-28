@@ -33,6 +33,7 @@ from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
 from torch.fx.interpreter import Interpreter
+from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
@@ -46,9 +47,11 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .aten_lowering import Lowering
 from .aten_lowering import LoweringContext
+from .aten_lowering import _should_use_cute_argreduce_lowering
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .compile_environment import FixedBlockSizeSource
+from .compile_environment import _symint_expr
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -61,19 +64,29 @@ if TYPE_CHECKING:
 
     from .. import Config
     from .backend import InductorOpOverrides
+    from .cute.layout import MatmulAxisModel
+    from .cute.layout import MatmulExecutionPlan
+    from .cute.layout import ThreadLayout
     from .device_function import DeviceFunction
+    from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
     from .tile_dispatch import TileStrategyDispatch
 
-INDUCTOR_PATCH: dict[str, object] = {
-    # Allow implicit upcasts to FP32 for elementwise math correctness
-    "triton.codegen_upcast_to_fp32": True,
-    # Ensure Inductor preserves reductions (even tiny ones) as Reduction IR
-    # so we can attach ReductionLowering instead of seeing pointwise fusions.
-    "split_reductions": False,
-    "unroll_reductions_threshold": 1,
-}
+
+def _patched_inductor_config() -> contextlib.AbstractContextManager[None]:
+    settings = CompileEnvironment.current().settings
+    patch: dict[str, object] = {
+        # Allow implicit upcasts to FP32 for elementwise math correctness
+        "triton.codegen_upcast_to_fp32": True,
+        # Ensure Inductor preserves reductions (even tiny ones) as Reduction IR
+        # so we can attach ReductionLowering instead of seeing pointwise fusions.
+        "split_reductions": False,
+        "unroll_reductions_threshold": 1,
+    }
+    if settings.fast_math:
+        patch["use_fast_math"] = True
+    return inductor_config.patch(patch)
 
 
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
@@ -93,6 +106,13 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                 if node.op == "call_function":
                     with node.meta["location"]:
                         prepare_node_lowering(graph_lowering, node)
+                        lowering = node.meta.get("lowering")
+                        if isinstance(lowering, PointwiseLowering):
+                            # Catch the missing-keepdim broadcast bug at graph
+                            # build time (backend- and config-independent) so it
+                            # is rejected consistently on every backend, before
+                            # any config-specific validation or codegen.
+                            lowering._check_reduction_broadcast_keepdim(node)
 
 
 def prepare_node_lowering(
@@ -105,8 +125,25 @@ def prepare_node_lowering(
         return
 
     if node.target in aten_lowering_dispatch:
-        node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
-        return
+        if node.target in {
+            torch.ops.aten.argmax.default,
+            torch.ops.aten.argmin.default,
+        } and not _should_use_cute_argreduce_lowering(node):
+            pass
+        elif (
+            node.target is torch.ops.aten.where.self
+            and CompileEnvironment.current().backend.name == "nki"
+        ):
+            # Upstream added a generic where ATen lowering whose "common" handler
+            # builds a "{cond}/{x}/{y}" expression template fed to where_expr.
+            # NKI's where is statement-emitting (nisa.tensor_copy_predicated) and
+            # must materialize/broadcast operands through the Inductor OpsHandler
+            # — exactly how the reference branch (which has no where ATen lowering)
+            # lowers it. Fall through to the inductor path for NKI.
+            pass
+        else:
+            node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
+            return
 
     if isinstance(
         val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
@@ -165,7 +202,7 @@ def prepare_node_lowering(
 
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
-    with inductor_config.patch(INDUCTOR_PATCH):
+    with _patched_inductor_config():
         with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(
@@ -194,6 +231,7 @@ def prepare_node_lowering(
             buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
+    # pyrefly: ignore [unbound-name]
     assert buffer in new_buffers
     nodes = []
     extra_input_names = []
@@ -422,7 +460,7 @@ def install_inductor_kernel_handlers(
     cg: CodegenInterface, args: dict[str, ast.AST]
 ) -> Iterator[None]:
     with (
-        inductor_config.patch(INDUCTOR_PATCH),
+        _patched_inductor_config(),
         V.set_graph_handler(FakeGraphLowering()),
         V.set_ops_handler(
             GenerateASTFromInductor(
@@ -453,7 +491,7 @@ class FakeGraphLowering(GraphLowering):
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         # Validate broadcasting of tile block dimensions to catch shape mismatches
-        self._check_block_broadcast_compatibility(node)
+        self._check_block_broadcast_compatibility(ctx, node)
         with self.install_kernel_handlers(ctx, node):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
@@ -506,7 +544,9 @@ class PointwiseLowering(InductorLowering):
     def get_masked_value(self, node: torch.fx.Node) -> float | bool | None:
         return inductor_masked_value(self, node)
 
-    def _check_block_broadcast_compatibility(self, node: torch.fx.Node) -> None:
+    def _check_block_broadcast_compatibility(
+        self, ctx: LoweringContext, node: torch.fx.Node
+    ) -> None:
         """Detect invalid broadcasting between tile-related dimensions in pointwise ops.
 
         This guards against patterns like subtracting a reduced tensor without
@@ -535,7 +575,7 @@ class PointwiseLowering(InductorLowering):
             if isinstance(x, int):
                 return x == 1
             if isinstance(x, torch.SymInt):
-                expr = x._sympy_()
+                expr = _symint_expr(x)
                 if isinstance(expr, sympy.Integer):
                     return int(expr) == 1
                 # Treat tiles with a fixed block size of 1 as broadcastable-1
@@ -547,27 +587,72 @@ class PointwiseLowering(InductorLowering):
                         if isinstance(val, int):
                             return val == 1
                         if isinstance(val, torch.SymInt):
-                            vexpr = val._sympy_()
+                            vexpr = _symint_expr(val)
                             return isinstance(vexpr, sympy.Integer) and int(vexpr) == 1
                 return False
             return False
 
+        def block_sizes_proven_equal(block_ids: set[int]) -> bool:
+            block_infos = [env.block_sizes[bid] for bid in block_ids]
+            block_symbols = [info.symbol() for info in block_infos]
+            base_symbol = block_symbols[0]
+            if all(base_symbol == symbol for symbol in block_symbols[1:]):
+                return True
+
+            known_config_sizes = [
+                size
+                for info in block_infos
+                if isinstance(
+                    size := info.from_config(ctx.cg.device_function.config),
+                    (int, torch.SymInt),
+                )
+            ]
+            if len(known_config_sizes) == len(block_infos):
+                base_config_size = known_config_sizes[0]
+                if all(
+                    env.known_equal(base_config_size, size)
+                    for size in known_config_sizes[1:]
+                ):
+                    return True
+
+            known_sizes = [
+                info.size
+                for info in block_infos
+                if isinstance(info.size, (int, torch.SymInt))
+            ]
+            if len(known_sizes) != len(block_infos):
+                return False
+            base_size = known_sizes[0]
+            return all(env.known_equal(base_size, size) for size in known_sizes[1:])
+
         # Check each dimension independently
         for dim in range(max_rank):
+            non_one_sizes = [s[dim] for s in shapes if not is_one(s[dim])]
+            if non_one_sizes:
+                base_size = non_one_sizes[0]
+                if all(
+                    isinstance(size_i, (int, torch.SymInt))
+                    and env.known_equal(base_size, size_i)
+                    for size_i in non_one_sizes[1:]
+                ):
+                    continue
+
             # First, see if multiple distinct block-ids appear in this dim
             block_ids: set[int] = set()
             for s in shapes:
                 size_i = s[dim]
                 if is_one(size_i):
                     continue
-                block_id = env.get_block_id(size_i)
+                block_id = env.resolve_block_id(size_i)
                 if block_id is not None:
-                    block_ids.add(block_id)
+                    block_ids.add(env.canonical_block_id(block_id))
             if len(block_ids) >= 2:
-                raise exc.ShapeMismatch(
-                    str(shapes[0]),
-                    ", ".join(map(str, shapes[1:])),
-                )
+                if not block_sizes_proven_equal(block_ids):
+                    raise exc.ShapeMismatch(
+                        str(shapes[0]),
+                        ", ".join(map(str, shapes[1:])),
+                    )
+                continue
 
             # Otherwise, fall back to strict symbolic inequality among non-1 sizes
             exprs: set[object] = set()
@@ -575,11 +660,89 @@ class PointwiseLowering(InductorLowering):
                 size_i = s[dim]
                 if is_one(size_i):
                     continue
+                block_id = env.resolve_block_id(size_i)
+                if block_id is not None:
+                    exprs.add(
+                        env.block_sizes[env.canonical_block_id(block_id)].symbol()
+                    )
+                    continue
                 if isinstance(size_i, torch.SymInt):
-                    exprs.add(size_i._sympy_())
+                    expr = _symint_expr(size_i)
+                    exprs.add(env.specialize_expr(expr) if expr is not None else size_i)
                 else:
                     exprs.add(size_i)
             if len(exprs) >= 2:
+                raise exc.ShapeMismatch(
+                    str(shapes[0]),
+                    ", ".join(map(str, shapes[1:])),
+                )
+
+    def _check_reduction_broadcast_keepdim(self, node: torch.fx.Node) -> None:
+        """Reject a reduction result broadcast against a *different* tile axis.
+
+        This is the missing-``keepdim`` bug: e.g.
+        ``x[tile_m, :] - torch.amax(x[tile_m, :], dim=1)`` drops the reduced N
+        axis, then the surviving M axis is right-aligned onto N (``[M, N] - [M]``).
+        It is rejected on **every** backend at graph-build time (so the error is
+        config- and backend-independent), unlike the size-coincidence leniency in
+        :meth:`_check_block_broadcast_compatibility` which would otherwise let
+        ``[M, N] - [M]`` through whenever the M and N block sizes happen to match.
+
+        The check is gated on an operand actually being a reduction result, so it
+        does **not** touch structurally-identical but legitimately-handled
+        patterns such as matmul-epilogue column-vector / aux-tensor broadcasts
+        (``acc + colvec[tile_m]``), which the backend's epilogue classifier owns
+        and rejects with its own actionable diagnostics.
+        """
+        env = CompileEnvironment.current()
+        if not any(
+            isinstance(inp.meta.get("lowering"), ReductionLowering)
+            for inp in node.all_input_nodes
+        ):
+            return
+        inputs = self.input_fake_tensors(node)
+        if len(inputs) < 2:
+            return
+
+        shapes: list[list[int | torch.SymInt]] = [[*t.size()] for t in inputs]
+        max_rank = max((len(s) for s in shapes), default=0)
+        for i, s in enumerate(shapes):
+            pad = max_rank - len(s)
+            if pad > 0:
+                shapes[i] = [1] * pad + s
+
+        def is_one(x: int | torch.SymInt) -> bool:
+            if isinstance(x, int):
+                return x == 1
+            expr = _symint_expr(x)
+            if isinstance(expr, sympy.Integer):
+                return int(expr) == 1
+            block_id = env.get_block_id(x)
+            if block_id is not None:
+                bs = env.block_sizes[block_id]
+                if isinstance(bs.block_size_source, FixedBlockSizeSource):
+                    val = bs.block_size_source.value
+                    if isinstance(val, int):
+                        return val == 1
+                    vexpr = _symint_expr(val) if isinstance(val, torch.SymInt) else None
+                    return isinstance(vexpr, sympy.Integer) and int(vexpr) == 1
+            return False
+
+        for dim in range(max_rank):
+            symbols: set[object] = set()
+            for s in shapes:
+                size_i = s[dim]
+                if is_one(size_i):
+                    continue
+                block_id = env.resolve_block_id(size_i)
+                if block_id is not None:
+                    symbols.add(
+                        env.block_sizes[env.canonical_block_id(block_id)].symbol()
+                    )
+            # Two *distinct* tile axes aligned in the same broadcast position is a
+            # wrong-axis (missing-keepdim) reduction broadcast, even when their
+            # current sizes coincide.
+            if len(symbols) >= 2:
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),
@@ -667,15 +830,6 @@ class ReductionLowering(InductorLowering):
             ctx.cg,
             fx_node=node,
         )
-        if CompileEnvironment.current().block_sizes[self.block_index].reduction:
-            strategy = ctx.cg.device_function.tile_strategy.get_reduction_strategy(
-                self.block_index
-            )
-        else:
-            from .reduction_strategy import BlockReductionStrategy
-
-            strategy = BlockReductionStrategy(state, self.block_index)
-
         inputs = self.input_fake_tensors(node)
 
         if len(inputs) == 1:
@@ -778,14 +932,13 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
-        codegen_fn = self.api_func._codegen.get(env.codegen_name)
-        if codegen_fn is None:
-            codegen_fn = self.api_func._codegen.get("common")
-        if codegen_fn is None:
+        try:
+            codegen_fn = self.api_func._codegen[env.codegen_name]
+        except KeyError:
             raise exc.BackendImplementationMissing(
                 env.backend_name,
                 f"codegen for API function {self.api_func.__qualname__}",
-            )
+            ) from None
         from .generate_ast import GenerateAST
 
         if not isinstance(ctx.cg, GenerateAST):
@@ -795,6 +948,7 @@ class APIFuncLowering(Lowering):
             CodegenState(
                 ctx.cg,
                 fx_node=node,
+                env=ctx.env,
                 # pyrefly: ignore [bad-argument-type]
                 proxy_args=proxy_args,
                 # pyrefly: ignore [bad-argument-type]
@@ -973,9 +1127,15 @@ class GenerateASTFromInductor(DefaultHandler):
 
         # Triton sigmoid expects fp32/fp64 inputs; enforce fp32 compute, then cast back.
         inner_name = self._lift(self._create_cast_expr(x, torch.float32))
-        result = expr_from_string(
-            _unpack_opsvalue(self.parent_handler.sigmoid(inner_name))
-        )
+
+        if CompileEnvironment.current().settings.fast_math:
+            result = expr_from_string(
+                f"fast_dividef(1.0, 1.0 + fast_expf(-{inner_name}))"
+            )
+        else:
+            result = expr_from_string(
+                _unpack_opsvalue(self.parent_handler.sigmoid(inner_name))
+            )
 
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is not None and expected_dtype != torch.float32:
@@ -983,6 +1143,10 @@ class GenerateASTFromInductor(DefaultHandler):
         return self._lift(result)
 
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.name == "cute":
+            return self._lift(
+                expr_from_string("cute.math.rsqrt({x})", x=self._to_ast(x))
+            )
         try:
             return self._default("rsqrt", (x,), {})
         except NotImplementedError:
@@ -1017,6 +1181,21 @@ class GenerateASTFromInductor(DefaultHandler):
             result_expr = self._maybe_cast_to_expected_dtype(result_expr)
 
         return self._lift(result_expr)
+
+    def mod(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.codegen_name == "nki":
+            return self._default("mod", (str(a), str(b)), {})
+        return self._default("mod", (a, b), {})
+
+    def remainder(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.codegen_name == "nki":
+            return self._default("remainder", (str(a), str(b)), {})
+        return self._default("remainder", (a, b), {})
+
+    def fmod(self, a: object, b: object) -> str:  # type: ignore[override]
+        if CompileEnvironment.current().backend.codegen_name == "nki":
+            return self._default("fmod", (str(a), str(b)), {})
+        return self._default("fmod", (a, b), {})
 
     def load(self, name: str, index: sympy.Expr) -> str:
         # TODO(jansel): assert the index is correct
@@ -1064,14 +1243,52 @@ class GraphInterpreter(LoweringContext, Interpreter):
             return value
         raise TypeError(f"Unsupported value type for AST conversion: {type(value)}")
 
+    @property
+    def cute_layout(self) -> ThreadLayout | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.primary_layout()
+
+    @property
+    def cute_matmul_axes(self) -> MatmulAxisModel | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_axes
+
+    @property
+    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
+        if V.current_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = V.current_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_plan
+
     def _create_named_result(self, node: Node, result: ast.expr) -> str:
         """Create a named variable for a node result, handling block-size-only expressions as constexpr."""
         val = node.meta.get("val")
+        expr = getattr(getattr(val, "node", None), "_expr", None)
+        if not isinstance(expr, sympy.Expr) and isinstance(val, torch.SymInt):
+            with contextlib.suppress(Exception):
+                expr = val._sympy_()
 
         # Check if we should create a constexpr for block-size-only expressions used in tl.arange
         if (
             isinstance(val, torch.SymInt)
-            and contains_only_block_size_symbols(val._sympy_())
+            and isinstance(expr, sympy.Expr)
+            and contains_only_block_size_symbols(expr)
             and any(
                 user.op == "call_function"
                 and user.target == torch.ops.prims.iota.default
@@ -1080,7 +1297,7 @@ class GraphInterpreter(LoweringContext, Interpreter):
         ):
             # This expression is used in tl.arange, make it a constexpr
             name = self.cg.device_function.new_var(node.name)
-            self.cg.device_function.constexpr_arg(name, val._sympy_())
+            self.cg.device_function.constexpr_arg(name, expr)
             return name
 
         # If the lowering produced a named value that is already defined elsewhere
@@ -1169,7 +1386,12 @@ class GraphInterpreter(LoweringContext, Interpreter):
 
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
-            with self._set_current_node(n), n.meta["location"], V.set_current_node(n):
+            with (
+                self.cg.statement_owner_node(n),
+                self._set_current_node(n),
+                n.meta["location"],
+                V.set_current_node(n),
+            ):
                 try:
                     lowering: Lowering = n.meta["lowering"]
                     result = lowering.codegen(self, n)
@@ -1182,7 +1404,9 @@ class GraphInterpreter(LoweringContext, Interpreter):
                             user for user in n.users if user.target == getitem
                         ]
                         if len(getitem_users) > 0:
-                            return self._collect_multi_outputs(n, result)
+                            multi_outputs = self._collect_multi_outputs(n, result)
+                            self.cg.record_fx_node_ast(n, multi_outputs)
+                            return multi_outputs
 
                     if result is None:
                         return None
@@ -1193,12 +1417,18 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         if not isinstance(result, (ast.Name, ast.Constant)):
                             name = self._create_named_result(n, result)
                             result = create(ast.Name, id=name, ctx=ast.Load())
-                        if (
-                            isinstance(val := n.meta["val"], torch.SymInt)
-                            and len((expr := val._sympy_()).free_symbols) > 0
+                        val = n.meta["val"]
+                        expr = getattr(getattr(val, "node", None), "_expr", None)
+                        if not isinstance(expr, sympy.Expr) and isinstance(
+                            val, torch.SymInt
                         ):
+                            expr = val._sympy_()
+                        if isinstance(expr, sympy.Expr) and len(expr.free_symbols) > 0:
                             # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()
-                            expr = CompileEnvironment.current().shape_env.simplify(expr)
+                            with contextlib.suppress(Exception):
+                                expr = CompileEnvironment.current().shape_env.simplify(
+                                    expr
+                                )
                             if isinstance(result, ast.Name):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(result.id, n)
@@ -1208,6 +1438,7 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(repr(result.value), n)
                                 )
+                        self.cg.record_fx_node_ast(n, result)
                         return result
                     if not isinstance(result, (ast.Name, ast.Constant)):
                         self.cg.add_statement(create(ast.Expr, value=result))
@@ -1218,13 +1449,26 @@ class GraphInterpreter(LoweringContext, Interpreter):
                     raise InductorLoweringError(
                         f"Error in codegen for node {n.name} ({n.target}): {e}"
                     ) from e
-        return super().run_node(n)
+        result = super().run_node(n)
+        # For placeholder nodes, register their AST in fx_node_to_ast so that
+        # inner-loop subscript analysis (e.g. _nki_shifted_tile_subscript) can
+        # look up outer-loop variables like tile_c.begin * chunk_size.
+        if n.op == "placeholder" and isinstance(result, ast.AST):
+            self.cg.record_fx_node_ast(n, result)
+        return result
 
 
 def codegen_call_with_graph(
-    cg: GenerateAST, graph: torch.fx.Graph, args: list[ast.AST]
+    cg: GenerateAST,
+    graph: torch.fx.Graph,
+    args: list[ast.AST],
+    *,
+    copy_named_args: bool = True,
 ) -> list[object]:
     with compile_lock:
+        from .cute.cute_mma import prepare_cute_collective_lane_loop_suppression
+
+        prepare_cute_collective_lane_loop_suppression(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
@@ -1233,7 +1477,7 @@ def codegen_call_with_graph(
             ):
                 # TODO(jansel): we should remove these sym_size-only args from the graph
                 new_args.append(arg)
-            elif isinstance(arg, ast.Name):
+            elif copy_named_args and isinstance(arg, ast.Name):
                 # We need to copy the inputs to a loop so that phi nodes are handled properly.
                 # Phi nodes will merge variable names from outside the loop, but the old value
                 # of those variables could have usages.
@@ -1247,13 +1491,15 @@ def codegen_call_with_graph(
                     )
                 new_args.append(expr_from_string(copy_name))
             else:
-                new_args.append(cg.lift(arg))
+                with cg.statement_owner_node(placeholder):
+                    new_args.append(cg.lift(arg))
         return GraphInterpreter(graph, cg).run(*new_args)
 
 
 class CodegenState(NamedTuple):
     codegen: GenerateAST
     fx_node: torch.fx.Node | None
+    env: dict[torch.fx.Node, Argument] = dataclasses.field(default_factory=dict)
     proxy_args: list[object] = dataclasses.field(default_factory=list)
     ast_args: list[object] = dataclasses.field(default_factory=list)
 
@@ -1272,6 +1518,10 @@ class CodegenState(NamedTuple):
         assert self.fx_node is not None
         return self.fx_node.meta["val"]
 
+    def get_graph(self, graph_id: int | object) -> GraphInfo:
+        assert isinstance(graph_id, int)
+        return self.codegen.get_graph(graph_id)
+
     @property
     def device_function(self) -> DeviceFunction:
         return self.codegen.device_function
@@ -1289,3 +1539,39 @@ class CodegenState(NamedTuple):
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         return self.codegen.device_function.sympy_expr(expr)
+
+    @property
+    def cute_layout(self) -> ThreadLayout | None:
+        """Return the resolved CuTe ThreadLayout for the current FX node, if any."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.primary_layout()  # type: ignore[return-value]
+
+    @property
+    def cute_matmul_axes(self) -> MatmulAxisModel | None:
+        """Return the planner-owned CuTe matmul axis model for the current FX node."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_axes
+
+    @property
+    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
+        """Return the planner-owned CuTe matmul execution plan for the node."""
+        if self.fx_node is None:
+            return None
+        from .cute.layout_propagation import META_KEY
+
+        constraint = self.fx_node.meta.get(META_KEY)
+        if constraint is None:
+            return None
+        return constraint.matmul_plan

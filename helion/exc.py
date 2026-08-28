@@ -169,8 +169,7 @@ class InputTensorNumelExceedsIndexType(BaseError):
 
 class DataDependentOutputShapeNotSupported(BaseError):
     message = (
-        "{op_desc} is not supported in Helion device loops because it produces "
-        "a data-dependent output shape."
+        "{op_desc} produces a data-dependent output shape, which is not supported."
     )
 
 
@@ -319,6 +318,14 @@ class MissingEnableTile(BaseError):
     )
 
 
+class CuteBackendUnavailable(BaseError):
+    message = (
+        "The 'cute' backend cannot run in this environment: {0}\n"
+        "The cute backend requires nvidia-cutlass-dsl >= 4.5.1, the "
+        "apache-tvm-ffi package, and CUDA >= 13."
+    )
+
+
 class UndefinedVariable(BaseError):
     message = "{} is not defined."
 
@@ -333,6 +340,10 @@ class StarredArgsNotSupportedOnDevice(BaseError):
 
 class IncorrectTileUsage(BaseError):
     message = "Tiles can only be used in tensor indexing (`x[tile]`) or in `hl.*` ops (e.g. `hl.zeros(tile)`), used in {}"
+
+
+class InvalidJaggedTileUsage(BaseError):
+    message = "Invalid usage of hl.jagged_tile: {}"
 
 
 class TileOfTile(BaseError):
@@ -440,6 +451,10 @@ class TensorOperationInWrapper(BaseWarning):
         "Use @helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper]) to suppress this warning.\n"
         "If this is not a tensor operation, please report this as a bug."
     )
+
+
+class ProcessGroupNameNotFound(BaseWarning):
+    message = "No process group name argument found in kernel arguments. Default to use dist.group.WORLD.group_name. This may not be the correct behavior espectially in multi-dimension parallelism. Use hl.ProcessGroupName to annotate the argument for process group name to fix the warning."
 
 
 class TensorOperationsInHostCall(TensorOperationInWrapper):
@@ -561,14 +576,6 @@ class EmptyDeviceLoopAfterDCE(BaseError):
     )
 
 
-class PallasMosaicAlignmentError(BaseError):
-    message = (
-        "Pallas Mosaic GPU requires tiled tensor dimensions to be multiples of {alignment}, "
-        "but got tensor with shape {shape} (dimension {dim} has size {size}). "
-        "Pad your inputs to multiples of {alignment} before calling the kernel."
-    )
-
-
 class AutodiffKernelNotCalled(BaseError):
     message = (
         "Kernel must be called at least once before computing backward. "
@@ -581,3 +588,7 @@ class AutodiffNotSupported(BaseError):
         "helion.backward() does not support this kernel: {0}. "
         "Only single tile loop kernels with elementwise ops are supported."
     )
+
+
+class InconsistantConfigsAcrossRanks(BaseError):
+    message = "Different ranks get different hl.Configs"

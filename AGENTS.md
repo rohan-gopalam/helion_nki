@@ -32,13 +32,11 @@ This document explains how to work effectively in this repository.
 ## Testing Guidelines
 
 - Framework: PyTest. Place tests in `test/` and name `test_<feature>.py`.
-- Goldens: If using filecheck-style assertions, add a matching `test_<feature>.expected`.
-- Use helpers in `helion._testing` (e.g., `check_example`, `TestCase.assertExpectedJournal`).
-- Update goldens with `EXPECTTEST_ACCEPT=1`; validate generated code before correctness.
+- Use helpers in `helion._testing` (e.g., `check_example`).
 - Runtime: Many tests require CUDA, PyTorch nightly, and Triton dev builds; keep each test fast (<~30s).
-- Local tips: For iteration, use `-k`, or set `HELION_USE_DEFAULT_CONFIG=1` to skip autotuning.
-  - Warning: Do not run the full test suite with `HELION_USE_DEFAULT_CONFIG=1` — it can change execution paths and break tests. Only use this env var for targeted local iteration on specific tests.
-- Helpful env vars: `HELION_LOGS=all|+all`, `HELION_PRINT_OUTPUT_CODE=1`, `HELION_USE_DEFAULT_CONFIG=1`.
+- Local tips: For iteration, use `-k`, or set `HELION_AUTOTUNE_EFFORT=none` to skip autotuning.
+  - Warning: Do not run the full test suite with `HELION_AUTOTUNE_EFFORT=none` — it can change execution paths and break tests. Only use this env var for targeted local iteration on specific tests.
+- Helpful env vars: `HELION_LOGS=all|+all`, `HELION_PRINT_OUTPUT_CODE=1`, `HELION_AUTOTUNE_EFFORT=none`.
 
 ### PyTest Debugging Tips
 
@@ -51,9 +49,10 @@ This document explains how to work effectively in this repository.
 
 ## Agent-Specific Instructions
 
-- Do not run `pip install`, networked installs, or system package managers.
-- Do not run `git commit`; users handle commits/branches.
-- Do not `print()` inside kernels; use logging or host-side code.
+- Do NOT run `pip install`, networked installs, or system package managers.
+- Do NOT run `git commit` unless asked to directly.
+- Do NOT run `git push`; users handle updating PRs.
+- Do NOT `print()` inside kernels; use logging or host-side code.
 - Tile indexing preserves dimensions; `i = hl.tile(...); x[i]` keeps ranks.
-- Do not add unnecessary error checks via `hasattr`, `getattr`, `except`, etc.
+- Do NOT add unnecessary error checks via `hasattr`, `getattr`, `except`, etc.
 - When asked to read a Github issue or pull request, use `gh api`.

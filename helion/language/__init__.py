@@ -12,6 +12,7 @@ from .barrier import barrier as barrier
 from .builtin_ops import _builtin_max as _builtin_max
 from .builtin_ops import _builtin_min as _builtin_min
 from .constexpr import ConstExpr as constexpr  # noqa: F401
+from .constexpr import ProcessGroupName as ProcessGroupName
 from .constexpr import specialize as specialize
 from .creation_ops import arange as arange
 from .creation_ops import full as full
@@ -22,20 +23,21 @@ from .inline_asm_ops import inline_asm_elementwise as inline_asm_elementwise
 from .inline_triton_ops import inline_triton as inline_triton
 from .inline_triton_ops import triton_kernel as triton_kernel
 from .loops import grid as grid
+from .loops import jagged_tile as jagged_tile
 from .loops import static_range as static_range
 from .loops import tile as tile
 from .matmul_ops import dot as dot
 from .matmul_ops import dot_scaled as dot_scaled
 from .memory_ops import load as load
 from .memory_ops import store as store
+from .quantized_ops import float4_e2m1fn_x2_to_float32 as float4_e2m1fn_x2_to_float32
 from .random_ops import rand as rand
+from .random_ops import rand4x as rand4x
 from .random_ops import randint as randint
 from .reduce_ops import reduce as reduce
 from .scan_ops import associative_scan as associative_scan
 from .scan_ops import cumprod as cumprod
 from .scan_ops import cumsum as cumsum
-from .signal_wait import signal as signal
-from .signal_wait import wait as wait
 from .stack_tensor import StackTensor as StackTensor
 from .stack_tensor import stacktensor_like as stacktensor_like
 from .tile_ops import tile_begin as tile_begin
@@ -61,6 +63,4 @@ _MEMORY_OPS = (
     atomic_or,
     atomic_xchg,
     atomic_xor,
-    wait,
-    signal,
 )

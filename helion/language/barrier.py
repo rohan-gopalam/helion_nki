@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.type_propagation import BarrierResultType
-from .._compiler.type_propagation import LiteralType
+from .._compiler.type_info import BarrierResultType
+from .._compiler.type_info import LiteralType
 from . import _decorators
 
 if TYPE_CHECKING:
@@ -34,9 +34,9 @@ def _(origin: Origin, **kwargs: object) -> LiteralType:
     if origin.is_device():
         raise exc.BarrierOnlyAllowedAtTopLevel
 
+    env = CompileEnvironment.current()
     # A barrier introduces a sequential phase boundary between top-level loops,
     # so force persistent kernels (other PID choices are incompatible).
-    env = CompileEnvironment.current()
     env.has_barrier = True
     for disallowed in ("flat", "xyz", "persistent_interleaved"):
         env.config_spec.disallow_pid_type(disallowed)
@@ -51,7 +51,23 @@ def _(state: CodegenState) -> object:
     return expr_from_string("None")
 
 
+@_decorators.codegen(barrier, "cute")
+def _(state: CodegenState) -> object:
+    # Marker only; persistent phase synchronization is still unsupported on CuTe.
+    return expr_from_string("None")
+
+
 @_decorators.ref(barrier)
 def _() -> None:
     # No-op in ref/interpret mode
     return None
+
+
+# --- NKI codegen (ported from fix-nki-kernel-compilation) ---
+@_decorators.codegen(barrier, "nki")
+def _(state: CodegenState) -> object:
+    # NKI lowering currently emits a single kernel with sequential top-level
+    # phases, so the barrier is represented by the host/device loop ordering.
+    return expr_from_string("None")
+
+

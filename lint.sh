@@ -7,7 +7,7 @@ fi
 
 if [ "$ACTION" = "install" ]; then
   set -ex
-  pip install ruff==0.15.0 pyrefly==0.51.1
+  pip install ruff==0.15.14 pyrefly==1.0.0
   exit 0
 fi
 
@@ -28,22 +28,27 @@ function run {
   VALID_ACTION="true"
 }
 
+PYREFLY="scripts/pyrefly_check.sh"
+
 if [ "$ACTION" = "fix" ]; then
   run ruff format
   run ruff check --fix
-  run pyrefly check
+  run pre-commit run codespell --all-files
+  run $PYREFLY
 fi
 
 if [ "$ACTION" = "unsafe" ]; then
   run ruff format
   run ruff check --fix --unsafe-fixes
-  run pyrefly check
+  run pre-commit run codespell --all-files
+  run $PYREFLY
 fi
 
 if [ "$ACTION" = "check" ]; then
   run ruff format --check --diff
   run ruff check --no-fix
-  run pyrefly check
+  run pre-commit run codespell --all-files
+  run $PYREFLY
 fi
 
 if [ "$ERRORS" != "" ]; then

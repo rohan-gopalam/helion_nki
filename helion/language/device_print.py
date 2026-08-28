@@ -13,7 +13,7 @@ from . import _decorators
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
-    from .._compiler.type_propagation import TypeInfo
+    from .._compiler.type_info import TypeInfo
     from .._compiler.variable_origin import Origin
 
 
@@ -41,9 +41,9 @@ def _(*values: object, sep: str = " ", end: str = "\n") -> None:
 
 @_decorators.type_propagation(device_print)
 def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
-    from .._compiler.type_propagation import LiteralType
-    from .._compiler.type_propagation import NoType
-    from .._compiler.type_propagation import TensorType
+    from .._compiler.type_info import LiteralType
+    from .._compiler.type_info import NoType
+    from .._compiler.type_info import TensorType
 
     # Check that we have at least one argument (prefix)
     if len(args) == 0:
@@ -85,6 +85,32 @@ def _(state: CodegenState) -> None:
     call_expr = create(
         ast.Call,
         func=expr_from_string("tl.device_print"),
+        args=call_args,
+        keywords=[],
+    )
+    stmt = create(ast.Expr, value=call_expr)
+    state.add_statement(stmt)
+
+
+@_decorators.codegen(device_print, "cute")
+def _(state: CodegenState) -> None:
+    prefix = state.proxy_arg(0)
+    assert isinstance(prefix, str)
+
+    value_asts: list[ast.AST] = []
+    if len(state.proxy_args) > 1:
+        assert len(state.ast_args) > 1
+        ast_varargs = state.ast_args[1]
+        assert isinstance(ast_varargs, (tuple, list)), (
+            f"Expected tuple for varargs, got {type(ast_varargs)}"
+        )
+        value_asts.extend(ast_varargs[0])
+
+    fmt = prefix + " ".join(["{}"] * len(value_asts))
+    call_args: list[ast.AST] = [create(ast.Constant, value=fmt), *value_asts]
+    call_expr = create(
+        ast.Call,
+        func=expr_from_string("cute.printf"),
         args=call_args,
         keywords=[],
     )

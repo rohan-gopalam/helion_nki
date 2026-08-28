@@ -4,7 +4,6 @@ import ast
 import contextlib
 import inspect
 import sys
-import textwrap
 import threading
 import typing
 from typing import TYPE_CHECKING
@@ -17,16 +16,11 @@ from torch._inductor.codegen.wrapper import pexpr
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
-from .. import exc
-from .._compile_time import measure
 from . import ast_extension
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .output_header import SOURCE_MODULE
-from .source_location import SourceLocation
-from .source_location import UnknownLocation
-from .tensor_utils import patch_tensor_factories
 from .type_printer import print_ast
 from .variable_origin import AttributeOrigin
 from .variable_origin import GlobalOrigin
@@ -34,9 +28,12 @@ from .variable_origin import NameOrigin
 from .variable_origin import Origin
 
 if TYPE_CHECKING:
+    import inspect
     import types
 
-    from .type_propagation import TypeInfo
+    from .device_ir import DeviceIR
+    from .source_location import SourceLocation
+    from .type_info import TypeInfo
 
     class _TLS(Protocol):
         functions: list[HostFunction]
@@ -72,19 +69,65 @@ class SymbolOrigin(NamedTuple):
         return self.origin.depth()
 
 
+@dataclasses.dataclass
+class KernelDefinition:
+    """The kernel's structural definition.
+
+    Holds the function, its AST, and parameter bindings. Populated by
+    KernelCompiler.parse(). The AST body may be mutated by subsequent
+    compilation passes (e.g. static loop unrolling).
+    """
+
+    fn: types.FunctionType
+    constexpr_args: dict[str, object]
+    name: str
+    args: ast.arguments
+    body: list[ast.stmt]
+    params: inspect.BoundArguments
+
+
+@dataclasses.dataclass
+class CompilerState:
+    """Mutable state accumulated during compilation passes.
+
+    Tracks symbol and tensor provenance, import requirements, and
+    resource allocation. Populated progressively during compilation,
+    consumed by code generation.
+    """
+
+    expr_to_origin: dict[sympy.Expr, SymbolOrigin] = dataclasses.field(
+        default_factory=dict
+    )
+    tensor_to_origin: dict[torch.Tensor, Origin] = dataclasses.field(
+        default_factory=dict
+    )
+    global_imports: dict[str, GlobalImport] = dataclasses.field(default_factory=dict)
+    rng_seed_slot_count: int = 0
+
+
 class HostFunction:
+    """Mutable compilation state for a @helion.kernel function.
+
+    Composed of structured sub-states:
+
+      - definition: KernelDefinition — function, AST, and parameter bindings
+      - compiler_state: CompilerState — provenance tracking and imports
+      - device_ir: DeviceIR — FX graphs from lowering
+
+    Created and driven through the pipeline by KernelCompiler.
+    Accessed by compiler passes via HostFunction.current().
+    """
+
     def __init__(
         self,
-        fn: types.FunctionType,
-        fake_args: list[object],
-        constexpr_args: dict[str, object],
+        definition: KernelDefinition,
+        location: SourceLocation,
     ) -> None:
         super().__init__()
-        env = CompileEnvironment.current()
-        # pyrefly: ignore [read-only]
-        self.fn = fn
-        self.constexpr_args = constexpr_args
-        self.location: SourceLocation = UnknownLocation()
+        self.definition = definition
+        self.location = location
+        self.compiler_state: CompilerState = CompilerState()
+        self._device_ir: DeviceIR | None = None
         self.local_types: dict[str, TypeInfo] | None = None
         self.expr_to_origin: dict[sympy.Expr, SymbolOrigin] = {}
         self.tensor_to_origin: dict[torch.Tensor, Origin] = {}
@@ -135,25 +178,12 @@ class HostFunction:
                     self.device_ir = lower_to_device_ir(self)
 
     @staticmethod
-    def validate_ast(root: ast.FunctionDef) -> None:
-        # There must always be at least one decorator otherwise we would not have gotten this far
-        if len(root.decorator_list) > 1:
-            # Decorators are allowed before the helion kernel decorator
-            # but are not allowed after
-            def get_decorator_name(decorator: ast.expr) -> str:
-                if isinstance(decorator, ast.Name):
-                    return decorator.id
-                if isinstance(decorator, ast.Attribute):
-                    return get_decorator_name(decorator.value)
-                if isinstance(decorator, ast.Call):
-                    return get_decorator_name(decorator.func)
-                raise AssertionError(f"Unknown decorator: {decorator}")
-
-            for idx, decorator in enumerate(root.decorator_list):
-                # TODO(oulgen): this can break if someone did `import helion as helion2`
-                if get_decorator_name(decorator) == "helion":
-                    if idx != len(root.decorator_list) - 1:
-                        raise exc.DecoratorAfterHelionKernelDecorator
+    def _suppress_guards_if_profiler_enabled(
+        env: CompileEnvironment,
+    ) -> contextlib.AbstractContextManager[None]:
+        if torch.autograd.profiler._is_profiler_enabled:
+            return env.shape_env.suppress_guards()
+        return contextlib.nullcontext()
 
     def global_scope_origin(self, name: str) -> AttributeOrigin:
         if SOURCE_MODULE not in self.global_imports:
@@ -201,15 +231,21 @@ class HostFunction:
     def __repr__(self) -> str:
         return f"<HostFunction {self.name}>"
 
+    def allocate_rng_seed_slot(self) -> int:
+        seed_slot = self.rng_seed_slot_count
+        self.rng_seed_slot_count += 1
+        return seed_slot
+
     def set_local_types(self, local_types: dict[str, TypeInfo]) -> None:
-        fn = HostFunction.current()
         self.local_types = local_types
         for name, type_info in local_types.items():
-            type_info.populate_symbol_origins(NameOrigin(name, fn))
+            type_info.populate_symbol_origins(NameOrigin(name, self))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
-        expr = env.specialize_expr(env.shape_env.simplify(expr))
+        with contextlib.suppress(Exception):
+            expr = env.shape_env.simplify(expr)
+        expr = env.specialize_expr(expr)
         if not expr.free_symbols:
             return pexpr(expr)
         if expr in self.expr_to_origin:
@@ -240,16 +276,46 @@ class HostFunction:
                     ast.FunctionDef(self.name, self.args, self.body, [], None)
                 )
             ),
-            self.device_ir.debug_str(),
         ]
+        if self._device_ir is not None:
+            result.append(self._device_ir.debug_str())
         return "\n\n".join(result)
 
-    def codegen_function_def(self, statements: list[ast.AST]) -> ast.FunctionDef:
+    def codegen_function_def(
+        self,
+        statements: list[ast.AST],
+        extra_params: list[str] | None = None,
+        removed_args: set[str] | None = None,
+    ) -> ast.FunctionDef:
+        # Rebuild defaults: Python aligns defaults to the *end* of args,
+        # so removing an arg shifts alignment.
+        if removed_args:
+            old_args = self.args.args
+            old_defaults = self.args.defaults
+            n_no_default = len(old_args) - len(old_defaults)
+            new_defaults = [
+                old_defaults[i - n_no_default]
+                for i, a in enumerate(old_args)
+                if a.arg not in removed_args and i >= n_no_default
+            ]
+        else:
+            new_defaults = self.args.defaults
+
         # Create a new arguments structure with _launcher kwarg-only parameter
         new_args = ast_extension.create(
             ast.arguments,
             posonlyargs=self.args.posonlyargs,
-            args=self.args.args,
+            args=[
+                *(
+                    a
+                    for a in self.args.args
+                    if not removed_args or a.arg not in removed_args
+                ),
+                *(
+                    ast_extension.create(ast.arg, arg=n, annotation=None)
+                    for n in (extra_params or [])
+                ),
+            ],
             vararg=self.args.vararg,
             kwonlyargs=[
                 *self.args.kwonlyargs,
@@ -262,11 +328,11 @@ class HostFunction:
             kw_defaults=[
                 *self.args.kw_defaults,
                 expr_from_string(
-                    CompileEnvironment.current().backend.default_launcher_name
+                    CompileEnvironment.current().backend.get_launcher_name()
                 ),
             ],
             kwarg=self.args.kwarg,
-            defaults=self.args.defaults,
+            defaults=new_defaults,
         )
 
         return ast_extension.create(

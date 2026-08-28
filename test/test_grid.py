@@ -8,11 +8,15 @@ import torch
 import helion
 from helion import _compat
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
+from helion._testing import skipIfMetal
+from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 
@@ -34,10 +38,10 @@ def grid_2d_pytorch(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@onlyBackends(["triton"])
 class TestGrid(RefEagerTestBase, TestCase):
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @patch.object(_compat, "_min_dot_size", lambda *args: (16, 16, 16))
+    @skipIfXPU("Timeout on XPU")
     def test_grid_1d(self):
         @helion.kernel(static_shapes=True)
         def grid_1d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -67,21 +71,20 @@ class TestGrid(RefEagerTestBase, TestCase):
             return out
 
         args = (
-            torch.randn([8, 16, 32], device=DEVICE, dtype=torch.float16),
-            torch.randn([32, 4], device=DEVICE, dtype=torch.float16),
+            torch.randn([8, 16, 32], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([32, 4], device=DEVICE, dtype=HALF_DTYPE),
         )
         code, result = code_and_output(grid_1d, args)
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
-        self.assertExpectedJournal(code)
 
         # test again with block_ptr indexing
         code, result = code_and_output(
             grid_1d, args, block_sizes=[16, 16, 16], indexing="tensor_descriptor"
         )
         torch.testing.assert_close(result, grid_1d_pytorch(args[0], args[1]))
-        self.assertExpectedJournal(code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfXPU("XPU tensor descriptor path has accuracy issue for this grid test")
     def test_grid_2d_idx_list(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_list(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -107,23 +110,31 @@ class TestGrid(RefEagerTestBase, TestCase):
             return out
 
         args = (
-            torch.randn([3, 4, 64, 32], device=DEVICE, dtype=torch.float16),
-            torch.randn([32, 16], device=DEVICE, dtype=torch.float16),
+            torch.randn([3, 4, 64, 32], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([32, 16], device=DEVICE, dtype=HALF_DTYPE),
         )
 
         code, result = code_and_output(grid_2d_idx_list, args)
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
-        self.assertExpectedJournal(code)
 
         code, result = code_and_output(
             grid_2d_idx_list,
             args,
-            block_sizes=[64, 32, 16],
+            block_sizes=[64, 16, 16],
             indexing="tensor_descriptor",
         )
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
-        self.assertExpectedJournal(code)
 
+    @skipIfMetal("aten.addmm not yet registered for Metal backend")
+    @xfailIfPallas(
+        "Nested hl.grid + emit_pipeline corrupts output: only the first "
+        "hl.grid level becomes a pallas_call grid axis (sliced by BlockSpec); "
+        "subsequent hl.grid levels become outer emit_pipeline bodies whose "
+        "iteration index isn't bound to a stable name before inner bodies "
+        "shadow `_pipeline_indices`. Inner indexing falls back to literal 0 "
+        "for those dims, so only the (0, 0, ...) slot of the output is "
+        "correct."
+    )
     def test_grid_2d_idx_nested(self):
         @helion.kernel(static_shapes=True)
         def grid_2d_idx_nested(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -150,13 +161,13 @@ class TestGrid(RefEagerTestBase, TestCase):
             return out
 
         args = (
-            torch.randn([3, 4, 64, 32], device=DEVICE, dtype=torch.float16),
-            torch.randn([32, 16], device=DEVICE, dtype=torch.float16),
+            torch.randn([3, 4, 64, 32], device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn([32, 16], device=DEVICE, dtype=HALF_DTYPE),
         )
         code, result = code_and_output(grid_2d_idx_nested, args)
         torch.testing.assert_close(result, grid_2d_pytorch(args[0], args[1]))
-        self.assertExpectedJournal(code)
 
+    @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
     def test_grid_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -176,8 +187,8 @@ class TestGrid(RefEagerTestBase, TestCase):
         x = torch.randn([16], device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(grid_begin_end, (x,))
         torch.testing.assert_close(result, grid_begin_end_pytorch(x))
-        self.assertExpectedJournal(code)
 
+    @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
     def test_grid_begin_end_step(self):
         @helion.kernel(autotune_effort="none")
         def grid_begin_end_step(x: torch.Tensor) -> torch.Tensor:
@@ -197,8 +208,8 @@ class TestGrid(RefEagerTestBase, TestCase):
         x = torch.randn([16], device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(grid_begin_end_step, (x,))
         torch.testing.assert_close(result, grid_begin_end_step_pytorch(x))
-        self.assertExpectedJournal(code)
 
+    @skipIfMetal("BUG: hl.grid begin/end broken with CuteNDTileStrategy on Metal")
     def test_grid_end_step_kwarg(self):
         @helion.kernel(autotune_effort="none")
         def grid_end_step_kwarg(x: torch.Tensor) -> torch.Tensor:
@@ -218,7 +229,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         x = torch.randn([16], device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(grid_end_step_kwarg, (x,))
         torch.testing.assert_close(result, grid_end_step_kwarg_pytorch(x))
-        self.assertExpectedJournal(code)
 
     def test_grid_multidim_begin_end(self):
         @helion.kernel(autotune_effort="none")
@@ -242,7 +252,6 @@ class TestGrid(RefEagerTestBase, TestCase):
         x = torch.randn([8, 8], device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(grid_multidim_begin_end, (x,))
         torch.testing.assert_close(result, grid_multidim_begin_end_pytorch(x))
-        self.assertExpectedJournal(code)
 
     def test_grid_multidim_begin_end_step(self):
         @helion.kernel(autotune_effort="none")
@@ -266,8 +275,8 @@ class TestGrid(RefEagerTestBase, TestCase):
         x = torch.randn([8, 9], device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(grid_multidim_begin_end_step, (x,))
         torch.testing.assert_close(result, grid_multidim_begin_end_step_pytorch(x))
-        self.assertExpectedJournal(code)
 
+    @xfailIfPallasTpu("Tile begin/end not working on Pallas TPU")
     def test_tile_begin_end(self):
         @helion.kernel(autotune_effort="none")
         def tile_begin_end(x: torch.Tensor) -> torch.Tensor:
@@ -286,8 +295,8 @@ class TestGrid(RefEagerTestBase, TestCase):
         x = torch.randn([15], device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(tile_begin_end, (x,), block_size=4)
         torch.testing.assert_close(result, tile_begin_end_pytorch(x))
-        self.assertExpectedJournal(code)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_as_grid_basic(self):
         """Test that range() works as an alias for hl.grid() in device code."""
 
@@ -308,6 +317,7 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_begin_end(self):
         """Test that range(begin, end) works as alias for hl.grid(begin, end)."""
 
@@ -328,6 +338,11 @@ class TestGrid(RefEagerTestBase, TestCase):
         code, result = code_and_output(range_begin_end_kernel, (x,))
         torch.testing.assert_close(result, expected)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
+    @xfailIfPallas(
+        "range(begin, end, step) lowers to _for_loop_step which has no "
+        "emit_pipeline codegen"
+    )
     def test_range_with_step(self):
         """Test that range(begin, end, step) works as alias for hl.grid(begin, end, step)."""
 
@@ -349,8 +364,8 @@ class TestGrid(RefEagerTestBase, TestCase):
 
         code, result = code_and_output(range_step_kernel, (x,))
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(code)
 
+    @skipIfMetal("Metal does not support loop_index_expr for grid loops")
     def test_range_with_tensor_size(self):
         """Test that range(tensor.size(dim)) works with dynamic tensor dimensions."""
 

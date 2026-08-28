@@ -12,8 +12,10 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 from torch.testing._internal.common_utils import run_tests
 
+import helion
 from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -21,6 +23,16 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
+
+
+def _set_preferred_symm_mem_backend(device: torch.device) -> str:
+    preferred = "NVSHMEM"
+    try:
+        symm_mem.set_backend(preferred)
+        selected = preferred
+    except RuntimeError:
+        selected = str(symm_mem.get_backend(device) or "unknown")
+    return selected
 
 
 @onlyBackends(["triton"])
@@ -72,6 +84,7 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
             world_size=self.world_size,
             rank=self.rank,
             store=store,
+            device_id=self.device,
         )
         torch.distributed.distributed_c10d._set_pg_timeout(
             timedelta(seconds=60), dist.group.WORLD
@@ -118,7 +131,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         backend_stream = mod.copy_engine_all_gather_w_progress(
             a_out, a_shared, progress, 1
         )
-
         _, result = code_and_output(
             mod.helion_matmul_w_progress,
             (a_out, a_shared, b, progress, 1, symm_mem_hdl.rank),
@@ -138,7 +150,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         torch.cuda.current_stream().wait_stream(backend_stream)
         self._cleanup_process()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_all_reduce(self):
@@ -146,10 +157,8 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "all_reduce.py")
 
-        # Only NVSHMEM backend implements `get_remote_tensor` for now.
-        symm_mem.set_backend("NVSHMEM")
+        _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
 
         N = 16384
         dtype = torch.bfloat16
@@ -159,24 +168,20 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         ).normal_()
 
         symm_mem_hdl = symm_mem.rendezvous(a_shared, group=group)
-        local_signal_pad = symm_mem_hdl.get_signal_pad(
-            symm_mem_hdl.rank, dtype=torch.int32
-        ).view(-1, symm_mem_hdl.world_size)
-        signal_pad_addrs = mod.dev_array_to_tensor_short(
-            symm_mem_hdl.signal_pad_ptrs_dev,
-            (symm_mem_hdl.world_size,),
-            dtype=torch.uint64,
-            device=a_shared.device,
-        )
-
+        kernel = mod.one_shot_all_reduce_kernel
+        if torch.version.hip is not None:
+            kernel = helion.kernel(
+                config=helion.Config(block_sizes=[8192], num_warps=16),
+                static_shapes=True,
+            )(mod.one_shot_all_reduce_kernel.fn)
         _, result = code_and_output(
-            mod.one_shot_all_reduce_kernel,
+            kernel,
             (
-                signal_pad_addrs,
-                local_signal_pad,
+                symm_mem_hdl.signal_pad_ptrs_dev,
                 a_shared,
                 symm_mem_hdl.rank,
                 group.group_name,
+                symm_mem_hdl.world_size,
             ),
         )
 
@@ -193,20 +198,22 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         self._cleanup_process()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    def test_one_shot_allreduce_bias_rmsnorm(self):
+    @parametrize(
+        "kernel_name",
+        (
+            "one_shot_allreduce_bias_rmsnorm_kernel",
+            "two_shot_allreduce_bias_rmsnorm_kernel",
+        ),
+    )
+    def test_allreduce_bias_rmsnorm(self, kernel_name):
         self._init_process()
 
-        mod = import_path(
-            EXAMPLES_DIR / "distributed" / "one_shot_allreduce_bias_rmsnorm.py"
-        )
+        mod = import_path(EXAMPLES_DIR / "distributed" / "allreduce_bias_rmsnorm.py")
 
-        # Only NVSHMEM backend implements `get_remote_tensor` for now.
-        symm_mem.set_backend("NVSHMEM")
+        _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
 
         N, D = 128, 4096
         dtype = torch.float32
@@ -222,12 +229,19 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         symm_mem_buffer = symm_mem.empty(N, D, dtype=dtype, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
-
+        kernel = getattr(mod, kernel_name)
+        if (
+            torch.version.hip is not None
+            and kernel_name == "two_shot_allreduce_bias_rmsnorm_kernel"
+        ):
+            kernel = helion.jit(config=helion.Config(block_sizes=[4], num_warps=16))(
+                kernel.fn
+            )
         _, result = code_and_output(
-            mod.one_shot_allreduce_bias_rmsnorm_kernel,
+            kernel,
             (
-                x,
                 symm_mem_buffer,
+                x,
                 bias,
                 weight,
                 symm_mem_hdl.signal_pad_ptrs_dev,
@@ -240,26 +254,21 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
 
         torch.cuda.synchronize()
 
-        expected = mod.reference_one_shot_allreduce_bias_rmsnorm(
-            x_ref, bias, weight, eps
-        )
+        expected = mod.reference_allreduce_bias_rmsnorm(x_ref, bias, weight, eps)
 
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
         self._cleanup_process()
 
-    @skipIfRocm("Distributed example requires CUDA/NCCL")
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    def test_matmul_reduce_scatter(self):
+    def test_matmul_reduce_scatter_kernel(self):
         self._init_process()
 
         mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
 
-        # Only NVSHMEM backend implements `get_remote_tensor` for now.
-        symm_mem.set_backend("NVSHMEM")
+        _set_preferred_symm_mem_backend(self.device)
         group = dist.group.WORLD
-        symm_mem.enable_symm_mem_for_group(group.group_name)
 
         M, N, K = 512, 768, 1024
         dtype = torch.float32
@@ -279,7 +288,6 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         # Setup symmetric memory like the wrapper does
         symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
         symm_mem_hdl = symm_mem.rendezvous(symm_mem_buffer, group.group_name)
-
         _, result = code_and_output(
             mod.matmul_reduce_scatter_kernel,
             (
@@ -296,6 +304,110 @@ class TestExamplesDist(TestCase, MultiProcessTestCase):
         torch.cuda.synchronize()
 
         expected = mod.reference_matmul_reduce_scatter(a_ref, b_ref)
+
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+        self._cleanup_process()
+
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_matmul_reduce_scatter_wrapper(self):
+        self._init_process()
+
+        mod = import_path(EXAMPLES_DIR / "distributed" / "matmul_reduce_scatter.py")
+
+        _set_preferred_symm_mem_backend(self.device)
+        group = dist.group.WORLD
+
+        M, N, K = 512, 768, 1024
+        dtype = torch.float32
+
+        # Each rank has the same random seed for reproducibility
+        torch.manual_seed(42 + self.rank)
+        a = torch.randn(M, K, dtype=dtype, device=self.device)
+
+        # Weight matrix is the same across all ranks
+        torch.manual_seed(42)
+        b = torch.randn(K, N, dtype=dtype, device=self.device)
+
+        # Clone for reference computation
+        a_ref = a.clone()
+        b_ref = b.clone()
+
+        # Setup symmetric memory like the wrapper does
+        symm_mem_buffer = symm_mem.empty(M, N, dtype=dtype, device=self.device)
+        symm_mem.rendezvous(symm_mem_buffer, group.group_name)
+        result = mod.helion_matmul_reduce_scatter(
+            symm_mem_buffer,
+            a,
+            b,
+        )
+
+        torch.cuda.synchronize()
+
+        expected = mod.reference_matmul_reduce_scatter(a_ref, b_ref)
+
+        torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+        self._cleanup_process()
+
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @parametrize(
+        "M,N,K",
+        [
+            (512, 768, 1024),
+            (1024, 768, 512),
+        ],
+    )
+    def test_fp8_scaled_all_gather_matmul(self, M, N, K):
+        self._init_process()
+        from torch._C._distributed_c10d import _SymmetricMemory
+
+        os.environ["_USE_HARDCODED_CONFIG_FOR_CI"] = "1"
+        mod = import_path(
+            EXAMPLES_DIR / "distributed" / "fp8_scaled_all_gather_matmul.py"
+        )
+        _SymmetricMemory.signal_pad_size = 1024 * 1024 * 1024
+
+        group = dist.group.WORLD
+
+        M_per_rank = M // self.world_size
+        FP8_DTYPE = torch.float8_e4m3fn
+
+        torch.manual_seed(42 + self.rank)
+        a_shared = (
+            torch.rand(M_per_rank, K, device=self.device, dtype=torch.bfloat16) * 0.05
+        )
+        a_shared = a_shared.to(FP8_DTYPE)
+
+        b = (
+            (torch.rand(K, N, device=self.device, dtype=torch.bfloat16) * 0.1 + 0.05)
+            .T.contiguous()
+            .T
+        )
+        b = b.to(FP8_DTYPE)
+        scale_a = (
+            torch.rand((M_per_rank, 1), device=self.device, dtype=torch.float32) * 0.05
+            + 0.01
+        )
+        scale_b = (
+            torch.rand((1, N), device=self.device, dtype=torch.float32) * 0.05 + 0.01
+        )
+        min_val = 1e-4
+        max_val = 100
+        scale_a = scale_a.clamp(min=min_val, max=max_val)
+        scale_b = scale_b.clamp(min=min_val, max=max_val)
+
+        result = mod.helion_ag_matmul(
+            a_shared, b, scale_a, scale_b, self.world_size, group
+        )
+
+        torch.cuda.synchronize()
+
+        expected = mod.reference_ag_matmul(
+            a_shared, b, scale_a, scale_b, self.world_size, group
+        )
 
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
 

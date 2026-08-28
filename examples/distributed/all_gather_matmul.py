@@ -16,12 +16,22 @@ from __future__ import annotations
 import os
 
 import torch
+from torch._C._distributed_c10d import _SymmetricMemory
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+import triton
+import triton.language as tl
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import run_example
 import helion.language as hl
+from helion.runtime.triton_helpers import triton_wait_signal
+
+
+@triton.jit
+def _wait_progress_at_idx(progress: tl.tensor, idx: int) -> None:
+    triton_wait_signal(progress + idx, 1, 0, "acquire", "gpu", "ld", False)
 
 
 # %%
@@ -119,12 +129,13 @@ def helion_matmul_w_progress(
     M_per_rank = a_shared.size(0)
     for tile_m, tile_n in hl.tile([M, N]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        hl.wait(
-            progress,
-            [
+        hl.triton_kernel(
+            _wait_progress_at_idx,
+            args=(
+                progress,
                 tile_m.begin // (M_per_rank // SPLITS_PER_RANK),
-            ],
-            signal=1,
+            ),
+            output_like=None,
         )
         for tile_k in hl.tile(K):
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
@@ -191,9 +202,27 @@ def helion_all_gather_matmul(
 
 
 # %%
+def helion_ag_matmul(a_shared: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Wrapper for helion_all_gather_matmul that returns only the matmul result."""
+    _a_out, c = helion_all_gather_matmul(a_shared, b)
+    return c
+
+
+def reference_ag_matmul(a_shared: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Reference implementation using torch.ops.symm_mem.fused_all_gather_matmul."""
+    dist_group = dist.group.WORLD
+    if dist_group is None:
+        raise RuntimeError("No distributed group available")
+    _ag_out, mm_results = torch.ops.symm_mem.fused_all_gather_matmul(
+        a_shared, [b], gather_dim=0, group_name=dist_group.group_name
+    )
+    return mm_results[0]
+
+
+# %%
 def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
     """
-    Tests the helion_all_gather_matmul function against PyTorch's implementation.
+    Tests and benchmarks helion_all_gather_matmul against PyTorch's implementation.
     Args:
         M (int): First dimension of the matrix.
         N (int): Second dimension of the matrix.
@@ -205,16 +234,14 @@ def test(M: int, N: int, K: int, world_size: int, device: torch.device) -> None:
         M // world_size, K, dtype=torch.bfloat16, device=device
     ).normal_()
     b = torch.randn((K, N), device=DEVICE, dtype=torch.bfloat16).T.contiguous().T
-    a_out, c = helion_all_gather_matmul(a_shared, b)
-    golden_a = a_shared.clone()
-    dist_group = dist.group.WORLD
-    if dist_group is None:
-        raise RuntimeError("No distributed group available")
-    ag_golden, mm_golden = torch.ops.symm_mem.fused_all_gather_matmul(
-        golden_a, [b], gather_dim=0, group_name=dist_group.group_name
+
+    run_example(
+        helion_ag_matmul,
+        reference_ag_matmul,
+        (a_shared, b),
+        rtol=1e-1,
+        atol=1e-1,
     )
-    torch.testing.assert_close(c, mm_golden[0], rtol=1e-1, atol=1e-1)
-    torch.testing.assert_close(a_out, ag_golden)
 
 
 # %%
@@ -223,6 +250,7 @@ def main() -> None:
     Main entry point that initializes the distributed environment and runs the test.
     Sets up the distributed process group, runs the test, and then cleans up.
     """
+    _SymmetricMemory.signal_pad_size = 1024 * 1024 * 1024
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.manual_seed(42 + rank)

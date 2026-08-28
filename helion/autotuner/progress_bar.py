@@ -18,6 +18,8 @@ from rich.progress import TextColumn
 from rich.text import Text
 import torch
 
+from helion._dist_utils import is_master_rank
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Iterator
@@ -31,10 +33,9 @@ class SpeedColumn(ProgressColumn):
     """Render the processing speed in configs per second."""
 
     def render(self, task: Task) -> Text:
-        return Text(
-            f"{task.speed:.1f} configs/s" if task.speed is not None else "- configs/s",
-            style="magenta",
-        )
+        # Fixed-width placeholder before first sample to avoid bar jitter.
+        speed = f"{task.speed:.1f}" if task.speed is not None else "..."
+        return Text(f"{speed:>5} configs/s", style="bold blue")
 
 
 def iter_with_progress(
@@ -54,7 +55,7 @@ def iter_with_progress(
         When ``False`` the iterable is returned unchanged so there is zero
         overhead; when ``True`` a Rich progress bar is rendered.
     """
-    if (not enabled) or torch._utils_internal.is_fb_unit_test():
+    if (not enabled) or torch._utils_internal.is_fb_unit_test() or not is_master_rank():
         yield from iterable
         return
 
@@ -63,7 +64,7 @@ def iter_with_progress(
 
     with Progress(
         TextColumn("[progress.description]{task.description}"),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("[bold blue]{task.percentage:>3.0f}%"),
         BarColumn(bar_width=None, complete_style="yellow", finished_style="green"),
         MofNCompleteColumn(),
         SpeedColumn(),

@@ -8,12 +8,12 @@ import torch
 import helion
 from helion import _compat
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import skipIfCpu
-from helion._testing import skipIfRocm
+from helion._testing import skipIfSharedMemoryLessThan
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
@@ -21,7 +21,7 @@ import helion.language as hl
 from helion.language import loops
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestRegisterTunable(RefEagerTestBase, TestCase):
     maxDiff = 10000
 
@@ -49,7 +49,6 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
             ),
             PowerOfTwoFragment,
         )
-        self.assertExpectedJournal(code)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @patch.object(loops, "_supports_warp_specialize", lambda: False)
@@ -70,10 +69,10 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         )
         expected = x * 4
         torch.testing.assert_close(result, expected)
-        self.assertExpectedJournal(
-            repr(kernel_with_int_param.bind((x,)).config_spec.default_config())
+        default_config = repr(
+            kernel_with_int_param.bind((x,)).config_spec.default_config()
         )
-        self.assertExpectedJournal(code)
+        self.assertIn("multiplier=3", default_config)
 
     def test_enum_fragment(self):
         @helion.kernel(config={"operation": 2})
@@ -107,12 +106,12 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
 
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(fn, (x,), block_size=64)
-        self.assertExpectedJournal(code)
         torch.testing.assert_close(result, x.sum())
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
-    @skipIfRocm("failure on rocm")
-    @skipIfCpu("Failed: Timeout (>10.0s) from pytest-timeout.")
+    @skipIfSharedMemoryLessThan(
+        86016, reason="num_stages=8 requires 86016 bytes of shared memory"
+    )
     def test_matmul_split_k(self):
         """Test matmul_split_k kernel with register_tunable"""
 
@@ -145,11 +144,13 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
             return out
 
         m, k, n = 64, 4096, 64
-        x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
-        y = torch.randn([k, n], device=DEVICE, dtype=torch.float16)
+        x = torch.randn([m, k], device=DEVICE, dtype=HALF_DTYPE)
+        y = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
 
         code, result = code_and_output(matmul_split_k, (x, y))
-        expected = x @ y
+        expected = (
+            (x.cpu().float() @ y.cpu().float()).to(result.dtype).to(result.device)
+        )
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1)
         self.assertIsInstance(
             self.getUserDefinedTunable(
@@ -157,7 +158,6 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
             ),
             PowerOfTwoFragment,
         )
-        self.assertExpectedJournal(code)
 
 
 if __name__ == "__main__":

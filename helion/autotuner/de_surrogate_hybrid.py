@@ -32,6 +32,7 @@ from typing import Any
 
 from .differential_evolution import DifferentialEvolutionSearch
 from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
+from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -76,7 +77,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             Default: 3. Early stopping enabled by default.
         initial_population_strategy: Strategy for generating the initial population.
             FROM_RANDOM generates a random population.
-            FROM_DEFAULT starts from the default configuration.
+            FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
+            remainder with random configs when best_available_pad_random is True.
             Can be overridden by HELION_AUTOTUNER_INITIAL_POPULATION env var.
             If not set via env var and None is passed, defaults to FROM_RANDOM.
     """
@@ -95,6 +97,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         min_improvement_delta: float = 0.001,
         patience: int = 3,
         initial_population_strategy: InitialPopulationStrategy | None = None,
+        best_available_pad_random: bool = DIFFERENTIAL_EVOLUTION_DEFAULTS.best_available_pad_random,
+        finishing_rounds: int = 0,
         compile_timeout_lower_bound: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_lower_bound,
         compile_timeout_quantile: float = DIFFERENTIAL_EVOLUTION_DEFAULTS.compile_timeout_quantile,
     ) -> None:
@@ -114,6 +118,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             min_improvement_delta=min_improvement_delta,
             patience=patience,
             initial_population_strategy=initial_population_strategy,
+            best_available_pad_random=best_available_pad_random,
+            finishing_rounds=finishing_rounds,
             compile_timeout_lower_bound=compile_timeout_lower_bound,
             compile_timeout_quantile=compile_timeout_quantile,
         )
@@ -150,7 +156,6 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.log("=" * 70)
 
         # Initialize population
-        self.set_generation(0)
         self.initial_two_generations()
 
         # Compute adaptive compile timeout based on initial population compile times
@@ -170,7 +175,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         self.generations_without_improvement = 0
 
         # Evolution loop
-        for gen in range(2, self.max_generations + 1):
+        for gen in self._budgeted_range(2, self.max_generations + 1):
             self.set_generation(gen)
             self._evolve_generation(gen)
 
@@ -178,13 +183,15 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             if self.check_early_stopping():
                 break
 
-        # Return best config
-        best = min(self.population, key=lambda m: m.perf)
+        self.rebenchmark_population()
+
+        best = self.best
         self.log("=" * 70)
         self.log(f"✓ Best configuration: {best.perf:.4f} ms")
         self.log(f"Total evaluations: {len(self.all_observations)}")
         self.log("=" * 70)
 
+        best = self.run_finishing_phase(best, self.finishing_rounds)
         return best.config
 
     def _evolve_generation(self, generation: int) -> None:
@@ -208,7 +215,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             selected_candidates = self._generate_de_candidates(self.population_size)
 
         # Evaluate selected candidates
-        new_members = self.parallel_benchmark_flat(selected_candidates)
+        new_members = self.benchmark_flat_batch(selected_candidates)
 
         # Track observations
         for member in new_members:
@@ -233,59 +240,61 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
 
     def _generate_de_candidates(self, n_candidates: int) -> list[FlatConfig]:
         """Generate candidates using standard DE mutation/crossover."""
-        candidates = []
+        with sync_seed(process_group_name=self.kernel.env.process_group_name):
+            candidates = []
 
-        for _ in range(n_candidates):
-            # Select four distinct individuals: x (base), and a, b, c for mutation
-            x, a, b, c = random.sample(self.population, 4)
+            for _ in range(n_candidates):
+                # Select four distinct individuals: x (base), and a, b, c for mutation
+                x, a, b, c = random.sample(self.population, 4)
 
-            # Differential mutation: x + F(a - b + c)
-            trial = self.config_gen.differential_mutation(
-                x.flat_values,
-                a.flat_values,
-                b.flat_values,
-                c.flat_values,
-                crossover_rate=self.crossover_rate,
-            )
+                # Differential mutation: x + F(a - b + c)
+                trial = self.config_gen.differential_mutation(
+                    x.flat_values,
+                    a.flat_values,
+                    b.flat_values,
+                    c.flat_values,
+                    crossover_rate=self.crossover_rate,
+                )
 
-            candidates.append(trial)
+                candidates.append(trial)
 
-        return candidates
+            return candidates
 
     def _fit_surrogate(self) -> None:
         """Fit Random Forest surrogate model on all observations."""
         if len(self.all_observations) < 10:
             return  # Need minimum data
 
-        # Encode configs to numeric arrays
-        X = []
-        y = []
+        with sync_seed(process_group_name=self.kernel.env.process_group_name):
+            # Encode configs to numeric arrays
+            X = []
+            y = []
 
-        for config, perf in self.all_observations:
-            try:
-                encoded = self.config_gen.encode_config(config)
-                X.append(encoded)
-                y.append(perf)
-            except Exception:
-                continue
+            for config, perf in self.all_observations:
+                try:
+                    encoded = self.config_gen.encode_config(config)
+                    X.append(encoded)
+                    y.append(perf)
+                except Exception:
+                    continue
 
-        if len(X) < 10:
-            return
+            if len(X) < 10:
+                return
 
-        X_array = np.array(X)  # type: ignore[union-attr]
-        y_array = np.array(y)  # type: ignore[union-attr]
+            X_array = np.array(X)  # type: ignore[union-attr]
+            y_array = np.array(y)  # type: ignore[union-attr]
 
-        # Fit Random Forest
-        surrogate = RandomForestRegressor(  # type: ignore[misc]
-            n_estimators=self.n_estimators,
-            max_depth=15,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
-        )
-        surrogate.fit(X_array, y_array)
-        self.surrogate = surrogate
+            # Fit Random Forest
+            surrogate = RandomForestRegressor(  # type: ignore[misc]
+                n_estimators=self.n_estimators,
+                max_depth=15,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                random_state=42,
+                n_jobs=-1,
+            )
+            surrogate.fit(X_array, y_array)
+            self.surrogate = surrogate
 
     def _surrogate_select(
         self, candidates: list[FlatConfig], n_select: int
@@ -302,7 +311,8 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
         """
         if self.surrogate is None:
             # Fallback: random selection
-            return random.sample(candidates, min(n_select, len(candidates)))
+            with sync_seed(process_group_name=self.kernel.env.process_group_name):
+                return random.sample(candidates, min(n_select, len(candidates)))
 
         # Predict performance for all candidates
         predictions = []

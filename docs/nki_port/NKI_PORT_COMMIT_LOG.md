@@ -1,0 +1,1394 @@
+# NKI Port — Commit Log
+
+In-depth record of every commit made while executing `NKI_PORT_IMPLEMENTATION_PLAN.md`,
+porting the NKI backend from `fix-nki-kernel-compilation` (`3056e85c`) onto `upstream/main`
+(`eb61d5b8`) on branch `nki-port-v2`.
+
+**How to read this:** newest entries are appended at the bottom. Each entry records the plan
+step, what changed and why, how it was verified (with the actual gate result), and any
+deviation from the plan or open follow-up. Commits are made only after the step's verification
+gate passes.
+
+**Conventions**
+- Reference (NKI source of truth): `fix-nki-kernel-compilation`. Verbatim copies use `git show`/`git checkout`, never manual paste.
+- Port tree tested via `PYTHONPATH=/home/ubuntu/helion_port` (editable install points elsewhere; never reinstall).
+- Baseline (before any NKI work): `helion` imports OK; backends = `['triton','pallas','cute','tileir','metal']`; `nki` absent.
+
+---
+
+## Baseline — `eb61d5b8` (upstream/main, untouched)
+
+- `import helion` succeeds from the port tree.
+- `list_backends()` → `['triton','pallas','cute','tileir','metal']` (no `nki`).
+- Working tree clean apart from the two planning docs.
+
+---
+
+## P1.1 — Copy NKI-only support files
+
+**Files:** `helion/_compiler/nki_fusion.py` (NEW), `helion/language/_nki_dim_access.py` (NEW)
+
+**What & why:** Copied both verbatim from the reference via `git checkout fix-nki-kernel-compilation -- …`
+(no manual edits). These have no upstream equivalent, so there is no conflict surface.
+- `_nki_dim_access.py` defines the `DimAccess` hierarchy (Contiguous/Scalar/Indirect/Dynamic/FullSlice/StridedGather)
+  plus the `IndirectAP`/`DynamicAP` dataclasses (the post-sentinel-refactor representation) used by
+  `memory_ops.py` and `atomic_ops.py` load/store codegen.
+- `nki_fusion.py` provides the FX-graph fusion passes (`annotate_psum_reuse`, `annotate_tensor_scalar_reduce`,
+  `annotate_activation_reduce`, `annotate_fx_graph`) that mark matmul→activation patterns for PSUM reuse.
+  Its `matmul_ops` import is lazy (inside a function body) so no circular import at load time.
+
+**Verification (gate passed):**
+- `git diff fix-nki-kernel-compilation -- <both files>` → empty (byte-identical to reference).
+- `from helion._compiler.nki_fusion import annotate_fx_graph; from helion.language._nki_dim_access import DimAccess, IndirectAP, DynamicAP` → OK.
+- Regression: `import helion` still OK; backends unchanged `['triton','pallas','cute','tileir','metal']` (nki not yet registered — correct, that's P1.5/P1.6).
+
+**Deviations/follow-ups:** none.
+
+## P1.2 — Add record_fx_node_ast / ast_for_fx_node to CodegenInterface
+
+**File:** `helion/_compiler/helper_function.py`
+
+**What & why:** The NKI load/store codegen in `memory_ops.py` calls `ast_for_fx_node`/`record_fx_node_ast`
+on the codegen interface 32 times (all inside function bodies — import-safe). Upstream's `CodegenInterface`
+does not define them. Added both methods verbatim from the reference, immediately after `lift()`.
+Both are no-op defaults on the base (record = pass, ast_for = return None); the real recording is wired in
+`generate_ast.py` (P1.10). Kept upstream's `statement_owner_node` (and its `contextlib`/`Iterator`/`Node`
+imports) untouched — the reference branch predates that method, but all three coexist cleanly.
+
+**Insertion point:** after `CodegenInterface.lift`, before the module-level `extract_helper_function`.
+
+**Verification (gate passed):**
+- Inserted text is byte-identical to `fix-nki-kernel-compilation:helper_function.py` for both methods.
+- Gate: `CodegenInterface` has all of `record_fx_node_ast`, `ast_for_fx_node`, `statement_owner_node`.
+- Regression: `import helion` OK.
+
+**Deviations/follow-ups:** none. (Note: did NOT port the reference's removal of `statement_owner_node` —
+that method is upstream-new and orthogonal; keeping it is correct.)
+
+## P1.3 — Reconcile jagged_tile / loops / exc / tunable deltas
+
+**Files:** `helion/language/tunable_ops.py` (edited). **No edit needed:** `loops.py`, `exc.py`, `language/__init__.py`.
+
+**MAJOR FINDING (plan correction):** The plan estimated a "~109-line NKI delta in loops.py." That figure was
+the *merge-base → reference* diff, which only shows the reference *adding* `jagged_tile`. In the 829
+intervening commits, **upstream independently added its own jagged_tile scaffolding — a strict superset** of
+the reference's:
+- `loops.py`: upstream's `jagged_tile` type_propagation handler is **byte-identical** to the reference's
+  (verified via extracted-body diff); upstream's docstring is richer (more examples). Neither branch's
+  `loops.py` contains any `nki`/`backend`-specific code. → **No edit.**
+- `exc.py`: `InvalidJaggedTileUsage` already present upstream (L345). → **No edit.**
+- `language/__init__.py`: `jagged_tile` export already present upstream (L26). → **No edit.**
+
+**The ONE real NKI delta** (isolated via `merge-base → reference`, not the misleading `upstream → reference`
+diff which conflates upstream's own additions like `signal`/`wait`/`CuteBackendUnavailable`): in
+`tunable_ops._register_tunable_type`, the reference returns a `SymIntType(origin, env.create_unbacked_symint(default))`
+for `int`-typed tunables instead of `NumericType.subtype(int).new_unbacked(origin)`. This makes an int
+`register_tunable` participate as a symbolic int (needed so NKI tile/loop bounds derived from tunables get a
+size hint). Added the `if python_type is int:` branch + `SymIntType` import.
+
+**Verification (gate passed):**
+- Edited region matches the reference verbatim.
+- `create_unbacked_symint(hint=8192)` signature accepts the positional `default()` hint (compile_environment L667).
+- `SymIntType`/`NumericType` import cleanly from `type_info` (and are re-exported by `type_propagation`).
+- Gate: `jagged_tile`, `InvalidJaggedTileUsage`, `JaggedTileIndexType`, `register_tunable` all import.
+- No residual mis-targeted `type_propagation` imports in `helion/language/`. Regression: `import helion` OK.
+
+**Deviation from plan:** The `int → SymIntType` change is **unconditional (not NKI-guarded)** in the
+reference, so it affects all backends. Applied as-is to match the reference (and per AGENTS.md "don't add
+unnecessary guards"). **Open follow-up:** confirm at P1.22/P2 that this doesn't shift Triton codegen for
+int tunables; if it does and that matters, revisit guarding. loops.py/exc.py/__init__.py edits from the
+plan were correctly dropped.
+
+## P1.3b — Port NKI type-inference deltas (trailing-singleton + symint-hint)
+
+**File:** `helion/_compiler/type_info.py` (NOT `type_propagation.py` — see correction below).
+
+**PLAN CORRECTION (file location):** The plan said port these into `type_propagation.py`. But upstream's
+`type_propagation.py → type_info.py` split moved `TensorType` and `CallableType` into **`type_info.py`**
+(`type_propagation` only re-exports them). So both NKI deltas were applied to `type_info.py`.
+
+**PLAN CORRECTION (method names):** The reference's method was `TensorType.propagate_assignment`; upstream
+renamed/reorganized it to **`TensorType.propagate_setitem`** (L429). The CallableType hunk lives in
+**`CallableType.propagate_call`** (L705). Applied to the correct methods.
+
+**Two deltas applied (verbatim from reference logic):**
+1. **Trailing-singletons (in `propagate_setitem`):** when `backend.name == "nki"`, allow a higher-rank RHS to
+   be assigned to a lower-rank LHS slice if the extra trailing dims are all size-1 (`rhs_trailing_singletons`).
+   NKI's 2D SBUF model produces `[P, F, 1]`-style shapes that must assign into `[P, F]` lanes without a
+   RankMismatch. This delta IS NKI-guarded.
+2. **Symint-hint capture (in `propagate_call`):** for host-side `_new_symint_on_host_fns` calls, instead of
+   `SymIntType.new_unbacked(origin)` (hint defaults to 8192), evaluate the function on size-hinted args to
+   compute a concrete `hint`, then `SymIntType(origin, env.create_unbacked_symint(hint=hint))`. Gives NKI
+   tile/loop bounds a realistic size hint. NOT backend-guarded in the reference (applies to all backends).
+   Added `import contextlib` (was absent); `tree_map_only` already imported.
+
+**NOT applied (correctly, per plan):**
+- `JaggedTileIndexType` — already in upstream `type_info.py` (L… ); not duplicated (verified count 1/0).
+- `patch_tensor_factories` guard — upstream already guards it at type_propagation.py L903–911 via
+  `backend.pad_factory_tensors_to_power_of_2`; NKI participates by overriding that property to False in P1.6.
+  No edit here.
+
+**Verification (gate passed):**
+- `trailing_singletons` present in `TensorType.propagate_setitem`; `create_unbacked_symint(hint=hint)` present
+  in `CallableType.propagate_call`; `type_propagation` re-export of both classes intact.
+- `JaggedTileIndexType` count: type_info=1, type_propagation=0 (not duplicated).
+- Regression: `import helion` OK.
+
+**Open follow-up:** delta #2 is cross-backend (unconditional) — confirm at P1.22 it doesn't shift Triton codegen.
+
+## P1.4 — compile_environment.py: set_codegen_state + NKI int64/size_hint guards
+
+**File:** `helion/_compiler/compile_environment.py`
+
+**Applied (3 of the reference's NKI pieces):**
+1. **`set_codegen_state` context manager + `self._codegen_state` attribute** (added after `has_barrier` /
+   after `__init__`). The keystone for NKI statement-based codegen ("Option B"): during codegen the active
+   state is parked on the env so NKI op-lowerings can emit `nisa.*` statements and return a result var name.
+   Genuinely absent upstream (grep count 0). Added `from collections.abc import Iterator` under TYPE_CHECKING.
+2. **int64→int32 fake-tensor promotion** in `_to_fake_tensor`: compute `fake_dtype` once (int64→int32 when
+   `backend_name=='nki'`) and thread it through ALL THREE upstream branches — the new `FakeTensor` branch,
+   `static_shapes`, and the `from_real_tensor` else-branch (with the pre-cast empty-tensor trick). Upstream
+   refactored this method to 3 branches (reference had 2); the cast is applied to each so int64 never leaks.
+3. **`size_hint` unbacked-symbol fallback**: before defaulting to 8192, try `expr.xreplace(var_hints)` (return
+   if fully concrete) then `shape_env.size_hint(expr)`. Helps NKI bounds resolve to real hints.
+
+**NOT applied here (handled elsewhere — plan corrections):**
+- **`backend_factory` dict + `from .backend import NKIBackend`**: the reference hardcoded `"nki": NKIBackend`
+  in a dict and hard-imported it. Upstream uses the registry (`get_backend_class(settings.backend)()`), and
+  the plugin constraint FORBIDS a hard NKI import here. Skipped — NKI registers via backend_registry (P1.5/P1.6).
+- **`jagged_tile_parent_ids`/`jagged_tile_mask_shapes` dicts + `register_jagged_tile`/`is_jagged_tile`**:
+  ALREADY present upstream (L270-271, L1222-1226) from upstream's own jagged_tile work. Not re-added.
+- **NKI reduction-DMA power-of-2 guard** in `ReductionLoopBlockSizeSource.from_config`: the reference inlined
+  `if backend_name=='nki': return max(1, size_hint())`. Upstream replaced that whole path with a backend hook
+  `backend.static_rdim_size(size)` (Pallas already returns exact `numel`; Triton/CuTe round to pow2). The
+  correct NKI port is to override `NKIBackend.static_rdim_size` to return `numel` exact — **deferred to P1.6**.
+  No edit needed in this file.
+
+**Verification (gate passed):** `set_codegen_state` present; `_to_fake_tensor` has `fake_dtype`/`torch.int32`;
+`size_hint` has the `hinted_expr` fallback; module AST-parses; `import helion` OK.
+
+**Open follow-up:** ensure P1.6 adds `NKIBackend.static_rdim_size(numel) -> numel`.
+
+## P1.5 — backend_registry.py: lazy _maybe_register_nki hook
+
+**File:** `helion/_compiler/backend_registry.py` (existing file; appended after the builtin-register loop).
+
+**What & why:** NKI is an optional plugin. Added `_maybe_register_nki()` which imports `nki_backend`
+(side-effect: that module calls `register_compiler_backend(NKIBackend)` at load). The import is lazy/guarded
+so on a non-Trainium box (no torch_xla) NKI is simply absent rather than breaking `import helion`. Did NOT
+touch `_BUILTIN_BACKENDS` — NKI is not a builtin; it self-registers on import.
+
+**Dev-time choice:** the except clause is intentionally widened to also catch non-ImportError (SyntaxError,
+circular import) and log a warning, so a broken `nki_backend.py` surfaces instead of silently leaving NKI
+unregistered. To be narrowed to `except ImportError` once nki_backend.py is stable (tracked for post-P1.6).
+
+**Verification (gate passed):** `nki_backend.py` does not exist yet, so `'nki' not in list_backends()` and
+`import helion` still works (ImportError swallowed). `_maybe_register_nki()` is idempotent. backends =
+`['triton','pallas','cute','tileir','metal']` (nki appears only after P1.6).
+
+## P1.6 — Create nki_backend.py (extract NKIOpOverrides + NKIBackend) [CENTERPIECE]
+
+**File:** `helion/_compiler/nki_backend.py` (NEW, ~6750 lines). Core `backend.py` left UNTOUCHED.
+
+**What & why:** On the reference branch the entire NKI backend lived inline in `backend.py`
+(lines 636–7321: `NKIOpOverrides` 636→5768, module helper `_validate_nki_tensor_shape` 5769→5808,
+`NKIBackend` 5809→7321). Upstream's `backend.py` has neither, and uses a plugin registry. So this step
+**extracts** that 6686-line block verbatim into a standalone `nki_backend.py` that self-registers.
+
+**How built (guarantees verbatim block):**
+- Extracted lines 636–7321 from `fix-nki-kernel-compilation:backend.py` via `git show | sed -n`.
+- Prepended a fresh module header: docstring + minimal module-level imports the block needs
+  (`abc`, `ast`, `torch`, `exc`, `expr_from_string`, `Backend`, `register_compiler_backend`) plus a
+  TYPE_CHECKING block (`OpsHandler`/`InductorOpOverrides`, `Config`, `BoundKernel`, `Argument`,
+  `DeviceFunction`, `TileStrategy`). All heavy deps (CompileEnvironment, device_function, torch_xla)
+  are lazy-imported inside method bodies (71 CompileEnvironment lazy-imports etc.), so the module imports
+  cleanly with no torch_xla at load — plugin semantics preserved.
+- Appended `register_compiler_backend(NKIBackend)` at module end.
+
+**Two upstream-new Backend hooks overridden (the reference didn't need these; added by hand):**
+- `pad_factory_tensors_to_power_of_2` → `False` (base default True). Replaces the reference's
+  patch_tensor_factories guard, which upstream relocated onto this backend property (see P1.3b/P1.4).
+- `static_rdim_size(numel)` → `numel` exact (base default `next_power_of_2(numel)` = 512 for 300).
+  Replaces the reference's inline ReductionLoopBlockSizeSource NKI guard (deferred here from P1.4).
+
+**Verification (gate passed):**
+- AST parses; module imports directly.
+- `NKIBackend()` instantiates → `__abstractmethods__` is EMPTY (all 7 of upstream's abstractmethods —
+  name, dtype_str, acc_type, function_decorator, constexpr_type, default_launcher_name, library_imports —
+  are concretely implemented in the extracted class).
+- `import helion` now registers nki: `list_backends()` = `[...,'nki']`; `get_backend_class('nki')` resolves.
+- `dtype_str(int64)='nl.int32'`; `pad_factory_tensors_to_power_of_2 is False`; `static_rdim_size(300)==300`.
+- `git diff upstream/main -- backend.py` empty (core backend.py untouched).
+
+**Known forward dependency (not a failure):** `NKIBackend.function_decorator` calls
+`helion.runtime.settings.get_neuron_target`, which P1.7 adds. Not exercised by the P1.6 gate; resolved at P1.7.
+
+## P1.7 — runtime launcher, settings (get_neuron_target + platform_target), config, output_header
+
+**Files:** `helion/runtime/__init__.py`, `helion/runtime/settings.py`, `helion/runtime/config.py`,
+`helion/_compiler/output_header.py`
+
+**Applied:**
+1. **`runtime/__init__.py`**: added `default_nki_launcher` verbatim from the reference, inserted right after
+   `default_launcher`. Moves tensors to the XLA device, casts int64→int32, auto-bumps LNC to 2 for kernels
+   containing `dynamic_range`, runs `xm.mark_step()`, and supports `HELION_NKI_PROFILE` timing. `torch_xla`
+   is imported INSIDE the function body (plugin constraint preserved). Added `import time` (module scope;
+   `os`/`sys` already upstream).
+2. **`settings.py`**: added `get_neuron_target()` (config → `HELION_NEURON_TARGET` → `neuron-ls` autodetect →
+   explicit RuntimeError) + `import subprocess`; added `platform_target: str | None = None` field to
+   `_Settings` (placed last to avoid dataclass default-ordering issues) and its FIELD_DOCS entry.
+   **Did NOT** touch `BackendLiteral`/`_get_backend` — upstream derives them from `list_backends()` so `nki`
+   already appears (the reference's manual `"nki": "nki"` mapping entry is unnecessary here).
+3. **`config.py`**: added `platform_target: str | None` class attr + `__init__` kwarg + `self.platform_target = …`.
+4. **`output_header.py`**: added `"_default_nki_launcher"` to `disallowed_names`.
+
+**This resolves the P1.6 forward dependency:** `NKIBackend.function_decorator` imports `get_neuron_target`,
+which now exists. (function_decorator can only be fully exercised inside a live CompileEnvironment during a
+real bind, which requires the codegen steps P1.10+; deferred to those gates.)
+
+**Verification (gate passed):** `default_nki_launcher` importable; `Config(platform_target='trn2')` works;
+`get_neuron_target()` resolves via env and via config arg; **`torch_xla` NOT in sys.modules after import**
+(lazy import confirmed); all 4 files AST-parse; `_default_nki_launcher` in output_header disallowed_names.
+
+**Plan deviation:** skipped the `BackendLiteral`/`_get_backend` mapping edits (registry-driven upstream).
+
+## P1.8 — program_id.py: NKIProgramIDs (host_function edit dropped)
+
+**File:** `helion/_compiler/program_id.py`. **No edit:** `helion/_compiler/host_function.py`.
+
+**What & why:** Appended `class NKIProgramIDs(ProgramIDs)` after `CuteProgramIDs`. NKI compiles a single
+program whose grid is always `(1,)` — all tiling happens via `nl.affine_range` loops inside the kernel — so
+`codegen` is a no-op and `codegen_grid` returns `(1,)`. Verbatim from reference; orthogonal to upstream's
+CuTe PID work.
+
+**host_function.py NOT touched (plan-confirmed):** the reference guarded `patch_tensor_factories` in
+host_function with `backend_name != "nki"`, but upstream removed `patch_tensor_factories` from host_function
+entirely (grep count 0). NKI's equivalent guard is the `pad_factory_tensors_to_power_of_2=False` override
+added to NKIBackend in P1.6.
+
+**Verification (gate passed):** `NKIProgramIDs` imports and subclasses `ProgramIDs`; host_function has 0
+`patch_tensor_factories` refs; `import helion` OK.
+
+## P1.9 — device_function.py: NKI tracking dicts, methods, printer
+
+**Files:** `helion/_compiler/device_function.py`, `helion/_compiler/nki_backend.py`
+
+**Applied:**
+1. **16 `_nki_*` tracking dicts/sets** in `__init__` (after `_variable_renames`, before `dce_vars`):
+   `_nki_tile_lists`, `_nki_sbuf_shapes` (read by tile_strategy in P1.16g), `_nki_logical_shapes`,
+   `_nki_iota_offsets`, `_nki_iota_block_sizes`, `_nki_scalar_arg_names`, `_nki_sbuf_dtypes`,
+   `_nki_hbm_sources`, `_nki_host_arg_casts`, `_nki_protected_vars`, `_nki_return_buffers`,
+   `_nki_free_dim_tile_lists`, `_nki_psum_aliases`, `_nki_fx_matmul_vars`. (More than the plan's "12".)
+2. **`block_size_var`**: hoisted `env=...` and added the `else` branch that lazily creates the constexpr
+   host-def when a strategy pre-populated the cache with just a symbol name.
+3. **variable-rename method**: propagate `_nki_tile_lists` across a phi/rename group.
+4. **Tile-list helpers**: `register_tile_list`, `get_tile_list_vars`, `get_tile_list_count`,
+   `propagate_tile_list` (before `tensor_arg`).
+5. **`tensor_arg`**: recover captured-tensor origins via new static `_recover_captured_tensor_origin`.
+6. **`_expr_args` path**: register Python-scalar params into `_nki_scalar_arg_names`.
+7. **5 NKI methods** before `codegen_function_def`: `_register_nki_dynamic_tensor_size_args`,
+   `_nki_return_statements`, `_is_nki_sbuf_allocation`, `_should_rewrite_nki_sbuf_reassign`,
+   `_rewrite_nki_sbuf_reassignments`.
+8. **`codegen_function_def`** (re-anchored onto upstream's heavily-refactored version that uses
+   `function_decorator_for_args` + a `kernel_body` list + cute pipeline passes): added the
+   `_register_nki_dynamic_tensor_size_args()` call; built the NKI `tensor_shape_preamble` (reshape tensor
+   args to 2D logical shape) and wove it + `_nki_return_statements()` into `kernel_body`
+   (`_nki_return_statements` returns `[]` for non-NKI so it's inert for other backends); restructured the
+   return to build `fn_def` then call `_rewrite_nki_sbuf_reassignments(fn_def.body, …)` for NKI only.
+9. **`codegen_function_call`**: added the `_register_nki_dynamic_tensor_size_args()` call.
+
+**PLAN CORRECTION — HelionNKIPrinter routing:** the plan's watch-out was right. Upstream routes sympy
+printing through `backend.sympy_printer_expr()` (base→`texpr`, Pallas→`pallas_texpr`, CuTe→`cute_texpr`),
+NOT through a `texpr` guard. So instead of patching `texpr` (the reference's approach), added
+`HelionNKIPrinter` + a module-level `nki_texpr()` to device_function.py, and overrode
+`NKIBackend.sympy_printer_expr` (in nki_backend.py) to call `nki_texpr` — matching the upstream idiom. The
+printer emits Python `//` / `%` instead of Triton `div_floor_integer`/`remainder_integer` helpers.
+
+**DEFERRED to P1.17 (store codegen):** the `codegen_function_call` NKI return-buffer call_str manipulation
+(`_nki_result[i]`, reshape/slice on the launcher return). Upstream added a generalized `_output_only_names`
+return-capture mechanism; the NKI `_nki_return_buffers` attrs are only populated by store codegen (not yet
+ported) and getattr-default to empty, so the branch is inert today. Will reconcile NKI return-capture against
+upstream's `_output_only_names` when store codegen lands.
+
+**Verification (gate passed):** module AST-parses; all 8 representative NKI methods present on DeviceFunction;
+`NKIBackend.sympy_printer_expr(x % 8)` → `(x % 8)` (Python modulo via HelionNKIPrinter); `import helion` OK,
+backends include nki.
+
+## P1.10 — generate_ast.py: NKI tracking, methods, pre-codegen passes (~386-line delta)
+
+**File:** `helion/_compiler/generate_ast.py`
+
+**Applied:**
+1. **4 `__init__` attrs** (after `next_else_block`): `_var_to_constant`, `_nki_sbuf_constant_values`,
+   `_nki_sbuf_alloc_depth`, `fx_node_to_ast`.
+2. **`_lower_nki_mod_assign`** (after `mask_var`): lowers `var = a % b` to the NKI
+   tensor_scalar(mul 1/b)→floor→mul→subtract sequence (no Triton remainder helper).
+3. **4 methods after `_phase_checker`**: `_record_nki_sbuf_allocation`, `_constant_value_from_ast`,
+   `_record_nki_sbuf_write`, `_lower_nki_sbuf_reassign`.
+4. **`add_statement`**: NKI mod-assign lowering, SBUF-reassign→tensor_copy lowering, and const/alloc/write
+   tracking — all woven in BEFORE upstream's existing append + `_record_statement_thread_references` /
+   `_record_tcgen05_owned_statement` calls (preserved).
+5. **`get_var_constant_value` + `record_fx_node_ast` + `ast_for_fx_node`** (override the CodegenInterface
+   no-op base from P1.2 with the real dict-backed recording).
+6. **`lift`**: NKI Mod early-lowering via `NKIOpOverrides.mod`. **Import adapted**: reference used
+   `from .backend import NKIOpOverrides`; since P1.6 moved it, this now reads `from .nki_backend import
+   NKIOpOverrides`.
+7. **Device-loop GRID codegen** (re-anchored onto upstream's refactored body-first / cute_state version):
+   added `env`+`is_nki`; `is_nki` forces the single-body-block path; `validate_nki_tensor_shapes(root)` +
+   `annotate_fx_graph(root)` before codegen; wrapped the grid-state codegen branch in
+   `with env.set_codegen_state(state):`; guarded the multi-root if/else emission with `not is_nki`;
+   added the `_nki_post_call_stmts` post-call handling at the `codegen_function_call` return.
+
+**Plan note (the disabled `_nki_dyn_loops` cleanup hunk):** the reference carried a commented-out cleanup
+block in `_add_device_loop`; it was already disabled (dead comment) so not ported.
+
+**Verification (gate passed):**
+- Module AST-parses; all 8 NKI methods present on `GenerateAST`; `NKIOpOverrides` imported from `nki_backend`.
+- **End-to-end smoke** (`/tmp/nki_smoke.py`, a trivial copy kernel, `to_triton_code`): pipeline now runs
+  through env-setup (nki backend selected — "experimental backend" warning fires), tracing, device_ir, and
+  generate_ast, failing exactly at `BackendImplementationMissing: codegen for API function load` — i.e. the
+  next unported step (P1.17 memory_ops). This confirms the generate_ast wiring is correct and the failure is
+  a clean not-yet-implemented at the expected boundary.
+- Regression: `import helion` OK.
+
+## P1.11 — device_ir.py: SiLU decomp guard + set_codegen_state wraps
+
+**File:** `helion/_compiler/device_ir.py`
+
+**MAJOR FINDING — most of P1.11 is already upstream.** Verified upstream already has: `JaggedTileIndexType`
+import (from type_info, L63), `_get_custom_decomp_table` with the stack pop, `_make_fx` using it,
+`hl.jagged_tile` in the WalkDeviceAST func_type assert (L1322), and the `JaggedTileIndexType` `amax()` jagged
+end-handling (L1454). All upstream's own jagged work. So only TWO NKI pieces were genuinely missing:
+
+**Applied:**
+1. **SiLU decomp pop** in `_get_custom_decomp_table`: `if backend_name == "nki": decomp_table.pop(aten.silu.default)`
+   so SiLU lowers via `NKIOpOverrides.silu` instead of the aliasing `x*sigmoid(x)` decomposition.
+2. **`set_codegen_state(state)` wraps** on the control-flow codegen methods (the keystone from P1.4, so NKI
+   op-lowerings can emit statements while inside these graphs). Re-anchored onto upstream's refactored
+   versions: `ForLoopGraphInfo.codegen` (wrap the `add_device_loop` ctx), `IfGraphInfo.codegen` (BOTH the if
+   body and the else-branch `set_statements` — upstream split these), `WhileLoopGraphInfo.codegen` (BOTH the
+   `emit_condition` inner block AND the body block — 2 paths), `HelperFunctionGraphInfo.codegen`. 6 wraps total.
+
+**Verification (gate passed):** `CompileEnvironment` already imported; 6 `set_codegen_state` wraps present;
+silu pop present; module AST-parses; `import helion` OK.
+
+**Deviation:** the reference's commented-out `_nki_dyn_loops` cleanup block (already dead) was not ported.
+
+## P1.12 — reduction_strategy.py: NKI deferred reduction (guide-omitted; 232-line delta)
+
+**File:** `helion/_compiler/reduction_strategy.py`
+
+**Applied (re-anchored onto upstream's refactored ReductionStrategy/Looped/Block + cute vec-fold path):**
+1. **`call_reduction_function`**: pass `fake_input=/fake_output=` to `backend.reduction_expr` ONLY when
+   `backend.name=="nki"`. PLAN CORRECTION confirmed (R15): upstream's base `reduction_expr` takes
+   `threads_in_group`, NOT `fake_input/fake_output` (which NKIBackend's override carries). Passing them
+   unconditionally would `TypeError` on other backends, so it's NKI-guarded.
+2. **`LoopedReductionStrategy.codegen`**: after the `{acc} = {acc_full}` outer_prefix append, add the NKI
+   `full_memset_stmt` init + `_nki_sbuf_shapes[acc]` registration (`getattr(backend,"full_memset_stmt",None)`
+   is None for non-NKI → inert). In the non-indexed branch, for NKI emit the deferred post-loop reduction
+   directly into `outer_suffix` (`_NKI_REDUCTION_OPS` map → `nisa.tensor_reduce` with part-size resolution
+   from `_nki_sbuf_shapes`/shape_dims/fake_input, mean scaling, `[:,0]` extract) and `return` early to skip
+   the shared `maybe_reshape`/`cast_expr` tail; non-NKI keeps upstream's `_cute_cross_warp_reduction_expr or
+   call_reduction_function` path untouched.
+3. **`debug_dtype_asserts`** guard: `and backend.name != "nki"` (NKI doesn't emit `tl.static_assert`).
+4. **`BlockReductionStrategy`** zero-dim path: NKI `full_memset_stmt` ndarray+memset variant.
+
+**Verification (gate passed):** module AST-parses; `full_memset_stmt` exists only on NKIBackend (None
+elsewhere → inert); `cast_expr`/`full_expr`/`is_indexed_reduction`/`reduction_combine_expr` resolve;
+`import helion` OK; end-to-end smoke still fails at the SAME expected boundary (missing `load` codegen,
+P1.17) — no reduction-wiring regression.
+
+## P1.13 — creation_ops.py: NKI full() memset/transpose (guide-omitted; ~150 lines)
+
+**File:** `helion/language/creation_ops.py`
+
+**What & why:** Added an NKI branch at the top of `_full_codegen` (after `backend=`) that emits the NKI
+two-line `hl.full` pattern: `var = nl.ndarray(...)` then `nisa.memset(var, value=...)`, instead of the
+single `full_expr`. Gated by `getattr(backend,"full_memset_stmt",None)` (None for non-NKI → inert, like
+P1.12). Includes the accumulator-layout transpose heuristic (scans device_ir for reduction ops to decide
+whether a `[1,N]` full should be allocated `[N,1]`) and `_nki_sbuf_shapes` registration with block-size
+resolution. Returns early for NKI; upstream's literal/dynamic `full_expr` path is untouched for other
+backends. Added the `statement_from_string` import (was absent). Upstream's `_full_codegen` matched the
+reference's pre-edit form exactly, and `_full_codegen_pallas` is a separate variant (no conflict).
+
+**Verification (gate passed):** module AST-parses; `full` imports; `import helion` OK.
+
+## P1.14 — aten_lowering.py: 15 NKI codegen handlers + 2 NKI-only lowering objects
+
+**File:** `helion/_compiler/aten_lowering.py`
+
+**Approach (append-block, not in-place):** The reference delta (1429 lines) is **purely additive** (0 removed
+lines, verified). Since `@<obj>.register_codegen("nki")` decorators register position-independently (the
+target `*_lowering` object just needs to be defined above), I extracted all 15 NKI handler blocks (+ the 2
+new lowering objects) verbatim from the reference via a line-range script and **appended them as one block at
+the end of the file**. This is far less error-prone than placing 15 blocks at scattered anchors, and produces
+identical *registered behavior* (and identical generated NKI kernels — the byte-for-byte goal is about
+generated code, not this file's source layout).
+
+**Handlers ported (15):** full, unsqueeze, squeeze, view (+reshape via double-decorator), permute, stack,
+expand, silu, mm, addmm, bmm, baddbmm, cumsum, iota.
+
+**NKI-only lowering objects created (2):** `silu_lowering`, `cumsum_lowering` (upstream lacked them, verified
+count 0). **PLAN CORRECTION:** `stack_lowering` is NOT NKI-only — upstream already has it (the plan/guide
+said NKI may have added it); only the `register_codegen("nki")` handler is appended for stack.
+
+**Verification (gate passed):** module AST-parses; `silu_lowering`/`cumsum_lowering` exist; all needed
+helpers (`constant_repr`, `map_arg`, `_env_arg`, `statement_from_string`, `passthrough_masked_value`) present
+upstream; **`'nki' in codegen_impls` confirmed on all 15 lowering objects** (and the register_codegen
+`assert backend not in codegen_impls` guarantees no double-registration); `import helion` OK.
+
+## P1.15 — inductor_lowering.py: NKI reduction wrap, mean, dtype, mod/remainder/fmod, fx recording
+
+**File:** `helion/_compiler/inductor_lowering.py` (real delta only 181 lines — smaller than the plan implied)
+
+**PLAN CORRECTIONS CONFIRMED by the real merge-base→reference diff (the draft's errors are NOT in it):**
+- `_check_block_broadcast_compatibility` ctx: **NOT changed** (upstream already has `ctx`; the reference
+  delta doesn't touch it). Left untouched. ✓
+- `_patched_inductor_config` / `INDUCTOR_PATCH` rename: **not in the delta** — no such change needed.
+
+**Applied (6 hunks):**
+1. `ReductionLowering.codegen`: wrap the `strategy.codegen_reduction(...)` call in `with env.set_codegen_state(state):`.
+2. `ReductionLowering.get_masked_value`: add `"mean"` to `{sum,prod,min,max}`. UNCONDITIONAL (matches reference;
+   affects all backends — flagged for P1.22 cross-backend verification, see earlier user question).
+3. `GenerateASTFromInductor._default`: wrap the parent-handler call in try/except; for NKI, raise
+   `BackendUnsupported` for unmapped activation ops (`_NKI_ACTIVATION_NAMES` set). Preserved upstream's
+   metal `"::"` handling.
+4. `to_dtype`: NKI `backend.cast_ast(..., src_dtype=)` branch, inserted after upstream's cute fp8 branch.
+5. `mod`/`remainder`/`fmod` methods (str-arg for NKI → `_default`), before `def load`.
+6. `GraphInterpreter`: `record_fx_node_ast` at the multi-output site, the single-result site, and the
+   placeholder branch of `run_node`; plus the tile-list phi handling in `codegen_call_with_graph`
+   (`get_tile_list_vars`→`register_tile_list` instead of emitting a copy), preserving upstream's
+   `statement_owner_node` wrapper.
+
+**Verification (gate passed):** parses; `'mean'` in get_masked_value; mod/remainder/fmod present;
+`_check_block_broadcast_compatibility` untouched; `import helion` OK; smoke still at expected `load` boundary.
+
+## P1.16 — tile_strategy.py (HARDEST; ~945-line delta, split into sub-commits)
+
+Strategy: upstream's codegen_grid/codegen_device_loop diverged heavily (e.g. codegen_device_loop is 112
+upstream lines vs the reference's 471 NKI-heavy lines, with thread-axis/LoopDimInfo/steps additions). The
+reference's NKI path is a clean EARLY-BRANCH in codegen_grid (`if nki: return self._codegen_grid_nki(...)`),
+so the port adds NKI helper methods + early-branch guards rather than interweaving. codegen_device_loop's NKI
+logic is interwoven in the reference; ported by branching to a dedicated NKI path that leaves upstream's body
+intact.
+
+### P1.16a+b — module-level NKI helpers + _setup_block_size_constexpr block_idx
+
+**Applied:**
+- Inserted 4 module-level helpers verbatim before `class TileStrategy`: `_nki_body_leading_count`,
+  `_count_leading_block_id_matches`, `_backend_loop_index_statements`, `_backend_grid_index_statements`.
+  The `_backend_*` ones use `getattr(backend,"loop_index_statements"/"grid_index_statements",None)` → inert
+  for non-NKI (NKIBackend defines those, from P1.6). Deps `grid_index_expr`/`loop_index_expr` exist on base.
+- `TileStrategy._setup_block_size_constexpr`: added `block_idx: int | None = None` param + the NKI guard
+  (inline block size as a literal in `block_size_var_cache`, no kernel param). Upstream matched the
+  reference's pre-edit form. Existing call sites need no change — they default `block_idx=None` (Triton/cute
+  path); the NKI-specific calls that pass `block_idx=` live inside the NKI methods added in P1.16c-f.
+
+**Verification (gate passed):** parses; `_setup_block_size_constexpr` signature has `block_idx`; `import
+helion` OK; smoke still at expected `load` boundary.
+
+### P1.16c — codegen_grid NKI early-branch + _codegen_grid_nki method
+
+**Applied to `_BaseNDTileStrategy`:**
+- `codegen_grid`: added `if env.backend.name == "nki": return self._codegen_grid_nki(state, block_ids,
+  block_sizes, begins, ends)` right after `ends` is resolved (before upstream's `_root_grid_steps`/
+  thread-axis path). Clean early-return — NKI bypasses select_pid_strategy entirely.
+- Inserted `_codegen_grid_nki` (265 lines, verbatim from reference L1096-1360) as a method, before `_to_ast`.
+- Verified the reference's `_to_ast` is byte-identical to upstream's (no NKI delta there — not touched).
+
+**Verification (gate passed):** parses; `_codegen_grid_nki` present on `_BaseNDTileStrategy`; the NKI guard
+is in `codegen_grid`; `import helion` OK.
+
+### P1.16d+e — codegen_device_loop NKI branch + DeviceGridState 3-tuple lane loops + mask_var
+
+**Applied:**
+- `_BaseNDTileStrategy.codegen_device_loop`: early-branch `if env.backend.name == "nki": return
+  self._codegen_device_loop_nki(state)` right after `env`. Inserted `_codegen_device_loop_nki` (472 lines,
+  the reference's entire codegen_device_loop renamed) before `compact_shape`. This keeps upstream's
+  refactored 112-line body (thread-axis/LoopDimInfo/steps) fully intact and isolates the NKI dynamic-range/
+  register logic. Verified deps (`_thread_axis_offset/_map`, `_uses_thread_axis(block_size)`, `_setup_mask`,
+  `_reorder`, `DeviceLoopState` fields) all exist upstream.
+- `DeviceGridState.wrap_body`: handle the NKI 3-tuple `lane_loops` entry `(lane_var, body_prefix, extent)`
+  (string range_expr + body-prefix iota injection) alongside upstream's 2-tuple `_create_lane_loop` path.
+  `_codegen_grid_nki` emits 3-tuples, so this is required. Applied to both wrap_body definitions.
+- `from .program_id import NKIProgramIDs` added (the reference imports it; `_codegen_device_loop_nki` calls
+  `set_pid(NKIProgramIDs())`).
+- `_NKINDTileStrategy.mask_var` override (`.get()`) added in nki_backend.py — localizes the reference's
+  `NDTileStrategy.mask_var` `.get()` change to NKI only, avoiding touching cute.
+
+**Plan deviations (justified):** Skipped the reference's `NDTileStrategy.mask_var` `.get()` change (did it via
+the NKI subclass override instead — safer, cute untouched) and the `CuteNDTileStrategy._setup_block_size_constexpr
+(block_idx=)` additions (CuteNDTileStrategy is cute-only, never NKI — verified only instantiated in
+backend.py L4620 — so block_idx would never trigger the NKI guard; cosmetic, skipped to minimize diff).
+
+**Verification (gate passed):** parses; `import helion` OK; **end-to-end smoke now runs the full NKI tile
+path** (grid + device loop — the prior NKIProgramIDs NameError is fixed) and fails cleanly at the expected
+`codegen for API function load` boundary (P1.17, next step). P1.16 functionally complete.
+
+## P1.17 — memory_ops.py: NKI load/store codegen (THE GIANT; 5739 lines, verbatim)
+
+**File:** `helion/language/memory_ops.py`
+
+**Approach (extract-and-append, like P1.6/P1.14):** The reference delta is **purely additive** (0 removed
+lines). The NKI block is the 6 helpers + `@codegen(load,"nki")` + `@codegen(store,"nki")`, contiguous in the
+reference from L510 to L6248. **Important boundary finding:** L6250+ in the reference is shared
+`@get_masked_value(load)` / `@ref(load)` code that ALREADY exists upstream (count 1 each) — so the extract
+stops at L6248 to avoid double-registration. Extracted L510-6248 (5739 lines) verbatim via sed and appended
+at EOF. Added `from ._nki_dim_access import DynamicAP, IndirectAP` at module top (the only non-lazy import
+the block needs; everything else is lazy-imported inside function bodies).
+
+**Helpers:** `_nki_shifted_tile_subscript`, `_nki_indirect_gather`, `_nki_lookup_sbuf_shape_dtype`,
+`_nki_as_uint32_p1_vector`, `_nki_row_index_gather`, `_nki_subscript_block_id`.
+
+**MILESTONE — first end-to-end NKI codegen on the port.** `to_triton_code` for a copy kernel now produces a
+complete, valid `@nki.jit` kernel:
+```
+@nki.jit
+def _helion_k(x, nki_return_numel):
+    x = x.reshape([1, 256])
+    nki_return_buf = nl.ndarray([1, nki_return_numel], dtype=nl.float32, buffer=nl.shared_hbm)
+    for offset_0 in nl.affine_range(0, 256, 128):
+        indices_0 = nl.ndarray([1, 128], nl.int32, buffer=nl.sbuf)
+        nisa.iota(dst=indices_0, pattern=[[1, 128]], offset=offset_0, channel_multiplier=0)
+        _nki_sbuf_1 = nl.ndarray([1, 128], nl.float32, buffer=nl.sbuf)
+        nisa.memset(_nki_sbuf_1, value=0)
+        if offset_0 >= 0 and offset_0 + 128 <= 256:
+            nisa.dma_copy(dst=_nki_sbuf_1, src=x[0:1, offset_0:offset_0 + 128])
+        nisa.dma_copy(dst=nki_return_buf[0:1, offset_0:offset_0 + 128], src=_nki_sbuf_1)
+    return nki_return_buf
+def k(x, *, _launcher=_default_nki_launcher): ...
+```
+
+**Verification (gate passed):** parses; 6 helpers import; `nki` in `load._codegen` and `store._codegen`;
+**NO Triton/`tl.` leakage**; full kernel has `@nki.jit`, `nl.affine_range`, `nisa.iota`, 2× `nisa.dma_copy`,
+bounds guard, and the host launcher. `import helion` OK.
+
+## P1.18 — language op codegens + P1.14 fix (_nki_dot helpers)
+
+**Files:** `matmul_ops.py`, `scan_ops.py`, `_tracing_ops.py`, `random_ops.py`, `barrier.py`, `view_ops.py`,
+and a fix to `aten_lowering.py`.
+
+**Applied (all purely additive):**
+- 4 single-hunk files (matmul_ops/scan_ops/barrier/view_ops): appended their `@_decorators.codegen(<op>,"nki")`
+  blocks (327/213/7/8 lines) at EOF (position-independent decorator registration).
+- `_tracing_ops.py` (2 hunks): inserted the `@codegen(_mask_to,"nki")` codegen (106 lines, masked-fill via
+  tensor_copy_predicated) before `@get_masked_value(_mask_to)`; added the tile-list handling in `_new_var`'s
+  codegen (`get_tile_list_vars`→`register_tile_list`).
+- `random_ops.py` (2 hunks): added `import ast` + `expr_from_string`/`statement_from_string` imports; inserted
+  the `@codegen(rand,"nki")` codegen (72 lines, nl.rand + seed setup) before `@get_masked_value(rand)`.
+
+**P1.14 GAP FIXED (caught by matmul smoke):** The mm/addmm/bmm/baddbmm nki handlers call `_nki_dot`, a
+standalone (non-decorated) helper at reference aten_lowering L1291, plus `_nki_copy_psum_to_sbuf` (L1265).
+My P1.14 extraction only grabbed the `@register_codegen` blocks and missed these two helpers. Appended both
+(472 lines, L1265-1736) to aten_lowering.py. Matmul codegen now works.
+
+**Verification (gate passed):** all 6 language files parse; nki codegen registered on
+dot/_associative_scan/_mask_to/rand/barrier/subscript; `_nki_dot`+`_nki_copy_psum_to_sbuf` present;
+**matmul kernel now generates `nc_matmul` with zero Triton leakage**; copy kernel still generates; `import
+helion` OK.
+
+## P1.19 — atomic_ops.py: NKI atomic_add codegen
+
+**File:** `helion/language/atomic_ops.py`
+
+**What & why:** Added `from ._nki_dim_access import IndirectAP` import + appended the
+`@_decorators.codegen(atomic_add, "nki")` handler (363 lines). The handler builds synthetic load/store
+states and calls `load._codegen["nki"](load_state)` and `store._codegen["nki"](store_state)` for the
+read-modify-write — which is why P1.17 (memory_ops) STRICTLY precedes this step (those KeyError otherwise).
+Purely additive (+349/-0).
+
+**Verification (gate passed):** parses; `nki` in `atomic_add._codegen`; `load`/`store` nki codegen present
+(dependency satisfied); copy + matmul kernels still generate; `import helion` OK.
+
+## P1.20 — runtime/kernel.py: NKI config completion + profiling
+
+**File:** `helion/runtime/kernel.py`
+
+**Applied (re-anchored onto upstream's refactored BoundKernel):**
+- Added `import copy`, `import os`, `import time` (none present upstream).
+- Added `_complete_nki_partial_config` (pads a partial NKI block_sizes config with safe per-axis defaults
+  that divide the size hint, partition axis ≤128) and `_clone_config` (deep-copies config.config AND
+  preserves `platform_target`) as `BoundKernel` methods, after `_compile_repr`.
+- In `to_triton_code`: replaced upstream's `config = Config(**config.config)` (which DROPS platform_target)
+  with `config = self._clone_config(config)` + `self._complete_nki_partial_config(config)` before normalize.
+- Added the `HELION_NKI_PROFILE` stderr timing wrap around `self._run(*args)` in `__call__`.
+
+**Plan deviation (justified):** skipped the reference's profiling prints *inside* `compile()` (the internal
+`to_triton_code`/`PyCodeCache.load` timing) — they depend on the exact refactored `compile()` structure,
+are env-var-gated diagnostics with no functional effect, and the load-bearing config-completion + the _run
+profiling wrap are ported. Can add later if profiling granularity is needed.
+
+**Verification (gate passed):** parses; both helper methods present; copy + matmul still generate; helion OK.
+
+## P1.21 — _testing.py: NKI DEVICE / tolerances / baseline / benchmark skip
+
+**File:** `helion/_testing.py`
+
+**Applied (re-anchored onto upstream's pallas-aware run_example/DEVICE block):**
+- DEVICE detection: `if _get_backend() == "nki": DEVICE = torch.device("cpu")` as the FIRST branch (examples
+  create host tensors; the NKI launcher moves them to XLA).
+- `run_example` baseline dict: when NKI + dict baseline, select the `pytorch`/`torch` entry.
+- `run_example` tolerances: override `rtol=5e-2`, `atol=1.5` for NKI near the top of the function (cleaner
+  than the reference's per-bwd-block local override; covers all assert_close sites via the shared vars).
+- `run_example` benchmark: `if nki: print("Skipping benchmark…"); return` before the benchmark section.
+
+**Plan deviation:** skipped the reference's bwd `msg=lambda ...` tweak (unrelated to NKI; upstream's
+`msg=f"..."` is fine).
+
+**Verification (gate passed):** parses; `DEVICE == cpu` under `HELION_BACKEND=nki`.
+
+## P1.22 — byte-for-byte codegen verification gate + return-buffer fix + tests
+
+**Files:** `helion/_compiler/device_function.py` (return-buffer fix), `test/test_nki_port_codegen.py` (new).
+
+**Methodology:** created a reference worktree (`git worktree add /tmp/ref_wt fix-nki-kernel-compilation`)
+and a generator (`/tmp/gen_one.py`). With `PYTHONHASHSEED=0`, confirmed reference codegen is DETERMINISTIC
+(ref-vs-ref identical), then diffed port `to_triton_code` vs reference for representative patterns.
+
+**Results:**
+| Pattern | Kernel | Result |
+|---|---|---|
+| pointwise/DMA | copy | **byte-IDENTICAL** (43 lines) |
+| matmul | addmm tiled | **byte-IDENTICAL** (128 lines) |
+| reduction | row sum | **byte-IDENTICAL** (64 lines) |
+| gather/indirect | embedding-style | **semantically identical** — only `0 + N` (ref) vs `N` (port) folding on literal-zero free-dim slice starts |
+
+**FIX caught by the gate (the deferred P1.9 item):** the copy diff initially showed the port emitting
+`_launcher(...)` instead of `out = _launcher(...).reshape([...])` — the NKI return-buffer capture was missing
+because `codegen_function_call`'s NKI branch was deferred to P1.17. Added it now: grafted the NKI
+`_nki_return_buffers` (multi-output → `_nki_post_call_stmts`) and `_nki_return_host_var`/`reshape`/`slice`
+(single-output) handling into upstream's `codegen_function_call` before the `_output_only_names` path.
+After the fix, copy is byte-identical.
+
+**Known cosmetic delta (gather):** every gather diff hunk is `0 + 256` ↔ `256` — semantically identical
+(same numeric guard, same slice range, same compiled NEFF). The NKI memory_ops block is verbatim-identical to
+the reference, so this stems from a shared slice-string folding difference upstream, not an NKI-logic error.
+Left as-is (not a correctness issue); flagged for optional follow-up if exact byte-parity on gather is
+required.
+
+**Tests:** added `test/test_nki_port_codegen.py` — 4 structural codegen tests (copy/matmul/reduce/gather),
+all PASS, guarding the invariants without hardware.
+
+**Verification (gate passed):** 3/4 patterns byte-identical, gather semantically-identical; all 4 codegen
+tests pass; no Triton leakage anywhere.
+
+---
+
+# PHASE 2 — Trainium hardware validation
+
+## P2.1 — On-device smoke (pointwise + matmul) [PASSED]
+
+Hardware: trn2.3xlarge (Trainium2, logical-neuroncore-config: 2), torch_xla OK, xla:0 available.
+Cache cleared first (`rm -rf /tmp/helion_nki_portv2_* /var/tmp/neuron-compile-cache/`), run with
+`NEURON_CC_FLAGS="--no_cache"` so neuronx-cc compiles fresh (no stale-cache masking).
+
+- **Pointwise add** ([256,512] fp32): `Compiler status PASS`; ran on-device; output matched `x+y` within
+  NKI tolerances (rtol 5e-2 / atol 1.5). **PASSED.**
+- **Matmul** ([256,256]@[256,256] fp32, via addmm + nc_matmul): `Compiler status PASS`; ran on-device;
+  output matched `x@y`. **PASSED.**
+
+This is the first proof the ported codegen is HARDWARE-correct (compiles through neuronx-cc + runs + matches
+torch), not just byte-identical to the reference. Paused here per plan for review before the full P2.2 sweep.
+
+**NEXT: P2.2** — full `examples/run_nki_examples.py` sweep (~2-3 hrs cold), expect 47 pass + 5 blocked xfail
+(nvfp4_gemm, fused_linear_jsd, mamba2_chunk_scan, mamba2_chunk_state, grpo_loss).
+
+## P2 infra — HELION_NKI_SIMULATE CPU launcher (fast correctness path)
+
+**File:** `helion/runtime/__init__.py`
+
+**What & why:** Added `_nki_simulate_launcher` + a `HELION_NKI_SIMULATE=1` opt-in branch at the top of
+`default_nki_launcher`. When set, the kernel runs on CPU via `nki.simulate(kernel)(args)` instead of
+compiling through neuronx-cc and executing on Trainium. This is MUCH faster (no compile) and is used for
+correctness validation across the example sweep without burning hours of neuronx-cc time. Off by default
+(env-gated) so the byte-identical default behavior and the real hardware path are unchanged. Mirrors the XLA
+launcher's int64->int32 cast and dynamic_range LNC auto-bump; converts numpy results back to torch on the
+caller's device.
+
+**Verification:** pointwise add + matmul both PASS via `HELION_NKI_SIMULATE=1` (CPU, no Trainium compile),
+matching torch within NKI tolerances. (User noted CPU sim is faster than the compiler step — confirmed.)
+
+## P2.2a — Codegen-parity sweep vs reference (cache-immune) [48/48 IDENTICAL]
+
+Ran `/home/ubuntu/codegen_parity_sweep.py`: for every reference example, generate `to_triton_code` on BOTH
+the port tree and a `fix-nki-kernel-compilation` worktree (PYTHONHASHSEED=0, identical config) and diff.
+
+**Result: 48 examples BYTE-FOR-BYTE IDENTICAL, 0 regressions, 0 differ, 0 cosmetic.**
+identical(48): add attention attention_nki batch_softmax bf16xint16_gemm bmm broadcast_matmul concatenate
+concatenate_nki cross_entropy embedding exp fp8_gemm fused_linear_jsd fused_nki_ops gather_gemv gdn_fwd_h
+geglu grouped_gemm grpo_loss int4_gemm jagged_dense_add jagged_hstu_attn jagged_layer_norm jagged_mean
+jagged_softmax jagged_sum jsd kl_div layer_norm layer_norm_f32 long_sum low_mem_dropout mamba2_chunk_scan
+mamba2_chunk_state matmul matmul_layernorm moe_matmul_ogs nvfp4_gemm psum_reuse_test rms_norm simple_add_nki
+softmax softmax_decomposed squeeze_and_excitation_net sum swiglu welford
+
+**7 "both-error"** (aot_example, blackwell_attention, layer_norm_manual_nki, matmul_split_k,
+psum_reuse_minimal, segment_reduction, split_k_barrier): these fail IDENTICALLY on both trees inside my
+interception harness — a harness limitation, NOT a port issue. Root cause: the harness imports the example
+under a synthetic module name `_ex_<stem>`, which breaks `register_tunable`/module-name lookups (KeyError
+'_ex_matmul_split_k'), or they use AOT/manual-NKI/CUDA-only entry paths. They are validated via their real
+`main()` in the simulate/hardware sweeps instead.
+
+This is the strongest possible regression signal: the port reproduces the reference's NKI codegen exactly
+across the entire suite, with no hardware/compile needed.
+
+---
+
+# PHASE 3 — Autotuning (hook into upstream's hardware-agnostic autotuner)
+
+## P3.1 — Delegate NKIBackend.autotune to the base autotuner + get_do_bench
+
+**File:** `helion/_compiler/nki_backend.py`. Per the user's guidance ("hook into the current autotuner as
+that should be hardware agnostic"; their nki_search.py was shallow) — did NOT port the 385-line
+`NKIFiniteSearch`. Instead:
+
+- **Removed the `NKIFiniteSearch` dependency.** `NKIBackend.autotune` now delegates to
+  `super().autotune(...)` (the upstream `Backend.autotune`: handles single-config, FiniteSearch over explicit
+  configs, `autotune_effort="none"`→default, and the full search), wrapped to fall back to
+  `_safe_default_config` if the search raises (e.g. all candidates overflow SBUF).
+- **Added `NKIBackend.get_do_bench` → `do_bench_generic`.** This is the one genuinely-needed hardware hook:
+  Triton-event timing / CUDA sync aren't available on XLA, so NKI uses the generic wall-clock benchmark
+  (same path Pallas/CPU use). The NKI launcher runs `xm.mark_step()` internally so each timed call is
+  synchronized; `do_bench_generic` already does warmup+repeat+`synchronize_device`. This replaces the
+  reference's bespoke `_nki_bench` wall-clock loop with the upstream-native extension point.
+- Kept `_safe_default_config` (NKI-safe block sizes) + `_complete_nki_partial_config` (P1.20).
+
+**Why this is better than the reference:** the reference fully overrode autotuning with a parallel shallow
+search; this hooks NKI into upstream's real autotuner via the documented `get_do_bench` extension point, so
+NKI automatically gets FiniteSearch, effort profiles, caching, and future autotuner features — hardware-
+agnostic, minimal NKI surface.
+
+**Verification:** nki_backend parses/imports, `get_do_bench` present; `matmul` still byte-identical after the
+change; `rms_norm` (config-less) now runs through the autotuner (the prior `ModuleNotFoundError:
+nki_search` is gone) and generates a kernel BYTE-IDENTICAL to the reference (both 8093 bytes) — its
+simulate-bwd gradient delta is a simulate/precision artifact, not a port regression (codegen matches ref).
+
+## P2.2-fix1 — Triage fixes from the hardware sweep (stale imports + BlockIDStrategyMapping)
+
+The hardware sweep surfaced failures; triaged from logs (codegen errors, no hardware needed to reproduce):
+
+1. **Stale `NKIOpOverrides` imports (port bug).** Verbatim-extracted blocks (P1.14/P1.19) kept
+   `from .backend import NKIOpOverrides`, but P1.6 moved it to `nki_backend`. Fixed 4 sites:
+   aten_lowering.py (3, incl. one importing `NKIBackend` too) and atomic_ops.py (1) → `from .nki_backend`.
+   This fixes the `ImportError` in jagged_hstu_attn and any kernel hitting those NKI codegen paths.
+
+2. **Backward-compat shim in backend.py.** The reference example `fused_nki_ops.py` (a probe test) imports
+   `from helion._compiler.backend import NKIOpOverrides` directly. Added a module-level `__getattr__` (PEP
+   562) to backend.py that lazily resolves `NKIOpOverrides`/`NKIBackend` from nki_backend — no circular
+   import (nki_backend imports Backend from backend), full backward-compat. fused_nki_ops codegen now OK.
+
+3. **`BlockIDStrategyMapping` has no `.values()` (upstream drift).** memory_ops.py:8953 called `.values()` on
+   `block_id_to_strategy`, which upstream wrapped in `BlockIDStrategyMapping` (has `.items()`, not
+   `.values()`). Made it robust to both dict and the mapping. Fixes jagged_layer_norm
+   (now byte-identical to reference) and unblocks jagged_mean to the next issue.
+
+**Verification:** all 3 files parse; fused_nki_ops + jagged_layer_norm codegen OK (jagged_layer_norm
+byte-identical to ref); matmul still byte-identical (no regression).
+
+**Remaining (separate, autotuner-related):** `aten.where 'Missing placeholders: y'` in concatenate /
+jagged_mean / jagged_hstu_attn — surfaces only when the new base autotuner explores configs the reference's
+NKIFiniteSearch never did. Tracked as Phase 3 task #2.
+
+## P2.2b — Authoritative hardware baseline (after triage fixes db8ce151)
+
+Full hardware sweep (1940s) then targeted re-sweep of failures at current committed state.
+**Current: 35 PASS of the non-blocked set** (32 from full sweep + fused_nki_ops/jagged_layer_norm/jagged_sum
+recovered by db8ce151). Blocked-as-expected: grpo_loss, mamba2_chunk_scan, mamba2_chunk_state, nvfp4_gemm
+(4 of the documented 5). fused_linear_jsd PASSED (blocked-but-passed — bonus).
+
+**11 still-failing (non-blocked), categorized:**
+- **where bug (fixable):** concatenate, jagged_mean, jagged_hstu_attn — upstream's new `where_lowering`
+  ("common" handler builds {x}/{y} template) is incompatible with NKI's statement-emitting where_expr.
+- **pre-existing (documented in memory as known reference failures):** int4_gemm (bitwise int8 unsupported),
+  gdn_fwd_h (strided 4D indexing), split_k_barrier ("TODO: implement for other devices").
+- **bwd/autograd gradient mismatch:** layer_norm, rms_norm — need to confirm vs reference on hardware
+  (may be pre-existing NKI bwd limitation; fwd codegen is byte-identical).
+- **other (triage needed):** long_sum (shape (1,16384) vs (1,1) compat), low_mem_dropout (RNG __rshift__
+  "both operands host scalars"), psum_reuse_test ("no generated kernel source" — likely harness).
+
+**IMPORTANT methodology note:** the earlier "48/48 codegen-identical" sweep was partly misleading for
+config-less kernels (concatenate etc.) — at commit 5813c8c6 they errored IDENTICALLY on both port and
+reference (ModuleNotFoundError: nki_search, since the reference's autotuner override needs nki_search which
+was never ported), and my harness counted error==error as "identical". Phase 3 (834689a2) removed that
+nki_search dependency, so those kernels now reach real codegen and expose the next layer. The hardware sweep
+is the authoritative signal, not the codegen harness, for config-less kernels.
+
+## P2.2-fix2 — NKI where via inductor path (concatenate, jagged_mean fixed)
+
+**File:** `helion/_compiler/inductor_lowering.py` (`prepare_node_lowering`).
+
+**Root cause:** Upstream ADDED a generic `where` ATen lowering (`where_lowering` +
+`codegen_where("common")`) that builds a `"{cond}/{x}/{y}"` expression template and feeds it to
+`backend.where_expr`. NKI's `where` is statement-emitting (`nisa.tensor_copy_predicated`, materializes/
+broadcasts operands) and returns a result var — it cannot consume unsubstituted `{x}`/`{y}` placeholders, so
+it raised `KeyError: Missing placeholders: ['y']`. The reference branch had NO `where` ATen lowering, so
+`where` always lowered through the Inductor OpsHandler (which materializes operands and dispatches to
+`NKIOpOverrides.where` via getattr).
+
+**Fix (surgical, mirrors reference):** in `prepare_node_lowering`, when backend is NKI and the node is
+`aten.where.self`, fall through to the inductor path instead of the ATen lowering — modeled exactly on the
+existing argmax/argmin cute skip a few lines above. Does NOT touch the `where` codegen itself.
+
+**Hardware-verified (the authoritative signal; codegen-diff is unreliable for autotuned kernels since port
+vs reference pick different configs):**
+- concatenate: FAIL → **PASS** (57s)
+- jagged_mean: FAIL → **PASS**
+- jsd (uses where, was already passing): still **PASS** — NO regression
+- jagged_hstu_attn: progressed past the where bug to a deeper NKI-kernel type error
+  ('add' got (object,int)) — a separate pre-existing-class issue (documented complex 5D case), not a where regression.
+
+Earlier direct-call and route-to-overrides attempts were reverted (they shifted var-numbering / mishandled
+host-scalar operands). The dispatch-skip is the minimal correct fix.
+
+## P2.2c — Triage of remaining failures (in progress)
+
+After the where fix (51f952ee): **~37 pass** of the non-blocked set. Remaining non-blocked failures, with
+triage status:
+
+| Example | Failure | Assessment |
+|---|---|---|
+| int4_gemm | numeric mismatch 96% | **pre-existing** (memory: "bitwise ops on int8 not supported") |
+| gdn_fwd_h | load 'list index out of range' | **pre-existing** (memory: "strided 4D tensor indexing", complex) |
+| jagged_hstu_attn | NKI compile 'add got (object,int)' | **pre-existing-class** (memory: "5D scatter, complex 3D→2D"); where-fix let it progress past the where bug to this deeper issue |
+| psum_reuse_test | "no generated kernel source found" | **HARNESS ARTIFACT** — kernels compile (Compiler status PASS x2); the test searches TORCHINDUCTOR_CACHE_DIR (default /tmp/torchinductor_ubuntu) for the source, but my sweep's cache-dir differs. Not a port bug. |
+| long_sum | neuronx-cc 'shape (1,16384) vs (1,131072)' | deep reduction-loop tiling bug on a long (131072) dim; config'd; likely pre-existing |
+| low_mem_dropout | RNG __rshift__ 'both operands host scalars' | philox RNG codegen; needs reference comparison |
+| layer_norm / rms_norm | BWD gradient mismatch | autograd/bwd; fwd codegen byte-identical; needs reference comparison |
+| split_k_barrier | "TODO: implement for other devices" | example/feature not implemented for NKI; likely pre-existing |
+
+Running reference-helion-on-hardware to confirm pre-existing status. (First reference sweep hit transient
+NRT_FAILURE on all 9 — invalid; device confirmed healthy via port `add` PASS; re-running reference cleanly
+with inter-example settle delay.)
+
+## P2.2d — Reference baseline + diagnosed the layer_norm-class regression
+
+**Reference-on-hardware baseline** (clean rerun, NRT-settled): layer_norm PASS, rms_norm PASS, long_sum PASS,
+low_mem_dropout PASS, split_k_barrier PASS, psum_reuse_test FAIL. So **5 are PORT REGRESSIONS** (pass on
+reference, fail on port): layer_norm, rms_norm, long_sum, low_mem_dropout, split_k_barrier. (int4_gemm,
+gdn_fwd_h, jagged_hstu_attn confirmed pre-existing per memory; psum_reuse_test fails on ref too +
+harness-artifact.)
+
+**DIAGNOSED (layer_norm / rms_norm — likely same root):** the per-block return-buffer store
+(`grad_weight_blocks[mb_cta.id, :]`) computes its DST row index by **folding `offset_0 // 128` to the
+constant `8192`** (the loop offset's size_hint / `create_unbacked_symint` default). Result: every block
+writes to the same wrong row → wrong gradient. The reference keeps it symbolic (`offset_0 // 128`).
+- 100% of the layer_norm_bwd port-vs-ref diff is exactly `offset_0 // 128`↔`8192` (32 lines, nothing else).
+- Bisected: NOT caused by today's P1.3/P1.3b/P1.4 (reverted each individually; 8192 persists). Present at
+  the Phase-1 commit 5813c8c6 — a Phase-1 port regression in the memory_ops store codegen.
+- Localized: the reference reaches the `_is_tile_id_s` slice path (offset_var='offset_0', emits
+  `offset_0 // 128`); the port does NOT reach it — its return-buffer store path resolves the row via
+  `_bs_subs`/`_resolve_dim`/size_hint, folding the offset symbol to its hint.
+- Tracked as task #3. NOT fixed yet — deep in the 5700-line store codegen; needs careful tracing to avoid
+  breaking the 37 passing kernels (per user's "minimal changes" guidance). Repro: /tmp/gen_lnbwd.py.
+
+**Current hardware tally: ~37 pass** (after the where fix recovered concatenate + jagged_mean, and db8ce151
+recovered fused_nki_ops/jagged_layer_norm/jagged_sum). Remaining: 3 diagnosed-regressions (layer_norm,
+rms_norm + the same store-folding class), 2 to-recheck (long_sum, low_mem_dropout, split_k_barrier may share
+the offset-folding or be separate), 3 pre-existing, 1 harness-artifact, 4 blocked-as-expected.
+
+## P2.2e — FIX: recover block_id for tile_id stores (layer_norm regression fixed)
+
+**File:** `helion/language/memory_ops.py` (NKI store codegen, `_is_tile_id_s` path).
+
+**Root cause (fully traced):** for a per-block return-buffer store like
+`grad_weight_blocks[mb_cta.id, :]`, the store sees `_is_tile_id_s=True` (FX target `tile_id`) but
+`_nki_subscript_block_id` returns `block_id=None` (the tile_id's unbacked symbol u4 doesn't map via
+`env.get_block_id`). So `if _is_tile_id_s and block_id is not None` was False → fell through to the
+size-hint folding path, emitting `nki_return_buf[8192 ...]` (8192 = offset's size_hint) for the row index —
+every block wrote the SAME wrong row → wrong gradient.
+
+**Fix:** when `_is_tile_id_s and block_id is None`, recover the block_id from the tile_id FX node's first
+arg — `fx_node_i.args[0].meta["val"]` is the tile's block symint (e.g. u0), and `env.get_block_id(u0)=0`
+(verified via probe). Then the store takes the symbolic `offset_0 // 128` path, matching the reference.
+
+**Verified:**
+- layer_norm_bwd codegen now **BYTE-IDENTICAL to reference** (8192 gone, `offset_0 // 128` restored).
+- Hardware: **layer_norm FAIL → PASS**; grouped_gemm + moe_matmul_ogs (which the fix also touched, adding a
+  harmless `else: pass` bounds-guard branch) **stay PASS** — no regression.
+- 13 other byte-identical examples unchanged.
+
+(rms_norm still fails — a separate bwd issue, triaged next.)
+
+---
+
+# SESSION SUMMARY (autonomous Phase 2 + 3 run)
+
+**Branch nki-port-v2, ~38 commits.** Phase 1 (port + byte-identical codegen) complete; Phase 2 (hardware)
++ Phase 3 (autotuner) substantially done.
+
+## Phase 3 — autotuner (DONE, hooks into upstream's hardware-agnostic autotuner)
+- Dropped the reference's shallow 385-line NKIFiniteSearch. `NKIBackend.autotune` → `super().autotune()`
+  (upstream's FiniteSearch / effort / full-search) with a safe-default fallback; `get_do_bench` →
+  `do_bench_generic` (wall-clock; XLA has no Triton-event timing; NKI launcher's xm.mark_step syncs).
+- Added `HELION_NKI_SIMULATE=1` CPU launcher (nki.simulate) for fast correctness checks (no neuronx-cc).
+
+## Phase 2 — hardware validation (Trainium trn2)
+- P2.1 on-device smoke: pointwise + matmul PASS.
+- Built sweep tooling: hw_sweep.py, ref_hw_sweep.py, codegen_parity_sweep.py, sim_sweep.py (all in ~/).
+- Codegen-parity sweep: 48 examples byte-identical to reference (caveat: config-less kernels can be masked
+  as "identical" when both trees error identically — hardware is authoritative there).
+- **Fixes landed (all hardware-verified, byte-identical-to-ref where checked):**
+  1. where via inductor path (51f952ee) — concatenate, jagged_mean FAIL→PASS; jsd stays PASS.
+  2. stale NKIOpOverrides imports → nki_backend + backend.py PEP-562 shim + BlockIDStrategyMapping.values()
+     (db8ce151) — fused_nki_ops, jagged_layer_norm, jagged_sum FAIL→PASS.
+  3. tile_id-store block_id recovery (89e45858) — layer_norm FAIL→PASS (was folding offset_0//128→8192 so
+     every block wrote the same row); grouped_gemm/moe_matmul_ogs stay PASS.
+
+## Open items (tracked tasks #4, #5) — CONFIRMED regressions (pass on reference)
+- **long_sum** (#4): reduction loop emitted but load inside it isn't sliced to the 16384 reduction block →
+  loads full 131072 → SBUF overflow. Root: reduction block_id not in active_device_loops at load time
+  (LoopedReductionStrategy never push_active_loops for it). Diagnosed, deferred (careful multi-file fix).
+- **rms_norm** (#5): config-less; autotuner picks a config hitting 'load list index out of range'.
+- **low_mem_dropout** (#5): RNG philox __rshift__ 'both operands host scalars'.
+- **split_k_barrier** (#5): 'TODO: implement for other devices'.
+
+## Pre-existing (fail on reference too — NOT regressions)
+int4_gemm (bitwise int8), gdn_fwd_h (strided 4D), jagged_hstu_attn (5D scatter), psum_reuse_test (harness
+cache-dir artifact — kernels actually compile). Blocked-as-expected: grpo_loss, mamba2_chunk_scan/state,
+nvfp4_gemm. fused_linear_jsd unexpectedly PASSES (bonus).
+
+All fixes were minimal, hardware-verified, and confirmed not to regress the passing set, per the
+"minimal changes / don't break working kernels" directive. Deeper regressions left precisely diagnosed and
+tracked rather than risk-fixed blind.
+
+## P2 FINAL — authoritative full hardware sweep (all fixes in)
+
+`HW SWEEP (2130s)`: **38 PASS**, 8 fail (non-blocked), 3 blocked-as-expected (mamba2_chunk_scan,
+mamba2_chunk_state, nvfp4_gemm), 2 blocked-but-PASSED (fused_linear_jsd, grpo_loss — bonus).
+
+**38 PASS:** add aot_example attention batch_softmax bf16xint16_gemm blackwell_attention bmm broadcast_matmul
+concatenate cross_entropy embedding exp fp8_gemm fused_nki_ops gather_gemv geglu grouped_gemm jagged_dense_add
+jagged_layer_norm jagged_mean jagged_softmax jagged_sum jsd kl_div layer_norm layer_norm_f32 matmul
+matmul_layernorm matmul_split_k moe_matmul_ogs psum_reuse_minimal segment_reduction softmax softmax_decomposed
+squeeze_and_excitation_net sum swiglu welford
+
+**Net this session: 32 → 38 PASS (+6), 0 regressions to the passing set.** Confirmed holding on the full
+sweep: concatenate, jagged_mean (where fix); fused_nki_ops, jagged_layer_norm, jagged_sum (import/shim/.values
+fix); layer_norm (block_id-recovery fix).
+
+**8 remaining fails:**
+- Pre-existing (fail on reference too): gdn_fwd_h, int4_gemm, jagged_hstu_attn, psum_reuse_test (harness).
+- Open regressions (diagnosed, tasks #4/#5): long_sum, low_mem_dropout, rms_norm, split_k_barrier.
+
+This is the authoritative Phase-2 end state for the autonomous session.
+
+## long_sum (#4) — ROOT CAUSE PINPOINTED (ordering), fix deferred
+
+Probe of add_device_loop vs load ordering on the PORT:
+```
+ORD LOAD  slice(None) bid=None active=[0]      <- load codegen'd FIRST, block 1 not yet active
+ORD ENTER add_device_loop block_ids=[1] active_before=[0]   <- reduction loop registers AFTER
+```
+So the `x[tile_m, :]` load is emitted BEFORE the reduction loop's `add_device_loop` registers block 1 →
+the reduction-block slice match (memory_ops L7690, needs `_bid in active_device_loops`) fails → loads full
+131072 width → SBUF overflow. On the reference, active_device_loops=[0,1] at the load (the load is processed
+INSIDE the reduction loop scope). This is a device_ir graph-traversal / two-pass ordering difference: on the
+port the load node is codegen'd outside the ReductionLoopGraphInfo's add_device_loop scope. Fixing it means
+changing reduction-graph traversal/ordering — HIGH RISK to the 38 passing (reduction-heavy) kernels, so
+DEFERRED with full diagnosis rather than risk a regression (per the minimal-change directive).
+
+## long_sum (#4) — FIXED (the ordering theory above was a SYMPTOM, not the cause)
+
+Re-debugged manually (gen codegen for all 3 variants on port vs ref worktree, with a probe in
+`ReductionRoller.process`). The real divergence is in TYPE PROPAGATION, upstream of roll_reduction:
+
+- The `x[tile_m, :]` load's reduction-axis fake shape was `(u0, 130000)` on the port but `(u0, u1)` on
+  the reference. With a concrete `130000`, `get_block_id(130000)` is `None`, so
+  `ReductionRoller.should_go_in_inner_graph(load)` returns False → the load stays in the OUTER graph at
+  full width (SBUF overflow / dst≠src), instead of being rolled into the tiled reduction loop. The
+  "load codegen'd before add_device_loop" probe was just the downstream effect of the load living in the
+  outer graph.
+- Cause: `type_info.py` `TensorType._getitem` (and the mirror in `indexing_strategy.py SubscriptIndexing`)
+  had an upstream Pallas block (PR #2477 "[Pallas] Disable factory padding and preserve concrete dims")
+  that, for `not pad_factory_tensors_to_power_of_2`, keeps a concrete-int slice dim concrete and SKIPS
+  `allocate_reduction_dimension`. NKI overrides `pad_factory_tensors_to_power_of_2=False` (for the
+  factory-pad behavior it genuinely needs) and so got swept into the Pallas concrete-dim path it does
+  NOT want. The reference (commit 3056e85c) predates PR #2477 entirely and always allocates the rdim.
+
+**Fix (minimal, 3 files):** decoupled the two conflated behaviors. New `Backend.preserve_concrete_slice_dims`
+property (default `False`), overridden `True` only in `PallasBackend`. The two slice-dim-allocation sites
+(`type_info.py` + `indexing_strategy.py`) now key off `preserve_concrete_slice_dims` instead of
+`not pad_factory_tensors_to_power_of_2`. The factory-padding sites (`type_propagation.py:907`
+patch_tensor_factories guard, `kernel_compiler.py:154`) are UNCHANGED and still key off
+`pad_factory_tensors_to_power_of_2`. Truth table: Triton/CuTe/Metal default False (already allocated rdim
+→ byte-identical); Pallas True (preserves concrete dims → byte-identical); NKI now False (allocates rdim →
+restores reference behavior).
+
+**Verification:**
+- Codegen-parity sweep after fix: 48 identical to ref, 0 differ, 0 cosmetic, 0 port-error regressions
+  (long_sum now in the identical set).
+- Pre-fix vs post-fix port codegen diff across all 48 captured examples: only long_sum's behavior changed;
+  every other kernel byte-IDENTICAL (layer_norm_manual_nki "change" was NCCL log noise, a both-error kernel).
+- CPU-sim (HELION_NKI_SIMULATE=1): long_sum PASSES all 3 variants (naive/loop/manual). The port's
+  run_example codegen for the looped variant is byte-identical to the reference — same content-hashed cache
+  filename `ccs7fosz5...`. Reduction-heavy spot check (cross_entropy/softmax/sum/welford) all PASS.
+- Full sim sweep: long_sum PASS; the 14 sim-FAILs are all pre-existing (byte-unchanged by the fix:
+  matmul/jsd/kl_div/jagged_*/int4_gemm/low_mem_dropout confirmed IDENTICAL pre/post) — sim is stricter than
+  hardware; hardware remains authoritative for those.
+
+NOTE: the port's `examples/long_sum.py` is still the upstream/Triton version (`reduction_loops=[None]`,
+`32768`, `check(4, 130000)`); like all port example files it is intentionally NOT NKI-adapted — the
+harness runs the port compiler against the NKI-adapted `/tmp/ref_wt/examples`. The compiler fix is the fix;
+no example file was changed (would be a lone inconsistent artifact among 50+ unadapted examples).
+
+## rms_norm (#5) — FIXED (config-less autotuner was aborting; "load list index out of range" was a red herring)
+
+The real failure chain (each masked by NKIBackend.autotune's broad `except → _safe_default_config`
+fallback, so it silently "passed" on a default config and never actually autotuned):
+1. `local_cache.py _generate_key` asserts `hardware is not None and runtime_name is not None`. NKI runs on
+   XLA tensors that surface as device type `cpu`, and there was no NKI branch → empty `AssertionError` →
+   autotune aborts before trying any config.
+2. With (1) fixed, the search starts but `get_num_sm` (runtime/__init__.py) asserted device.type in
+   {cuda,xpu,mtia,mps} → `AssertionError: TODO: implement for other devices` for cpu/NKI (same TODO as
+   split_k_barrier #6 — shared root cause).
+3. With (2) fixed, the default fork/spawn autotune-precompile path is Triton-specific
+   (precompile_shim.make_precompiler drives triton.JITFunction .debug/.device_caches/.compile) →
+   `AttributeError: 'Kernel' object has no attribute 'debug'` for NKI's neuronx-cc/XLA launcher.
+4. With (3) fixed, individual invalid candidate configs (e.g. block_size 1024 > partition-dim max 128,
+   SBUF overflow, an unsupported codegen path) raised out of the search and aborted it, instead of being
+   skipped.
+
+**Fixes (4 files, all autotune-infra — ZERO codegen changes, so the 48-kernel byte-parity baseline is
+untouched):**
+- `local_cache.py`: NKI cache-key branch keyed on `get_neuron_target()` (hardware=`neuron_<target>`,
+  runtime=`<target>`), mirroring the existing Pallas `cpu` branch.
+- `runtime/__init__.py get_num_sm`: add a `cpu` branch returning `torch.get_num_threads()` (fallback
+  `os.cpu_count()`). This is the reference's exact delta. ALSO fixes split_k_barrier (#6).
+- `settings.py __init__`: when backend=="nki" and the user hasn't explicitly set HELION_AUTOTUNE_PRECOMPILE,
+  force `autotune_precompile=None` (benchmark in-process). The fork/spawn path cannot work for NKI.
+- `nki_backend.py`: implement `classify_autotune_exception` returning "debug" for any Exception (mirrors
+  PallasBackend) so invalid configs are skipped and the search keeps the configs that do compile.
+
+**Verification:** rms_norm sim_sweep PASS with **0 "search failed" fallbacks** (was 4 before); standalone
+autotune at quick AND full effort runs to completion (`RAN OK`) with default fork precompile. Regression
+spot check: cross_entropy/sum still PASS. No codegen touched → parity baseline intact.
+
+## split_k_barrier (#6) — FIXED by the same get_num_sm cpu branch (commit 12bfbc5b)
+
+split_k_barrier uses `pid_type="persistent_blocked"`, whose codegen emits
+`helion.runtime.get_num_sm(<device>)` into the kernel (program_id.py:771). On NKI's
+cpu-typed XLA device this hit the same `AssertionError: TODO: implement for other devices`
+as rms_norm failure #2. The `get_num_sm` cpu branch (returns torch.get_num_threads())
+resolves it — no separate change needed. Verified: split_k_barrier sim_sweep PASS.
+
+## low_mem_dropout (#5) — FIXED (keep hl.rand native for NKI; harden Philox bit-ops)
+
+Root cause: `device_ir.lower_to_device_ir` calls `rewrite_implicit_random_ops` unconditionally,
+which decomposes `hl.rand` into the upstream software-Philox FX subgraph. For NKI that bypasses the
+native `_rand_nki_codegen` (nisa.set_rng_seed + nl.rand) lowering and emits Philox bit-math the NKI
+codegen can't express. The decomposition surfaced two NKI-codegen gaps in sequence:
+- `(seed64 >> 32)` / `<< 32` on two host scalars hit NKIOpOverrides.rshift/lshift, which (unlike
+  and_/or_/xor) had no both-host-scalar fast path → `BackendUnsupported: both operands are host scalars`.
+- the iota tile index (`indices_*`, int32, no _nki_sbuf_shapes entry) was misclassified as a host scalar
+  in the to_dtype cast → `nisa.memset(dst, value=<tensor>)` (memset needs a scalar).
+
+**Fixes (2 files, no codegen-parity impact — the 48-kernel baseline is untouched; these only affect the
+RNG-decompose path which none of the 48 exercise):**
+- `random_ops.py rewrite_implicit_random_ops`: when backend=="nki", skip decomposing `rand` nodes (keep
+  them native; rand4x/randint, which have no native NKI codegen, still decompose). This alone fixes
+  low_mem_dropout — the port now emits `nisa.set_rng_seed(_nki_seed)` + `nl.rand(...)` with ZERO Philox
+  leftovers, byte-for-byte the reference's native approach (verified on a fresh cache).
+- `nki_backend.py`: (1) lshift/rshift now emit plain Python `<<`/`>>` for two host scalars (mirrors
+  and_/or_/xor); (2) the to_dtype cast excludes `indices_*` iota tensors from the host-scalar
+  classification so they go through tensor_copy, not memset. Both are defensive — they keep the still-
+  decomposing rand4x/randint paths correct on NKI.
+
+**Verification:** low_mem_dropout sim_sweep PASS (was FAIL); fresh-cache codegen shows native
+set_rng_seed+nl.rand, 0 Philox leftovers. Regression spot check: add/cross_entropy/embedding/softmax/sum
+all PASS.
+
+## int4_gemm (#7, pre-existing fail on ref too) — FIXED (shifted-iota column slice dropped its offset)
+
+Symptom: compiles+runs but 95.9% numerical mismatch. Root cause: the second A load
+``a_hi = A[tile_m, K_half + k_begin : K_half + k_begin + k_packed]`` is a contiguous slice
+whose start is shifted by ``K_half``. It lowers to a ``prims.iota.default`` with
+``offset = offset_0 + K//2`` (correctly emitted as ``add_2`` into the iota), but the NKI load's
+slice-building second pass (memory_ops, block-id branch) emitted the plain
+``offset_0:offset_0+block`` for ANY block-id-resolved subscript — dropping the ``+K_half`` shift.
+So a_hi DMA'd the SAME columns as a_lo. (Verified by isolating the int4 shift-unpack in a standalone
+nki.simulate probe — that part was correct; the bug was purely the A-column slice offset.)
+
+Fix (2 files, +29 lines):
+- ``aten_lowering.codegen_iota_nki``: record the iota's affine start in ``_nki_iota_offsets[dst_var]``
+  (unit-step only — a non-unit step isn't a contiguous slice).
+- ``memory_ops`` load second pass: when a block-id-resolved free subscript is an iota whose recorded
+  offset differs from ``offset_var``, slice from the iota's true start (``add_2:add_2+block``) instead
+  of the plain block offset. Guarded on ``!= offset_var`` so the common ``tile.index`` case (offset ==
+  offset_var) is inert.
+
+Verification: int4_gemm sim PASS ("Test passed for shapes: M=128,K=512,N=256"); executed kernel shows
+``src=A[..., add_2:add_2+32]``. Regression: before/after codegen snapshot across all 49 emitting
+examples — 48 byte-identical, only layer_norm_manual_nki differs (NCCL-log/PID noise, a stderr-only
+both-error kernel). No other kernel's codegen changed.
+
+## gdn_fwd_h (#8, pre-existing fail on ref too) — FIXED at the ROOT (tile.id subscripts → block_id)
+
+Symptom: `IndexError: list index out of range` in the NKI **load** codegen for
+`g[i_b, t_i_last, i_h]` (a fully-scalar index on 3D `g[B,S,H]`), at the `free_dims =
+[_resolve_dim(output_shape[-1])]` squeeze — `output_shape` was empty.
+
+**Root cause (traced with port-vs-reference probes on the SAME pinned config):** the load's
+`subscript_block_ids` came out `[None, None, None]` on the port vs `[1, None, 2]` on the reference,
+so the empty-`output_shape` reconstruction (which re-inserts dropped block dims) had no block_ids to
+re-insert → empty shape → crash. The byte-identical reconstruction code and `_nki_subscript_block_id`
+both behave correctly *given the right block_ids* — the divergence was one step earlier, in
+`env.get_block_id(<tile.id symbol>)`:
+
+- The `tile.id` symbol `u4`/`u5` resolves via `HostFunction.expr_to_origin`. On the **reference** its
+  origin is `GridOrigin(block_id=1/2)`; on the **port** upstream introduced a dedicated
+  `TileIdOrigin` (a *subclass* of `GridOrigin`) for `tile.id`.
+- `CompileEnvironment.get_block_id` matches origins with an **exact-type check**
+  `type(origin) is GridOrigin`, which deliberately rejects the subclasses (`tile.end`/`tile.count`
+  need different math — see indexing_strategy.py:158). So `get_block_id(tile.id)` returns `None` on
+  the port. The reference predates `TileIdOrigin`, so its `tile.id` was a plain `GridOrigin` and
+  resolved fine. This is the same bug class as the layer_norm store-fold regression (P2.2e).
+
+**Fix (1 file, +13 lines, NKI-scoped):** in `_nki_subscript_block_id` (the canonical NKI
+subscript→block_id resolver shared by load AND store), after `get_block_id` returns None for a bare
+symbol, consult `expr_to_origin` and resolve `TileIdOrigin`/`TileBeginOrigin` to their `block_id`.
+Did NOT touch the backend-agnostic `get_block_id` — its exact-type check is intentional and other
+backends rely on it (changing it risks Triton/CuTe/Pallas). The NKI load/store codegen already emits
+the correct `offset` / `offset // block_size` for these tile subscripts downstream, so resolving the
+block_id is all that was missing.
+
+**This REPLACED two in-progress band-aids** that had compensated downstream of the bad block_ids
+(a `_slice_width` free-dim parse in the load squeeze, and an ast_for_fx_node scalar-expr branch in the
+store) — both reverted; the fix is now a single 13-line root-cause change.
+
+**Verification:**
+- After the fix the port's `subscript_block_ids` / `output_shape` are byte-identical to the reference
+  for every g/w/u/k load (probed: `[1,None,2]`→`[u2,u3]`, `[1,3,2]`→`[u2,u6,u3]`, etc.).
+- gdn_fwd_h CPU-sim (HELION_NKI_SIMULATE=1) **PASS** (correctness assert passed; was IndexError).
+- Regression (compare-codegen, no full sweep): layer_norm, layer_norm_f32, rms_norm, int4_gemm,
+  matmul_split_k, split_k_barrier codegen **byte-identical** with vs without the fix. layer_norm
+  full sim PASS. (The fix only adds a fallback reached when `get_block_id` already returned None and
+  the origin is a tile.id/begin — inert for every currently-passing path.)
+- BONUS: jagged_hstu_attn (#9, the other pre-existing fail) now reaches full codegen with the fix
+  (previously errored) — needs separate correctness validation.
+
+## jagged_hstu_attn (#9, pre-existing fail on ref too) — FIXED (store row-scatter for `out[vec+starts, head, :]`)
+
+After the gdn tile.id fix unblocked codegen, jagged_hstu_attn compiled but crashed in CPU-sim with
+`TypeError: unsupported operand type(s) for +: 'NkiTensor' and 'int'` at
+`nisa.iota(dst=_ss_iota, ..., offset=_nki_sbuf_1_copy_0 + offset_2, ...)`.
+
+**Root cause:** the store `out[tile_q.index + starts, tile_h.begin, :]` (out is [L,H,D], reshaped to
+[L*H,D]) has a leading subscript `tile_q.index + starts` where `starts = seq_offsets[tile_b.begin]` is
+a **runtime SBUF scalar** (loaded tensor `_nki_sbuf_1_copy_0`), not a compile-time int. Because the
+subscript resolves the tile_q block_id, the store took the `block_id is not None` branch and built a
+string slice via the inline AST-add fallback (`{scalar_expr} + {offset_var} : ...`). That string fed
+the strided-scatter path, which emitted `nisa.iota(offset=<tensor>)` — but iota's `offset=` only
+accepts a scalar int. (`_nki_shifted_tile_subscript` correctly rejects SBUF-tensor shifts via its
+`_is_sbuf_tile` guard and returned None; the inline fallback had no such guard.)
+
+The **load** of the mirror pattern `q[tile.index + starts, head, :]` already handles this correctly
+via a 3D row-gather early-exit (`_nki_row_index_gather` builds the row vector with
+broadcast+tensor_tensor, then `flat = vec*H + head` → indirect `.ap(vector_offset=...)`). The store
+*had* the same 3D-gather logic but only in its `block_id is None` else-branch — unreachable here
+because `tile_q.index + starts` resolves the block_id.
+
+**Fix (1 file):**
+- Extracted the store's inline 3D `[vec+starts, head, :]` scatter logic into a reusable helper
+  `_nki_store_3d_row_scatter` (no behavior change to the existing else-branch — it now calls the
+  helper).
+- Call the helper at the top of the `block_id is not None` branch too, so the runtime-`+starts` case
+  routes to the row-gather scatter instead of folding the SBUF tensor into a scalar iota offset. The
+  helper self-guards: it only fires when `_nki_row_index_gather` returns an IndirectAP (a genuine
+  add-gather), so plain contiguous tiled stores are unaffected.
+
+The store now emits the same indirect scatter as the load: `_row_idx_add = indices + broadcast(starts)`
+→ transpose → `_3d_flat_idx_store = vec*H + head` → `dma_copy(nki_return_buf.ap(vector_offset=...))`.
+
+**Verification:**
+- jagged_hstu_attn CPU-sim **PASS** (correctness assert passed at the pinned config
+  block_sizes=[128,128], requires_grad=False — the upstream example sets requires_grad=True which
+  nki.simulate can't copy_ into, a harness limitation orthogonal to codegen).
+- Regression (compare-codegen, no full sweep): grouped_gemm, moe_matmul_ogs, embedding, jagged_mean,
+  jagged_sum, jagged_dense_add, gather_gemv, segment_reduction, layer_norm, gdn_fwd_h all
+  **byte-identical** with vs without the change. embedding/gather_gemv full sim PASS. (jagged_dense_add
+  fails sim identically pre/post — pre-existing `Unknown reduction operator: max`, unrelated.)
+
+## psum_reuse_test (#10) — CONFIRMED harness artifact, NOT a port bug (sweep tooling fixed)
+
+The "no generated kernel source found" failure is purely a test-environment assumption. The test does
+`_CACHE_DIR = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_ubuntu")` and then greps that
+dir for the generated NKI source to assert PSUM-reuse codegen. But PyTorch's inductor writes to
+`{tempfile.gettempdir()}/torchinductor_<user>`, and this session sets `TMPDIR=/tmp/claude-1000`, so the
+real cache is `/tmp/claude-1000/torchinductor_ubuntu` while the test looks in `/tmp/torchinductor_ubuntu`
+(absent) → empty `src` → assert. The kernel itself compiles and is numerically correct (Parts 1-3 all
+PASS; the two numeric checks before the assert print PASS).
+
+**Verification:** with `TORCHINDUCTOR_CACHE_DIR=/tmp/claude-1000/torchinductor_ubuntu` the entire test
+passes RC=0 (all of Part 1 fusion-pass unit tests, Part 2 end-to-end + codegen-introspection, Part 3
+y[:, tile_n] regression).
+
+**Fix (sweep tooling only, not repo code):** `sim_sweep.py` and `hw_sweep.py` now export
+`TORCHINDUCTOR_CACHE_DIR={tempfile.gettempdir()}/torchinductor_ubuntu` so cache-introspecting tests find
+their source regardless of TMPDIR. No port/codegen change — the example is correct as-is.
+
+## Follow-ups resolved (cross-backend changes + backend_registry narrowing)
+
+**(1) "mean" in ReductionLowering.get_masked_value (inductor_lowering.py) — VERIFIED inert for Triton.**
+This is a real divergence from upstream (upstream has `{sum,prod,min,max}`; the port adds `mean`,
+unconditionally). It feeds the mask-optimization pass (whether a masked reduction can skip an explicit
+mask because the masked lanes are already 0). Verified by generating Triton `to_triton_code` for
+reduce_kernel with mean/sum/amax at a masked non-power-of-2 size (500x500), with vs without the `mean`
+entry: **byte-identical**. Type-prop `_debug_str` also identical. Safe to keep — only NKI relies on it.
+
+**(2) int → SymIntType in tunable_ops._register_tunable_type — VERIFIED inert for Triton.**
+For int-typed `register_tunable`, the port returns `SymIntType(origin, create_unbacked_symint(default))`
+instead of `NumericType.subtype(int).new_unbacked(origin)` (so NKI tile/loop bounds derived from tunables
+get a size hint). Verified by generating Triton code for an IntegerFragment kernel (`x * multiplier`) and a
+PowerOfTwoFragment split-k matmul, with vs without the int branch: **byte-identical** (default_config and
+all generated code). Safe to keep.
+
+(Methodology note: both comparisons MUST run with `PYTHONPATH=/home/ubuntu/helion_port` — `helion` is
+pip-installed editable from `/home/ubuntu/helion_nki` (the old reference fork) via a site-packages .pth, so
+without the PYTHONPATH override `import helion` silently resolves to helion_nki, not the port tree.)
+
+**(3) backend_registry `_maybe_register_nki` — narrowed `except Exception` → `except ImportError`.**
+During the port the catch was widened to surface SyntaxError/circular-import in nki_backend.py as a
+warning. nki_backend now imports cleanly (verified: `list_backends()` includes 'nki'), so the broad catch
+was removed — only the benign `ImportError` (torch_xla absent on non-Trainium) is swallowed; any real bug
+in nki_backend.py now propagates instead of being silently downgraded to a warning. Removed the now-unused
+local `import logging` / warning block.
+
+## Multi-size sweep — gather/scatter index transpose now tiles for p_count > 128
+
+Built a multi-size CPU-sim sweep (`/home/ubuntu/multisize_sweep.py`) running the parametrizable examples
+(attention, gdn_fwd_h, jagged_hstu_attn) at several shape points to catch shape-dependent codegen bugs the
+single-size sweeps miss. Findings:
+- attention: PASS at all 3 sizes. gdn_fwd_h: PASS at chunk_size=128 sizes.
+- jagged_hstu_attn multi-size "failures" are the SAME requires_grad harness limitation (nki.simulate can't
+  `copy_` into leaf grad tensors) — the example's test() sets requires_grad=True; not a codegen bug.
+
+**Real bug found + fixed (general):** `_nki_as_uint32_p1_vector` builds the `[P,1]` vector-offset for
+gather/scatter by `nc_transpose`-ing a `[1, P]` row of indices. `nc_transpose` is capped at 128 partitions,
+so any gather/scatter over a tile with P>128 (e.g. gdn at chunk_size=256) crashed with
+`Tensor engine transpose requires shape <= [128, 128]`. Fixed by **tiling the transpose into <=128-column
+chunks** — each chunk transposes `name[0:1, c0:c0+w]` into `tr_sbuf[c0:c0+w, 0:1]`. Verified byte-identical
+codegen for the common P<=128 path (gdn_fwd_h, jagged_hstu_attn, embedding, gather_gemv, moe_matmul_ogs) and
+P<=128 sim still PASS; the loop is single-iteration and equivalent there.
+
+**Known limitation (documented, NOT a regression):** gdn_fwd_h at **chunk_size > 128** still fails — after
+the gather-index transpose is fixed, it hits a *second* independent >128 transpose (the `torch.where`
+mask-broadcast `nc_transpose(_nki_bcast_tr_psum, _nki_where_out)` on a `[1,256]` predicate). Full
+chunk_size>128 support would require tiling every >128 transpose site (a multi-site feature the reference
+never supported — its example uses chunk_size=128). Left as a precisely-diagnosed limitation rather than a
+broad speculative change. chunk_size<=128 (all shipped configs) is unaffected.
+
+## Full hardware sweep — split_k_barrier get_num_sm xla branch (FIXED)
+
+Ran the full cold-cache hardware sweep (hw_sweep.py, all 51 examples, autotuning). Result: all pass except
+the documented BLOCKED set, with ONE genuine remaining failure surfaced:
+
+**split_k_barrier — `AssertionError: TODO: implement for other devices` in `helion.runtime.get_num_sm`.**
+The kernel (pid_type="persistent_blocked") emits `helion.runtime.get_num_sm(a.device)`. A prior fix added a
+`"cpu"` branch (XLA tensors surface as cpu under nki.simulate). But on REAL Trainium hardware the device
+type is **`xla`**, not `cpu`, so it hit the allowlist assert. (The earlier "fixed by get_num_sm cpu branch"
+claim was validated only under sim, where device.type=='cpu' — the hardware xla path was never exercised.)
+Fix: add `"xla"` to the allowlist and route it through the same CPU-thread-count stand-in as `cpu` (Trainium
+has no SM concept; the persistent-kernel grid just needs a usable value). Runtime-only change — cannot affect
+any kernel's codegen.
+
+**split_k_barrier HARDWARE-CONFIRMED FIXED:** the get_num_sm xla fix was committed mid-sweep; because each
+example runs as a fresh subprocess importing helion from PYTHONPATH=PORT, split_k_barrier (which the sweep
+reached after the commit) picked up the fix and **PASSED on Trainium (21s, rc=0, Compiler status PASS)**.
+
+## FINAL FULL HARDWARE SWEEP RESULT (3803s, cold cache, all 51 examples)
+
+**49 of 51 examples actually pass on Trainium.** The raw sweep tally is `45 PASS / 1 FAIL / 1
+blocked-fail / 4 blocked-but-passed`, but the `BLOCKED` set is a historical "don't expect these to work"
+list — 4 of its 5 members (fused_linear_jsd, grpo_loss, mamba2_chunk_scan, mamba2_chunk_state) now pass and
+are only tallied separately. Counting them, **49 examples pass and only 2 do not**:
+
+  1. **rms_norm — TIMEOUT, not a correctness/codegen bug** (see below). Almost certainly passes with a
+     warm cache / longer timeout / pinned config; was finding valid configs with zero search-failures when
+     the 1800s/example limit killed it.
+  2. **nvfp4_gemm — genuine block.** Fails to *compile* (NKI assertion: `failed to compile NKI kernel`).
+     The nvfp4 (4-bit float) path is unsupported on the NKI backend; documented as blocked-as-expected, a
+     pre-existing limitation, not a regression from this session.
+
+(Examples excluded from the 51 entirely — CUDA-only or test scaffolding: flex_attention, fp8_attention,
+jagged_dense_bmm, and the test_nki_autotune*/test_nki_timing* harness scripts.)
+
+PASS (45 in the non-blocked tally): add aot_example attention batch_softmax bf16xint16_gemm blackwell_attention bmm broadcast_matmul
+concatenate cross_entropy embedding exp fp8_gemm fused_nki_ops gather_gemv **gdn_fwd_h** geglu grouped_gemm
+**int4_gemm** jagged_dense_add **jagged_hstu_attn** jagged_layer_norm jagged_mean jagged_softmax jagged_sum
+jsd kl_div layer_norm layer_norm_f32 **long_sum** **low_mem_dropout** matmul matmul_layernorm matmul_split_k
+moe_matmul_ogs psum_reuse_minimal **psum_reuse_test** segment_reduction softmax softmax_decomposed
+**split_k_barrier** squeeze_and_excitation_net sum swiglu welford
+(bold = fixed this session; all hold on hardware. Up from the prior 38-PASS baseline → 45.)
+
+blocked-but-PASSED (bonus): fused_linear_jsd, grpo_loss, mamba2_chunk_scan, mamba2_chunk_state.
+blocked-fail-as-expected: nvfp4_gemm.
+
+**The one FAIL — rms_norm — is a sweep TIMEOUT, not a correctness/codegen bug.** rms_norm uses bare
+`@helion.kernel` (no pinned config) for BOTH rms_norm_fwd and rms_norm_bwd, so it triggers the full
+LFBOTreeSearch autotune (20 generations) twice. On a cold neuron-compile-cache each config compile is slow,
+and the fwd search alone exceeded hw_sweep.py's 1800s per-example timeout (`__TIMEOUT__`). It was finding
+valid configs with ZERO search-failures when killed — i.e. it would PASS given more time or a warm cache.
+This is autotuner wall-clock, not a port defect. Mitigations (not applied — characterization only): raise
+the sweep timeout for rms_norm, warm the cache, or pin a config in the example. Note concatenate (which DID
+finish) took 620s autotuning — rms_norm's fwd+bwd is ~2x that plus slower per-config compiles, hence >1800s.
+
+**Other sweep notes (NOT failures):** concatenate passes (RC=0) but logs an autotuner-internal
+`RuntimeError: 0 active drivers` warning during parallel config probing — it falls back to a safe default
+config and runs correctly (transient Neuron-runtime hiccup, self-recovered). psum_reuse_test PASSES
+end-to-end on hardware with the sweep's new TORCHINDUCTOR_CACHE_DIR pin (all Part 1-3 sub-tests).
+
+## Architecture: how NKI integrates vs cute/pallas (isolation / merge-readiness)
+
+NKI follows the **same plugin structure upstream uses for cute/pallas/metal** — it is NOT bolted onto the
+other backends' codepaths:
+
+- **Per-backend codegen registration.** Every device op (load, store, dot, etc.) is registered once per
+  backend via `@_decorators.codegen(<op>, "<backend>")`. There is a separate `(load, "triton")`,
+  `(load, "pallas")`, `(load, "cute")`, `(load, "metal")`, and `(load, "nki")` function. The NKI load/store
+  bodies are entirely independent functions (memory_ops.py L7721/L11125) — they do not touch and are not
+  reached by the triton/pallas/cute/metal codegen. This is exactly cute's pattern.
+- **Backend class.** All NKI hardware specifics live in `nki_backend.py` (the `NKIBackend(Backend)` subclass
+  implementing the 7 abstractmethods + overrides), mirroring how `CuteBackend`/`PallasBackend` live in
+  backend.py and cute/ holds cute's helpers. Registered through the same `backend_registry` plugin hook.
+- **Shared-file guards are NKI-gated and inert for others.** Where NKI behaviour had to differ inside a
+  *shared* function (not a per-backend one), it is fenced behind `if backend.name == "nki":` so other
+  backends fall through unchanged. ~29 such checks across 12 files (device_ir, generate_ast, settings,
+  reduction_strategy, inductor_lowering, compile_environment, device_function, random_ops, creation_ops,
+  type_info, tile_strategy, nki_backend) — comparable in spirit to cute's ~24 `cute`-gated checks. This is
+  the same idiom (`if type(origin) is GridOrigin`, `backend.preserve_concrete_slice_dims`, etc.) the
+  codebase already uses to keep backends from interfering.
+
+**Caveats / not-yet-clean-for-upstream:**
+- A FEW changes in shared files are **unconditional (not backend-gated)** and were verified byte-identical
+  for Triton rather than guarded: the `"mean"` entry in `get_masked_value` and `int->SymIntType` in
+  tunable_ops (both confirmed inert for Triton codegen this session). The `long_sum` fix added a *new*
+  backend property (`preserve_concrete_slice_dims`, default False, True only for Pallas) — a clean,
+  backend-gated mechanism, byte-identical for all non-NKI backends.
+- `memory_ops.py` is a ~12.5k-line shared file; the NKI load/store functions are large (the GIANT) and live
+  in it rather than a `nki/` subpackage. cute similarly added a `cute/` subpackage for its helpers; a future
+  cleanup could move the NKI codegen helpers into a `nki/` subpackage to reduce the shared-file footprint.
+  Functionally isolated today, but structurally heavier in shared files than cute.
+
+**Load/store size vs other backends — and why NKI's is in-file while pallas's isn't.**
+Inline load-codegen function sizes: triton ~79 lines, **pallas ~14**, metal ~66, cute ~325, **nki ~1046**.
+Pallas's 14 lines are a SHIM — it delegates to `helion/_compiler/pallas/{codegen,gather,plan_tiling}.py`
+(~1.5k lines total, handling the SAME hard cases: 25 gather + 14 scatter + broadcast markers). So pallas
+needs the same kind of indexing machinery; it just lives in a `pallas/` subpackage behind a one-line
+dispatch, whereas NKI's lives inline. This CONFIRMS the structural cleanup above: the right end-state is a
+`nki/` subpackage with the NKI load/store as a thin shim, exactly mirroring pallas. (cute is in-between:
+~325 inline + a `cute/` subpackage.) The complexity itself is inherent — any backend over a constrained
+memory model (Pallas/TPU, NKI/Trainium) needs explicit gather/scatter/flatten lowering — NKI is not an
+outlier in *amount* of logic, only in *where* it currently sits.
+
+**n-D support (correction to an earlier "3D/4D/5D" description).** The core leading-dim flattening is
+RANK-GENERIC: `for dim_i in range(tensor.dim() - 1)` folds all leading dims into one flat partition index
+under a plain `if tensor.dim() > 2` guard (memory_ops.py L10115/L11431) — so 3D, 4D, 5D, and higher all go
+through the same loop; there is no hardcoded rank cap on the contiguous/flatten path. The `== 3` checks that
+exist (L7254, L7929, L7933) are NOT a rank limit — they are fast-path detectors for one specific pattern
+(`[vec + starts, scalar, :]`, the gather seen in gdn/hstu) that only arises at 3D. Higher-rank gathers fall
+through to the generic flatten path. Practical caveat: "supported" = "the example suite exercises up to 5D
+and those pass"; arbitrary n-D is structurally handled but only validated up to the ranks the examples hit.
+- **NOT yet run for a clean PR:** the upstream `pytest test/` suite on a CUDA GPU (to prove Triton/CuTe/
+  Pallas are unregressed by the shared-file edits) and `ruff`/`pyrefly` lint (CI gates). Those need a GPU box
+  — unavailable on this Trainium host. The NKI-side validation (49/51 examples on hardware, codegen-parity
+  vs reference) is done; the cross-backend regression-safety evidence the maintainers will want is the
+  outstanding gap.

@@ -16,8 +16,17 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
+)
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfXPU
+from helion._testing import skipUnlessCuteAvailable
+import helion.language as hl
 
 
 def _json_safe_values() -> st.SearchStrategy[Any]:
@@ -43,7 +52,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "block_sizes": st.lists(
                 st.integers(min_value=1, max_value=4096), max_size=4
             ),
-            "elements_per_thread": st.one_of(
+            "num_threads": st.one_of(
                 st.integers(min_value=1, max_value=128),
                 st.lists(st.integers(min_value=1, max_value=128), max_size=4),
             ),
@@ -76,6 +85,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "load_eviction_policies": st.lists(
                 st.sampled_from(["", "first", "last"]), max_size=4
             ),
+            "load_cache_modifiers": st.lists(st.sampled_from(["", ".cg"]), max_size=4),
             "num_warps": st.integers(min_value=1, max_value=64),
             "num_stages": st.integers(min_value=1, max_value=16),
             "pid_type": st.sampled_from(
@@ -95,7 +105,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                 k
                 not in {
                     "block_sizes",
-                    "elements_per_thread",
+                    "num_threads",
                     "loop_orders",
                     "flatten_loops",
                     "l2_groupings",
@@ -107,6 +117,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "range_flattens",
                     "static_ranges",
                     "load_eviction_policies",
+                    "load_cache_modifiers",
                     "num_warps",
                     "num_stages",
                     "pid_type",
@@ -119,7 +130,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
     )
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestConfigAPI(TestCase):
     def test_config_import_path_stability(self) -> None:
         runtime = importlib.import_module("helion.runtime")
@@ -127,11 +138,32 @@ class TestConfigAPI(TestCase):
         self.assertIs(helion.Config, runtime.Config)
         self.assertIs(helion.Config, helion.runtime.Config)
 
+    def test_cuda_device_capability_specializes_bound_kernel_cache_key(self) -> None:
+        @helion.kernel()
+        def device_key_kernel(device: hl.constexpr) -> None:
+            pass
+
+        device = torch.device("cuda:0")
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            sm90_key = device_key_kernel._base_specialization_key((device,))
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            sm100_key = device_key_kernel._base_specialization_key((device,))
+
+        self.assertEqual(sm90_key[-2:], ("cuda", (9, 0)))
+        self.assertEqual(sm100_key[-2:], ("cuda", (10, 0)))
+        self.assertNotEqual(sm90_key, sm100_key)
+
     def test_config_constructor_signature_contains_expected_kwargs(self) -> None:
         # Keep this list in sync with public kwargs; removal/rename should fail tests
         expected = {
             "block_sizes",
-            "elements_per_thread",
+            "num_threads",
             "loop_orders",
             "flatten_loops",
             "l2_groupings",
@@ -143,6 +175,7 @@ class TestConfigAPI(TestCase):
             "range_flattens",
             "static_ranges",
             "load_eviction_policies",
+            "load_cache_modifiers",
             "num_warps",
             "num_stages",
             "pid_type",
@@ -246,8 +279,25 @@ class TestConfigAPI(TestCase):
         reread = helion.Config.from_json(rejson)
         self.assertEqual(dict(reread), expected)
 
+    def test_epilogue_subtile_rewrites_only_store_slots(self) -> None:
+        env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
+        spec = env.config_spec
+        spec.epilogue_subtile_candidate_enabled = True
+        spec.store_indices = [1, 3]
+        config = {
+            "epilogue_subtile": 2,
+            "indexing": ["pointer", "block_ptr", "pointer", "block_ptr"],
+        }
 
-@onlyBackends(["triton"])
+        spec.fix_epilogue_subtile_store_indexing(config)
+
+        self.assertEqual(
+            config["indexing"],
+            ["pointer", "tensor_descriptor", "pointer", "tensor_descriptor"],
+        )
+
+
+@onlyBackends(["triton", "cute"])
 class TestSettingsEnv(TestCase):
     def test_persistent_reserved_sms_env_var(self) -> None:
         with patch.dict(
@@ -265,6 +315,42 @@ class TestSettingsEnv(TestCase):
             env.config_spec.allowed_pid_types,
             ("persistent_blocked", "persistent_interleaved"),
         )
+
+    @skipIfXPU("Uses torch.device('cuda') directly")
+    def test_distributed_limits_pid_types_to_persistent(self) -> None:
+        settings = helion.Settings()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+        ):
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+        self.assertEqual(
+            env.config_spec.allowed_pid_types,
+            ("persistent_blocked", "persistent_interleaved"),
+        )
+
+    def test_persistent_block_limit_caps_num_sm_multiplier(self) -> None:
+        # max_blocks=10000, 200 SMs -> 10000 // 200 = 50 -> floor pow2 = 32
+        settings = helion.Settings()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
+            patch("helion.runtime.get_num_sm", return_value=200),
+        ):
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+        self.assertEqual(env.config_spec.max_num_sm_multiplier, 32)
+
+    def test_persistent_block_limit_handles_zero_raw_max(self) -> None:
+        # max_blocks=144, 148 SMs -> 144 // 148 = 0 -> must clamp to 1
+        # without crashing on `1 << -1`.
+        settings = helion.Settings()
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=144),
+            patch("helion.runtime.get_num_sm", return_value=148),
+        ):
+            env = CompileEnvironment(torch.device("cuda", 0), settings)
+        self.assertEqual(env.config_spec.max_num_sm_multiplier, 1)
 
     def test_backend_env_var_accepts_cute(self) -> None:
         with patch.dict(
@@ -296,38 +382,209 @@ class TestSettingsEnv(TestCase):
             settings = helion.Settings()
         self.assertEqual(settings.backend, "tileir")
 
+    @skipUnlessCuteAvailable("Constructs a cute CompileEnvironment")
     def test_compile_environment_selects_cute_backend(self) -> None:
         settings = helion.Settings(backend="cute")
         env = CompileEnvironment(torch.device("cpu"), settings)
         self.assertEqual(env.backend_name, "cute")
         self.assertEqual(env.backend.default_launcher_name, "_default_cute_launcher")
 
-    def test_elements_per_thread_support_is_backend_specific(self) -> None:
+    @skipUnlessCuteAvailable("Constructs a cute CompileEnvironment")
+    def test_num_threads_support_is_backend_specific(self) -> None:
         triton_env = CompileEnvironment(
             torch.device("cpu"), helion.Settings(backend="triton")
         )
-        self.assertFalse(
-            triton_env.config_spec.supports_config_key("elements_per_thread")
-        )
-        self.assertNotIn(
-            "elements_per_thread", triton_env.config_spec.supported_config_keys()
-        )
+        self.assertFalse(triton_env.config_spec.supports_config_key("num_threads"))
+        self.assertNotIn("num_threads", triton_env.config_spec.supported_config_keys())
 
         cute_env = CompileEnvironment(
             torch.device("cpu"), helion.Settings(backend="cute")
         )
-        self.assertTrue(cute_env.config_spec.supports_config_key("elements_per_thread"))
+        self.assertTrue(cute_env.config_spec.supports_config_key("num_threads"))
 
-    def test_triton_rejects_elements_per_thread_in_normalize(self) -> None:
+    def test_pallas_backend_uses_exact_factory_and_static_reduction_dims(
+        self,
+    ) -> None:
+        from helion._compiler.backend import PallasBackend
+        from helion._compiler.backend import TritonBackend
+
+        triton = TritonBackend()
+        pallas = PallasBackend()
+
+        self.assertTrue(triton.pad_factory_tensors_to_power_of_2)
+        self.assertEqual(triton.static_rdim_size(384), 512)
+        self.assertFalse(pallas.pad_factory_tensors_to_power_of_2)
+        self.assertEqual(pallas.static_rdim_size(384), 384)
+
+    def test_triton_rejects_num_threads_in_normalize(self) -> None:
         env = CompileEnvironment(torch.device("cpu"), helion.Settings(backend="triton"))
         with self.assertRaisesRegex(
             helion.exc.InvalidConfig,
             rf"Unsupported config keys for backend '{env.backend_name}'",
         ):
-            env.config_spec.normalize({"elements_per_thread": [2]})
+            env.config_spec.normalize({"num_threads": [2]})
+
+    def test_block_size_spec_max_size_bounded_by_world_size(self) -> None:
+        """Regression test: BlockSizeSpec.max_size must be bounded by size_hint//world_size
+        in a distributed setting, not the raw size_hint."""
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        size_hint = 1024
+        world_size = 4
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=world_size),
+        ):
+            spec = BlockSizeSpec(block_id=0, size_hint=size_hint)
+
+        # max_size should be bounded by size_hint // world_size = 256, not 1024
+        self.assertLessEqual(spec.max_size, size_hint // world_size)
+
+    def test_bounded_inner_block_size_clamped_to_outer_value(self) -> None:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        # Use Triton only as a concrete backend; this normalize behavior is
+        # backend-agnostic.
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=1024, bounded_by_block_id=0)
+        )
+
+        config = {"block_sizes": [64, 256]}
+        spec.normalize(config)
+
+        self.assertEqual(config["block_sizes"][:2], [64, 64])
+
+    def test_bounded_inner_block_size_keeps_valid_inner_value(self) -> None:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=1024, bounded_by_block_id=0)
+        )
+
+        config = {"block_sizes": [256, 64]}
+        spec.normalize(config)
+
+        self.assertEqual(config["block_sizes"][:2], [256, 64])
+
+    def test_bounded_inner_block_size_clamps_multi_level_nesting(self) -> None:
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=1024, bounded_by_block_id=0)
+        )
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=2, size_hint=1024, bounded_by_block_id=1)
+        )
+
+        config = {"block_sizes": [64, 256, 512]}
+        spec.normalize(config)
+
+        self.assertEqual(config["block_sizes"][:3], [64, 64, 64])
+
+    def test_bounded_inner_block_size_repairs_cute_num_threads(self) -> None:
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+        from helion.autotuner.config_spec import NumThreadsSpec
+
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        spec.block_sizes.append(
+            BlockSizeSpec(block_id=1, size_hint=1024, bounded_by_block_id=0)
+        )
+        spec.num_threads.append(NumThreadsSpec(block_id=0, size_hint=1024))
+        spec.num_threads.append(NumThreadsSpec(block_id=1, size_hint=1024))
+
+        config = {"block_sizes": [64, 256], "num_threads": [64, 256]}
+        spec.normalize(config)
+
+        self.assertEqual(config["block_sizes"][:2], [64, 64])
+        self.assertEqual(config["num_threads"][:2], [64, 64])
+
+    def test_detect_outer_block_bound_requires_end_minus_begin(self) -> None:
+        from types import SimpleNamespace
+
+        import sympy
+
+        from helion._compiler.host_function import SymbolOrigin
+        from helion._compiler.type_info import _detect_outer_block_bound
+        from helion._compiler.variable_origin import TileBeginOrigin
+        from helion._compiler.variable_origin import TileEndOrigin
+
+        begin = sympy.Symbol("begin")
+        end = sympy.Symbol("end")
+        fake_host = SimpleNamespace(
+            expr_to_origin={
+                begin: SymbolOrigin(TileBeginOrigin(3)),
+                end: SymbolOrigin(TileEndOrigin(3)),
+            }
+        )
+        fake_env = SimpleNamespace(get_block_id=lambda _numel: None)
+
+        with (
+            patch(
+                "helion._compiler.type_info.HostFunction.current",
+                return_value=fake_host,
+            ),
+            patch(
+                "helion._compiler.type_info._symint_expr",
+                side_effect=lambda expr: expr,
+            ),
+        ):
+            self.assertEqual(_detect_outer_block_bound(end - begin, fake_env), 3)
+            self.assertIsNone(_detect_outer_block_bound(begin + end, fake_env))
+
+    def test_detect_outer_block_bound_accepts_direct_block_size(self) -> None:
+        from types import SimpleNamespace
+
+        from helion._compiler.type_info import _detect_outer_block_bound
+
+        numel = object()
+        fake_env = SimpleNamespace(
+            get_block_id=lambda value: 5 if value is numel else None
+        )
+
+        with patch(
+            "helion._compiler.type_info._symint_expr",
+            side_effect=AssertionError("_symint_expr should not be called"),
+        ):
+            self.assertEqual(_detect_outer_block_bound(numel, fake_env), 5)
+
+    def test_bounded_block_size_repr_includes_bound(self) -> None:
+        from helion.autotuner.config_spec import BlockSizeSpec
+
+        self.assertIn(
+            "bounded_by_block_id=7",
+            repr(BlockSizeSpec(block_id=1, size_hint=64, bounded_by_block_id=7)),
+        )
+
+    def test_autotune_search_acf_env_var_strips_whitespace(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HELION_AUTOTUNE_SEARCH_ACF": "/a/first.bin, /b/second.bin ,/c/third.bin"},
+            clear=False,
+        ):
+            settings = helion.Settings()
+        self.assertEqual(
+            settings.autotune_search_acf,
+            ["/a/first.bin", "/b/second.bin", "/c/third.bin"],
+        )
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestFormatKernelDecorator(TestCase):
     def test_format_kernel_decorator_includes_index_dtype(self) -> None:
         """Test that format_kernel_decorator includes index_dtype when set."""
@@ -340,7 +597,7 @@ class TestFormatKernelDecorator(TestCase):
         self.assertIn("index_dtype=torch.int64", decorator)
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 class TestHardwareConfigSpecRanges(TestCase):
     """Tests for NVIDIA/AMD num_warps and num_stages range constraints.
 
@@ -452,6 +709,209 @@ class TestHardwareConfigSpecRanges(TestCase):
         # TileIR uses fixed num_warps of 4
         self.assertEqual(num_warps.low, 4)
         self.assertEqual(num_warps.high, 4)
+
+    def test_eviction_policy_choices_do_not_leak_mocked_amd_state(self) -> None:
+        """Mocked AMD capability detection should not poison later Triton specs."""
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            amd_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(amd_spec.load_eviction_policies.inner.choices, ("",))
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            nvidia_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(
+            nvidia_spec.load_eviction_policies.inner.choices,
+            ("", "first", "last"),
+        )
+
+    def test_load_cache_modifier_choices_do_not_leak_mocked_amd_state(self) -> None:
+        """Mocked AMD capability detection should not poison later Triton specs."""
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=True,
+        ):
+            amd_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(amd_spec.load_cache_modifiers.inner.choices, ("", ".cg"))
+
+        with patch(
+            "helion.autotuner.config_spec.supports_amd_cdna_tunables",
+            return_value=False,
+        ):
+            nvidia_spec = ConfigSpec(backend=TritonBackend())
+        self.assertEqual(nvidia_spec.load_cache_modifiers.inner.choices, ("",))
+
+
+class TestCuteTcgen05ConfigSpecSplit(TestCase):
+    @staticmethod
+    def _make_cute_tcgen05_spec():
+        from helion._compiler.backend import CuteBackend
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        spec = ConfigSpec(backend=CuteBackend())
+        spec.cute_tcgen05_search_enabled = True
+        for block_id, size_hint in enumerate((4096, 4096, 4096)):
+            spec.block_sizes.append(
+                BlockSizeSpec(
+                    block_id=block_id,
+                    size_hint=size_hint,
+                    max_size=256 if block_id < 2 else 128,
+                )
+            )
+        return spec
+
+    def test_cute_tcgen05_search_fields_and_default_flat_roundtrip(self) -> None:
+        from helion.autotuner.config_generation import ConfigGeneration
+
+        spec = self._make_cute_tcgen05_spec()
+        flat_keys = [key for key, _count, _is_sequence in spec.flat_key_layout()]
+
+        self.assertIn("tcgen05_cluster_m", flat_keys)
+        self.assertIn("tcgen05_ab_stages", flat_keys)
+        self.assertIn("tcgen05_strategy", flat_keys)
+        self.assertIn("tcgen05_warp_spec_c_input_warps", flat_keys)
+
+        gen = ConfigGeneration(spec)
+        default_flat = gen.default_flat()
+        self.assertEqual(
+            gen.flatten(gen.unflatten([*default_flat])),
+            default_flat,
+        )
+
+    def test_tcgen05_search_fields_do_not_leak_to_other_backends(self) -> None:
+        from helion._compiler.backend import MetalBackend
+        from helion._compiler.backend import PallasBackend
+        from helion._compiler.backend import TileIRBackend
+        from helion._compiler.backend import TritonBackend
+        from helion.autotuner.config_generation import ConfigGeneration
+        from helion.autotuner.config_spec import BlockSizeSpec
+        from helion.autotuner.config_spec import ConfigSpec
+
+        for backend in (
+            TritonBackend(),
+            PallasBackend(),
+            TileIRBackend(),
+            MetalBackend(),
+        ):
+            spec = ConfigSpec(backend=backend)
+            spec.cute_tcgen05_search_enabled = True
+            spec.block_sizes.append(
+                BlockSizeSpec(block_id=0, size_hint=128, max_size=128)
+            )
+            flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
+            self.assertFalse(
+                any(key.startswith("tcgen05_") for key in flat_keys),
+                f"{backend.name} search surface leaked tcgen05 keys: {flat_keys}",
+            )
+            default_config = spec.default_config()
+            self.assertFalse(
+                any(key.startswith("tcgen05_") for key in default_config.config),
+                f"{backend.name} default config leaked tcgen05 keys: "
+                f"{default_config.config}",
+            )
+            gen = ConfigGeneration(spec)
+            generated_config = gen.unflatten(gen.default_flat())
+            self.assertFalse(
+                any(key.startswith("tcgen05_") for key in generated_config.config),
+                f"{backend.name} generated config leaked tcgen05 keys: "
+                f"{generated_config.config}",
+            )
+
+    def test_explicit_tcgen05_strategy_config_validation(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "tcgen05 strategy invariants violated",
+        ):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 128, 64],
+                    tcgen05_strategy="role_local_monolithic",
+                    tcgen05_warp_spec_c_input_warps=1,
+                )
+            )
+
+        with self.assertRaises(exc.InvalidConfig):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 128, 64],
+                    **{
+                        TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY: (
+                            TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
+                        )
+                    },
+                )
+            )
+
+        config = helion.Config(
+            block_sizes=[128, 128, 64],
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+        )
+        spec.normalize(config)
+        self.assertEqual(config.config["tcgen05_strategy"], "role_local_with_scheduler")
+        self.assertEqual(config.config["tcgen05_warp_spec_c_input_warps"], 1)
+
+    def test_direct_cute_config_spec_enforces_clc_arch_gate(self) -> None:
+        from helion._compiler.cute.strategies import (
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+        )
+        from helion._compiler.cute.strategies import Tcgen05PersistenceModel
+
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.current_device", return_value=0),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            spec = self._make_cute_tcgen05_spec()
+
+        with self.assertRaisesRegex(
+            exc.InvalidConfig,
+            "requires CUDA compute capability major >= 10",
+        ):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[128, 128, 64],
+                    pid_type="persistent_interleaved",
+                    tcgen05_strategy="role_local_with_scheduler",
+                    tcgen05_warp_spec_scheduler_warps=1,
+                    tcgen05_warp_spec_c_input_warps=1,
+                    **{
+                        TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                            Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                        )
+                    },
+                )
+            )
+
+    def test_aux_kernel_detection_routes_strategy_search_surface(self) -> None:
+        spec = self._make_cute_tcgen05_spec()
+        tcgen05_config = spec._cute_tcgen05_config
+
+        narrow = tcgen05_config.strategy_autotune_fragments()
+        self.assertEqual(narrow["tcgen05_strategy"].choices, ("role_local_monolithic",))
+        self.assertEqual(narrow["tcgen05_warp_spec_c_input_warps"].choices, (0,))
+
+        tcgen05_config.aux_kernel_detected = True
+        widened = tcgen05_config.strategy_autotune_fragments()
+        self.assertEqual(
+            widened["tcgen05_strategy"].choices,
+            ("role_local_monolithic", "role_local_with_scheduler"),
+        )
+        self.assertEqual(widened["tcgen05_warp_spec_c_input_warps"].choices, (0, 1))
 
 
 if __name__ == "__main__":

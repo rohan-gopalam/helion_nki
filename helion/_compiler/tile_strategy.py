@@ -7,21 +7,26 @@ import functools
 import itertools
 import math
 import operator
+import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import TypeVar
+from typing import cast
 import weakref
 
 import sympy
 import torch
 
 from .. import exc
+from .._compat import shape_env_size_hint
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
+from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
@@ -31,13 +36,13 @@ from .program_id import PersistentBlockedProgramIDs
 from .program_id import PersistentInterleavedProgramIDs
 from .program_id import PIDInfo
 from .program_id import ProgramIDs
+from .program_id import Tcgen05PersistentProgramIDs
 from .program_id import XYZProgramIDs
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
-    from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
 
     _T = TypeVar("_T")
@@ -45,10 +50,1761 @@ if TYPE_CHECKING:
     ShapeLike = Sequence[SymIntLike]
 
 
+class ThreadAxisTracker:
+    """Tracks thread axis assignments for block dimensions during codegen."""
+
+    __slots__ = ("sizes", "block_axes")
+
+    def __init__(self) -> None:
+        self.sizes: dict[int, int] = {}
+        self.block_axes: dict[int, int] = {}
+
+    def record(self, block_idx: int, axis: int, size: int) -> None:
+        """Record a thread axis mapping for a single block dimension."""
+        self.sizes[axis] = max(self.sizes.get(axis, 1), size)
+        self.block_axes[block_idx] = axis
+
+    def record_all(self, block_ids: list[int], axis: int, size: int) -> None:
+        """Record the same thread axis mapping for all block dimensions."""
+        self.sizes[axis] = size
+        for block_id in block_ids:
+            self.block_axes[block_id] = axis
+
+
+def _lane_loop_iter(extent: int) -> ast.AST:
+    # CuTe lane loops carry per-thread scalar state. Emitting them via
+    # cutlass.range(_constexpr) miscompiles scalar matmul paths, so keep them
+    # as ordinary Python loops.
+    return expr_from_string(f"range({extent})")
+
+
+def _create_lane_loop(lane_var: str, extent: int, body: list[ast.AST]) -> ast.For:
+    loop = create(
+        ast.For,
+        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+        iter=_lane_loop_iter(extent),
+        body=body,
+        orelse=[],
+        type_comment=None,
+    )
+    setattr(loop, HELION_LANE_LOOP_VAR_ATTR, lane_var)
+    return loop
+
+
+# Marker call emitted by reduction strategies when a reduction over a
+# lane-distributed block is generated inside a single-pass lane loop.  The
+# ``split_lane_loop_reductions`` post-pass recognizes these markers and
+# rewrites the enclosing lane loop into a two-pass structure:
+#
+#   (phase 1) accumulate the per-lane reduction inputs across the lane loop,
+#             then combine across the live thread axis (``threads_in_group``)
+#             into the final scalar;
+#   (finalize) define the reduced scalar between the two passes;
+#   (phase 2) re-iterate the lanes to apply any lane-varying consumers (e.g.
+#             the broadcast normalize / store) using the finalized scalar.
+#
+# The marker never reaches the emitted kernel — the post-pass strips every
+# marker it processes.
+_HELION_LANE_REDUCE_MARKER = "_helion_lane_reduce"
+
+
+def _lane_reduce_marker_expr(
+    input_name: str,
+    reduction_type: str,
+    identity_expr: str,
+    threads_in_group: int,
+    *,
+    group_pre: int = 1,
+    group_span: int = 0,
+    group_lane_expr: str = "",
+    group_count: int = 1,
+) -> str:
+    # ``group_*`` (optional) carry the parameters of a strided grouped
+    # reduction. They are required when the reduction's live thread axis is
+    # interleaved with an unrelated sibling thread axis. ``group_lane_expr`` is
+    # base64-free but may contain commas/parens, so it is passed as a string
+    # literal that the post-pass re-parses.
+    #
+    # When ``group_span <= 32`` the de-interleaving fits in a single warp and
+    # the finalize uses ``_cute_grouped_reduce_warp``. When ``group_span > 32``
+    # (and a multiple of 32) the reduction group is spread across warps, so the
+    # finalize uses the cross-warp ``_cute_grouped_reduce_shared_two_stage``;
+    # ``group_count`` (the number of independent groups in the CTA) is needed
+    # only by that two-stage helper.
+    return (
+        f"{_HELION_LANE_REDUCE_MARKER}({input_name}, {reduction_type!r}, "
+        f"{identity_expr}, {threads_in_group}, {group_pre}, {group_span}, "
+        f"{group_lane_expr!r}, {group_count})"
+    )
+
+
+@dataclasses.dataclass
+class _LaneReduceMarker:
+    result_var: str
+    input_name: str
+    reduction_type: str
+    identity_expr: str
+    threads_in_group: int
+    # The original RHS expression with the marker call replaced by the string
+    # ``{finalized}``; ``finalize_expr(x)`` substitutes ``x`` to re-apply any
+    # surrounding dtype cast / reshape to the finalized reduced scalar.
+    wrap_template: str
+    # Optional strided grouped reduction (the reduction's live thread axis
+    # shares a warp / CTA with an unrelated sibling axis). When ``group_span``
+    # > 0 the finalize uses a grouped reduction keyed on ``group_lane_expr``
+    # instead of a plain consecutive-lane ``cute.arch.warp_reduction_*``:
+    # ``_cute_grouped_reduce_warp`` when ``group_span <= 32`` (single warp),
+    # ``_cute_grouped_reduce_shared_two_stage`` when ``group_span`` is a
+    # multiple of 32 greater than 32 (cross-warp, ``group_count`` groups).
+    group_pre: int = 1
+    group_span: int = 0
+    group_lane_expr: str = ""
+    group_count: int = 1
+
+    def finalize_expr(self, reduced: str) -> str:
+        return self.wrap_template.replace("__HELION_FINALIZED__", f"({reduced})")
+
+
+def _find_lane_reduce_call(node: ast.AST) -> ast.Call | None:
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id == _HELION_LANE_REDUCE_MARKER
+        ):
+            return sub
+    return None
+
+
+class _ReplaceLaneReduceCall(ast.NodeTransformer):
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == _HELION_LANE_REDUCE_MARKER
+        ):
+            return ast.copy_location(
+                create(ast.Name, id="__HELION_FINALIZED__", ctx=ast.Load()), node
+            )
+        return node
+
+
+def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
+    """If ``stmt`` assigns an expression containing a single
+    ``_helion_lane_reduce(IN, TYPE, ID, T)`` marker call, return a
+    :class:`_LaneReduceMarker`; otherwise return ``None``.
+
+    The marker may be nested inside a surrounding cast/reshape (e.g.
+    ``R = cutlass.Float32(_helion_lane_reduce(...))``); the wrapping is
+    captured so it can be re-applied to the finalized reduced scalar.
+    """
+    if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        return None
+    target = stmt.targets[0]
+    if not isinstance(target, ast.Name):
+        return None
+    call = _find_lane_reduce_call(stmt.value)
+    if call is None or len(call.args) != 8:
+        return None
+    (
+        input_node,
+        type_node,
+        identity_node,
+        threads_node,
+        group_pre_node,
+        group_span_node,
+        group_lane_node,
+        group_count_node,
+    ) = call.args
+    input_name = ast.unparse(input_node)
+    reduction_type = ast.literal_eval(type_node)
+    identity_expr = ast.unparse(identity_node)
+    threads_in_group = int(ast.literal_eval(threads_node))
+    group_pre = int(ast.literal_eval(group_pre_node))
+    group_span = int(ast.literal_eval(group_span_node))
+    group_lane_expr = ast.literal_eval(group_lane_node)
+    group_count = int(ast.literal_eval(group_count_node))
+    # Build the wrap template by replacing the marker call with a sentinel.
+    wrapped = _ReplaceLaneReduceCall().visit(ast.parse(ast.unparse(stmt.value)).body[0])
+    assert isinstance(wrapped, ast.Expr)
+    wrap_template = ast.unparse(wrapped.value)
+    return _LaneReduceMarker(
+        result_var=target.id,
+        input_name=input_name,
+        reduction_type=reduction_type,
+        identity_expr=identity_expr,
+        threads_in_group=threads_in_group,
+        wrap_template=wrap_template,
+        group_pre=group_pre,
+        group_span=group_span,
+        group_lane_expr=group_lane_expr,
+        group_count=group_count,
+    )
+
+
+def _combine_expr(reduction_type: str, acc: str, val: str) -> str:
+    if reduction_type == "sum":
+        return f"({acc}) + ({val})"
+    if reduction_type == "prod":
+        return f"({acc}) * ({val})"
+    if reduction_type == "max":
+        return f"({acc}) if ({acc}) > ({val}) else ({val})"
+    if reduction_type == "min":
+        return f"({acc}) if ({acc}) < ({val}) else ({val})"
+    raise NotImplementedError(f"lane reduce combine {reduction_type!r}")
+
+
+def _dtype_ctor_from_identity(identity_expr: str) -> str | None:
+    """Extract the dtype constructor (e.g. ``cutlass.Float32``) from an identity
+    expression like ``cutlass.Float32(0)`` so the per-lane input can be cast to
+    the accumulator's dtype before combining."""
+    try:
+        node = ast.parse(identity_expr, mode="eval").body
+    except SyntaxError:
+        return None
+    if isinstance(node, ast.Call):
+        return ast.unparse(node.func)
+    return None
+
+
+def _grouped_warp_reduce_expr(
+    reduction_type: str,
+    acc: str,
+    identity_expr: str,
+    lane_expr: str,
+    *,
+    pre: int,
+    group_span: int,
+) -> str:
+    """Strided grouped warp reduction over a single warp.
+
+    Reduces ``acc`` across the ``group_span`` lanes that share the same
+    ``lane % pre`` within each ``group_span``-lane block, so an interleaved
+    sibling thread axis (occupying the low ``pre`` strides) stays distinct.
+    """
+    return (
+        "_cute_grouped_reduce_warp("
+        f"{acc}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
+        f"pre={pre}, group_span={group_span})"
+    )
+
+
+def _grouped_two_stage_reduce_stmts(
+    result_acc: str,
+    reduction_type: str,
+    acc: str,
+    identity_expr: str,
+    lane_expr: str,
+    *,
+    pre: int,
+    group_span: int,
+    group_count: int,
+) -> list[ast.AST]:
+    """Cross-warp grouped reduction over ``group_span`` (> 32) lanes.
+
+    Mirrors ``BlockReductionStrategy._strided_thread_reduction_expr``'s
+    ``group_span > 32`` branch: the reduce group is spread across warps, so a
+    single ``cute.arch.warp_reduction_*`` cannot fold it. The two-stage shared
+    helper reduces each warp, stages the per-warp partials in shared memory, and
+    combines them, keeping the ``pre`` interleaved sibling lanes distinct.
+
+    Unlike that reference emitter this path has no shared-memory-budget fallback,
+    but it does not need one: it only fires for a block-resident reduced tile
+    whose live thread count is bounded by ``MAX_THREADS_PER_BLOCK`` (<= 1024, so
+    <= 32 staged per-warp partials), which cannot overflow the reduction SMEM
+    budget.
+
+    Returns the (lane-index setup + reduce) statements that define
+    ``result_acc`` (used in place of the single-shuffle ``reduced`` scalar).
+    """
+    lane_var = f"{result_acc}_lane"
+    lane_in_group_var = f"{result_acc}_lane_in_group"
+    lane_mod_pre_var = f"{result_acc}_lane_mod_pre"
+    return [
+        statement_from_string(f"{lane_var} = {lane_expr}"),
+        statement_from_string(f"{lane_in_group_var} = ({lane_var}) % {group_span}"),
+        statement_from_string(f"{lane_mod_pre_var} = ({lane_in_group_var}) % {pre}"),
+        statement_from_string(
+            f"{result_acc} = _cute_grouped_reduce_shared_two_stage("
+            f"{acc}, {reduction_type!r}, {identity_expr}, "
+            f"{lane_var}, {lane_in_group_var}, {lane_mod_pre_var}, "
+            f"pre={pre}, group_span={group_span}, group_count={group_count})"
+        ),
+    ]
+
+
+def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast.AST]:
+    """Combine a marker's per-lane accumulator ``acc_var`` across the live
+    thread axis and assign the finalized scalar to ``m.result_var``.
+
+    Picks the cross-thread combine that matches the marker's thread layout:
+
+    * a cross-warp two-stage shared reduction when the reduce group spans more
+      than one warp (``group_span`` a multiple of 32 > 32);
+    * a single-warp strided grouped reduction when the reduce axis shares a warp
+      with an unrelated sibling axis (``1 < group_span <= 32`` with ``pre`` > 1);
+    * a plain consecutive-lane warp reduction otherwise;
+    * the accumulator unchanged when there is no live thread axis to combine.
+    """
+    if m.group_span > 32 and m.group_span % 32 == 0 and m.group_lane_expr:
+        # Cross-warp: the reduce group is spread across warps, so fold the
+        # per-lane accumulator with the two-stage shared-memory reduction.
+        stmts = _grouped_two_stage_reduce_stmts(
+            f"{acc_var}_reduced",
+            m.reduction_type,
+            acc_var,
+            m.identity_expr,
+            m.group_lane_expr,
+            pre=m.group_pre,
+            group_span=m.group_span,
+            group_count=m.group_count,
+        )
+        stmts.append(
+            statement_from_string(
+                f"{m.result_var} = {m.finalize_expr(f'{acc_var}_reduced')}"
+            )
+        )
+        return stmts
+    if m.group_span > 1 and m.group_pre > 1 and m.group_lane_expr:
+        # Strided grouped reduction: the reduce axis shares a warp with an
+        # unrelated sibling axis, so combine only the lanes that share the
+        # current lane's sibling coordinate.
+        reduced = _grouped_warp_reduce_expr(
+            m.reduction_type,
+            acc_var,
+            m.identity_expr,
+            m.group_lane_expr,
+            pre=m.group_pre,
+            group_span=m.group_span,
+        )
+    elif m.threads_in_group > 1:
+        reduced = _warp_reduce_expr(m.reduction_type, acc_var, m.threads_in_group)
+    else:
+        reduced = acc_var
+    return [statement_from_string(f"{m.result_var} = {m.finalize_expr(reduced)}")]
+
+
+def _warp_reduce_expr(reduction_type: str, acc: str, threads_in_group: int) -> str:
+    tg = f", threads_in_group={threads_in_group}"
+    if reduction_type == "sum":
+        return f"cute.arch.warp_reduction_sum({acc}{tg})"
+    if reduction_type == "max":
+        return f"cute.arch.warp_reduction_max({acc}{tg})"
+    if reduction_type == "min":
+        return f"cute.arch.warp_reduction(({acc}), lambda a, b: a if a < b else b{tg})"
+    if reduction_type == "prod":
+        return f"cute.arch.warp_reduction(({acc}), lambda a, b: (a * b){tg})"
+    raise NotImplementedError(f"lane warp reduce {reduction_type!r}")
+
+
+def _backward_slice(body: list[ast.AST], roots: set[str]) -> tuple[list[int], set[str]]:
+    """Return the indices of the statements in ``body`` that (transitively)
+    produce any name in ``roots``, plus the set of all names those statements
+    write.  Statements are scanned in reverse so a producer is included once a
+    later consumer (already selected) reads its output.
+    """
+    from .ast_read_writes import ReadWrites
+
+    needed = set(roots)
+    selected: list[int] = []
+    written: set[str] = set()
+    for idx in range(len(body) - 1, -1, -1):
+        stmt = body[idx]
+        rw = ReadWrites.from_ast(stmt)
+        writes = set(rw.writes)
+        if writes & needed:
+            selected.append(idx)
+            written |= writes
+            needed |= set(rw.reads)
+    selected.reverse()
+    return selected, written
+
+
+def split_lane_loop_reductions(body: list[ast.AST]) -> list[ast.AST]:
+    """Rewrite single-pass lane loops that contain ``_helion_lane_reduce``
+    markers into the two-pass accumulate / finalize / consume structure.
+
+    Operates bottom-up so nested lane loops are handled before their parents.
+    Lane loops without markers are returned unchanged (their inner statements
+    are still recursed into so nested markers are processed).
+    """
+    new_body: list[ast.AST] = []
+    for stmt in body:
+        new_body.extend(_split_stmt_lane_reductions(stmt))
+    return new_body
+
+
+def _restore_stmt_lane_reduce_markers(stmt: ast.AST) -> ast.AST:
+    """Recurse into statement-list fields and replace any surviving
+    ``R = ..._helion_lane_reduce(IN, TYPE, ID, T)...`` assignment with
+    ``R = ...IN...`` (the raw per-lane input)."""
+    for field in ("body", "orelse", "finalbody"):
+        old = getattr(stmt, field, None)
+        if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+            setattr(stmt, field, [_restore_stmt_lane_reduce_markers(s) for s in old])
+    if isinstance(stmt, ast.Assign):
+        m = _is_lane_reduce_marker_assign(stmt)
+        if m is not None:
+            return statement_from_string(
+                f"{m.result_var} = {m.finalize_expr(m.input_name)}"
+            )
+    return stmt
+
+
+def restore_unprocessed_lane_reduce_markers(
+    body: list[ast.AST],
+) -> list[ast.AST]:
+    """Replace any surviving ``R = ..._helion_lane_reduce(IN, TYPE, ID, T)...``
+    assignment with ``R = ...IN...`` (the raw per-lane input).
+
+    A safety net: ``split_lane_loop_reductions`` only rewrites markers it can
+    place in a two-pass lane structure. A marker emitted in a context neither
+    that pass nor ``interchange_lane_outside_serial_reductions`` handles would
+    otherwise leak the ``_helion_lane_reduce`` call into the emitted kernel.
+    Reverting to the per-lane input keeps the kernel compilable (it falls back
+    to the original single-pass per-lane reduction behavior).
+
+    Recurses only into statement-bearing fields (``body``/``orelse``/
+    ``finalbody``) instead of using ``ast.NodeTransformer``; markers are always
+    statement-level assignments, so this avoids the transformer's in-place
+    mutation of expression list fields, which fails when an AST node carries a
+    ``torch.fx`` ``immutable_list`` (e.g. multi-output ``inline_asm_elementwise``).
+    """
+    return [_restore_stmt_lane_reduce_markers(stmt) for stmt in body]
+
+
+def _split_stmt_lane_reductions(stmt: ast.AST) -> list[ast.AST]:
+    # Recurse into any statement-list-bearing fields first so nested lane
+    # loops are rewritten before the enclosing one.
+    for field in ("body", "orelse", "finalbody"):
+        old = getattr(stmt, field, None)
+        if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+            setattr(stmt, field, split_lane_loop_reductions(old))
+    lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+    if (
+        lane_var is None
+        or not isinstance(stmt, ast.For)
+        or not isinstance(stmt.target, ast.Name)
+        or stmt.target.id != lane_var
+    ):
+        return [stmt]
+    return _split_one_lane_loop(stmt, lane_var)
+
+
+def _split_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
+    from .ast_read_writes import ReadWrites
+
+    body: list[ast.AST] = list(loop.body)
+    markers: list[tuple[int, _LaneReduceMarker]] = []
+    for idx, stmt in enumerate(body):
+        parsed = _is_lane_reduce_marker_assign(stmt)
+        if parsed is not None:
+            markers.append((idx, parsed))
+    if not markers:
+        return [loop]
+
+    marker_indices = {i for i, _ in markers}
+
+    # A matmul whose *output* is reduced over a lane-distributed axis (e.g.
+    # matmul_layernorm's ``acc.sum(-1)`` over the synthetic-lane N output) cannot
+    # be handled by the per-lane / two-pass paths below: each lane owns a
+    # distinct output column, so the reduction must combine DIFFERENT lanes, and
+    # the matmul (an unduplicatable cross-thread shared-memory reduction) cannot
+    # be re-run in a second lane pass.  The register-stash lowering runs the
+    # matmul once, stashes each lane's output in a per-thread fragment, and
+    # re-derives every downstream reduction / consumer from the stash.
+    #
+    # This is gated narrowly so it does NOT disturb kernels the existing paths
+    # already handle correctly:
+    #   * an unduplicatable op must feed the reduction, and
+    #   * the marker results must NOT be consumed by a cross-lane loop-carried
+    #     accumulator.  Online-softmax attention carries ``mi``/``di`` across the
+    #     lane loop (``di = di * alpha + sum``); there the per-lane restore is
+    #     correct, so the stash path must stay out of the way.
+    if any(
+        _contains_unduplicatable_op(stmt) for stmt in body
+    ) and not _markers_feed_cross_lane_carry(body, lane_var, markers):
+        stashed = _split_lane_loop_with_register_stash(loop, lane_var, markers)
+        if stashed is not None:
+            return stashed
+
+    # Safety: the two-pass split is only valid when the reduction marker is the
+    # ONLY cross-lane carried value in this lane loop. If the body has another
+    # loop-carried accumulator across the lanes (e.g. a matmul ``dot_acc`` or a
+    # plain ``extra += per_lane`` sum that already accumulates over the lanes),
+    # splitting would drop or double-count it. Fall back to the original
+    # single-pass per-lane behavior by replacing each marker with its raw input.
+    if _has_extra_cross_lane_carry(body, lane_var, marker_indices):
+        return [_restore_per_lane_markers(loop, markers)]
+
+    input_roots = {m.input_name for _, m in markers}
+
+    # Phase 1: the backward slice that produces all reduction inputs.
+    phase1_indices, _phase1_written = _backward_slice(body, input_roots)
+
+    # Sequentially-dependent reductions (one marker's input depends on another
+    # marker's result, e.g. online softmax's sum-of-exp needing the max first)
+    # would require a multi-pass split. The single-pass phase-1/finalize/phase-2
+    # structure can't express that, so fall back to per-lane behavior.
+    if set(phase1_indices) & marker_indices:
+        return [_restore_per_lane_markers(loop, markers)]
+
+    # The phase-1 (accumulate) and phase-2 (consume) passes both re-run the
+    # reduction-input producers. That is only safe for side-effect-free
+    # producers. A matmul / collective in the slice (cross-thread shared-memory
+    # reductions, ``cute.gemm``, ``dot``) cannot be duplicated without racing on
+    # shared memory, so fall back to per-lane behavior in that case (the
+    # register-stash path above handles the cases where the per-lane restore
+    # would be numerically wrong).
+    if any(_contains_unduplicatable_op(body[i]) for i in phase1_indices):
+        return [_restore_per_lane_markers(loop, markers)]
+
+    extent = _lane_loop_extent(loop)
+
+    prefix: list[ast.AST] = []  # acc init statements (outside the lane loops)
+    accumulate_body: list[ast.AST] = [body[i] for i in phase1_indices]
+    finalize: list[ast.AST] = []
+    for _, m in markers:
+        acc_var = f"{m.result_var}_lane_acc"
+        prefix.append(statement_from_string(f"{acc_var} = {m.identity_expr}"))
+        # Cast the per-lane input to the accumulator dtype before combining so
+        # the CUTLASS DSL's strict ternary type check (max/min emit a Python
+        # ``a if a > b else b``) does not see mixed fp32/bf16 operands.
+        ctor = _dtype_ctor_from_identity(m.identity_expr)
+        combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
+        accumulate_body.append(
+            statement_from_string(
+                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
+            )
+        )
+        finalize.extend(_finalize_lane_reduce_marker(m, acc_var))
+
+    # Phase 2: everything except the marker assignments themselves; the
+    # reduced scalar is already finalized so consumers read it directly.
+    phase2_body = [s for i, s in enumerate(body) if i not in marker_indices]
+
+    # A statement is lane-varying if it (transitively) reads the lane var.
+    # Statements that only depend on the finalized scalar(s) are lane-invariant
+    # and run once after the lane loops; lane-varying consumers run in a second
+    # lane loop, but only those that contribute to a side effect (a store, an
+    # if-with-store, an in-place write). Pure lane-varying producers that fed
+    # only the (now-removed) reduction markers are dropped.
+    lane_varying_names = _lane_varying_names(phase2_body, lane_var)
+
+    def is_lane_varying(stmt: ast.AST) -> bool:
+        reads = set(ReadWrites.from_ast(stmt).reads)
+        return lane_var in reads or bool(reads & lane_varying_names)
+
+    keep_indices = _live_phase2_indices(phase2_body)
+    lane_invariant_tail: list[ast.AST] = []
+    lane_varying_tail: list[ast.AST] = []
+    for i, s in enumerate(phase2_body):
+        if is_lane_varying(s):
+            if i in keep_indices:
+                lane_varying_tail.append(s)
+        else:
+            lane_invariant_tail.append(s)
+
+    result: list[ast.AST] = []
+    result.extend(prefix)
+    result.append(_create_lane_loop(lane_var, extent, accumulate_body))
+    result.extend(finalize)
+    result.extend(lane_invariant_tail)
+    if lane_varying_tail:
+        result.append(_create_lane_loop(lane_var, extent, lane_varying_tail))
+    return result
+
+
+_LANE_STASH_COUNTER = itertools.count()
+
+
+def _stash_dtype_for_value(
+    value_name: str, body: list[ast.AST], markers: list[tuple[int, _LaneReduceMarker]]
+) -> str:
+    """Pick a CuTe scalar dtype constructor for a stashed lane value.
+
+    Prefer the accumulator dtype of a marker whose input transitively reads the
+    stashed value (matmul outputs feed an fp32 ``sum``), then any cast that
+    wraps the value's defining assignment, then ``cutlass.Float32``.
+    """
+    from .ast_read_writes import ReadWrites
+
+    for _idx, m in markers:
+        slice_indices, _ = _backward_slice(body, {m.input_name})
+        reads_value = any(
+            value_name in ReadWrites.from_ast(body[i]).reads for i in slice_indices
+        )
+        if reads_value:
+            ctor = _dtype_ctor_from_identity(m.identity_expr)
+            if ctor is not None:
+                return ctor
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == value_name
+            and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute)
+            and isinstance(stmt.value.func.value, ast.Name)
+            and stmt.value.func.value.id == "cutlass"
+        ):
+            return f"cutlass.{stmt.value.func.attr}"
+    return "cutlass.Float32"
+
+
+def _strip_ssa_suffix(name: str) -> str:
+    """Strip Helion's SSA / loop-carry suffixes from a variable name.
+
+    ``acc_1`` / ``acc_copy`` / ``acc_copy_0`` all collapse to ``acc`` so a
+    loop-carried accumulator can be matched to its per-iteration rewrites.
+    """
+    base = re.sub(r"(_copy)(_\d+)*$", "", name)
+    return re.sub(r"(_\d+)+$", "", base)
+
+
+def _assigns_simple_name(stmt: ast.AST, names: set[str]) -> bool:
+    """Return True when ``stmt`` is ``X = ...`` for some ``X`` in ``names``."""
+    return (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and stmt.targets[0].id in names
+    )
+
+
+def _undup_stmt_rederives(stmt: ast.AST, name: str) -> bool:
+    """Return True when ``stmt`` (an unduplicatable statement, typically the
+    matmul K ``for`` loop) re-derives the loop-carried accumulator ``name``.
+
+    The statement re-derives ``name`` when it both reads ``name`` (the live-in
+    accumulator) and writes a value transitively dependent on ``name`` whose
+    SSA-stripped name equals ``name`` (e.g. ``acc_1 = acc_copy_0 + ...``).  A
+    plain input the matmul only reads (``indices_2``) is not re-derived.
+    """
+    from .ast_read_writes import ReadWrites
+
+    if not isinstance(stmt, ast.For):
+        rw = ReadWrites.from_ast(stmt)
+        return name in rw.reads and any(_strip_ssa_suffix(w) == name for w in rw.writes)
+    if name not in ReadWrites.from_ast(stmt).reads:
+        return False
+    # Forward slice from ``name`` within the loop body; True when it reaches a
+    # write whose stripped name is ``name``.
+    inner = list(stmt.body)
+    tainted = {name}
+    changed = True
+    while changed:
+        changed = False
+        for s in inner:
+            rw = ReadWrites.from_ast(s)
+            if set(rw.reads) & tainted:
+                for w in rw.writes:
+                    if w not in tainted:
+                        tainted.add(w)
+                        changed = True
+    return any(_strip_ssa_suffix(w) == name for w in tainted if w != name)
+
+
+def _store_value_and_addr_reads(stmt: ast.AST) -> tuple[set[str], set[str]] | None:
+    """For a statement containing a single ``(ADDR).store(VALUE)`` call, return
+    ``(value_reads, addr_reads)`` — the names read in the stored VALUE and the
+    names read in the ADDRESS expression (plus any guarding condition).
+
+    Returns ``None`` when the statement has no ``.store(...)`` call (or has more
+    than one, which this analysis does not attempt to characterize)."""
+    stores = [
+        node
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "store"
+        and len(node.args) == 1
+    ]
+    if len(stores) != 1:
+        return None
+    store = stores[0]
+    value_reads = {n.id for n in ast.walk(store.args[0]) if isinstance(n, ast.Name)}
+    # Everything read in the statement that is not part of the stored value
+    # belongs to the address expression / guard (e.g. an enclosing ``if mask:``).
+    all_reads = {n.id for n in ast.walk(stmt) if isinstance(n, ast.Name)}
+    addr_reads = all_reads - value_reads
+    return value_reads, addr_reads
+
+
+def _lane_axis_wrongly_collapsed(
+    tail: list[ast.AST],
+    lane_var: str,
+    lane_varying: set[str],
+    stash_set: set[str],
+    marker_result_names: set[str],
+) -> bool:
+    """Return True when the register-stash lowering would collapse the lane axis
+    incorrectly.
+
+    The stash lowering reduces each marker over the lane axis, which is only
+    correct when the lane-distributed axis IS the reduced axis (matmul_layernorm:
+    the reduced output free dim is broadcast back into a per-lane store whose
+    VALUE still depends on the per-lane stash output).  When a side-effecting
+    store writes to a lane-varying ADDRESS but its stored VALUE depends only on
+    the reduced marker scalars (never on a per-lane stash output), each lane is a
+    distinct, preserved output element that the lane reduction wrongly collapses
+    (e.g. ``baddbmm(...).sum(-1)`` with the reduced dim folded into the matmul).
+
+    ``lane_varying`` is the set of lane-derived names over the FULL lane-loop body
+    (the per-lane output index, e.g. ``indices_2``, lives in the compute region
+    rather than the tail, so it must be supplied by the caller).
+    """
+    # Names in the tail that (transitively) depend on a stashed per-lane value,
+    # WITHOUT crossing a marker reduction.  A reduction marker collapses the lane
+    # axis: its result is a cross-lane reduced scalar, no longer a per-lane value,
+    # so the taint must STOP at marker results (a store of the reduced scalar is
+    # exactly the collapse-bug signature, and must not count as stash-dependent).
+    stash_tainted = _forward_taint_excluding_markers(
+        tail, stash_set, marker_result_names
+    )
+    for stmt in tail:
+        parsed = _store_value_and_addr_reads(stmt)
+        if parsed is None:
+            continue
+        value_reads, addr_reads = parsed
+        addr_lane_varying = lane_var in addr_reads or bool(addr_reads & lane_varying)
+        value_depends_on_stash = bool(value_reads & stash_tainted)
+        value_depends_on_marker = bool(value_reads & marker_result_names)
+        if addr_lane_varying and value_depends_on_marker and not value_depends_on_stash:
+            return True
+    return False
+
+
+def _forward_taint_excluding_markers(
+    body: list[ast.AST], roots: set[str], marker_result_names: set[str]
+) -> set[str]:
+    """Forward-slice taint of ``roots`` through ``body`` that does NOT propagate
+    across a lane-reduce marker.
+
+    A marker assigns a cross-lane reduced scalar (``R = ..._helion_lane_reduce``);
+    its result no longer depends on a single lane's value, so a statement that
+    only writes a marker result must not inherit the taint even when its reduction
+    input was tainted.
+    """
+    from .ast_read_writes import ReadWrites
+
+    tainted = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for stmt in body:
+            rw = ReadWrites.from_ast(stmt)
+            if not (set(rw.reads) & tainted):
+                continue
+            for w in rw.writes:
+                # A marker result is a reduction boundary: never taint it.
+                if w in marker_result_names:
+                    continue
+                if w not in tainted:
+                    tainted.add(w)
+                    changed = True
+    return tainted
+
+
+def _split_lane_loop_with_register_stash(
+    loop: ast.For,
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+) -> list[ast.AST] | None:
+    """Lower a lane loop whose reduction inputs depend on an unduplicatable op.
+
+    The standard two-pass split re-runs the reduction-input producers in a
+    second pass, which is unsafe when a matmul / cross-thread reduction is in
+    the slice.  Instead, run the matmul-bearing *compute region* (the prefix of
+    the body up to and including the last unduplicatable statement) exactly
+    once, stashing each lane's unduplicatable-derived live-out values into
+    per-thread register fragments.  Every downstream reduction marker and
+    consumer is then re-derived from the stash (a plain register read, safely
+    duplicatable), one accumulate/finalize pass per marker in dependency order,
+    plus a final consume pass for the side-effecting statements.
+
+    Returns the replacement statement list, or ``None`` when the pattern does
+    not apply (caller then falls back to the per-lane single-pass behavior).
+    """
+    from .ast_read_writes import ReadWrites
+
+    body: list[ast.AST] = list(loop.body)
+    marker_indices = {i for i, _ in markers}
+    extent = _lane_loop_extent(loop)
+
+    # Compute region: prefix of the body up to (and including) the last
+    # unduplicatable statement.  Everything after it must be free of
+    # unduplicatable ops so it can be re-derived from the stash.
+    undup_indices = [
+        i for i in range(len(body)) if _contains_unduplicatable_op(body[i])
+    ]
+    if not undup_indices:
+        return None
+    region_end = max(undup_indices)
+    region = body[: region_end + 1]
+    tail = body[region_end + 1 :]
+    tail_offset = region_end + 1
+    if any(_contains_unduplicatable_op(s) for s in tail):
+        return None
+    # A marker inside the compute region cannot be re-derived from the stash
+    # (its reduction would have to run before the matmul finishes).
+    if any(i <= region_end for i in marker_indices):
+        return None
+
+    if extent <= 0 or extent > 256:
+        return None
+
+    lane_varying = _lane_varying_names(body, lane_var)
+
+    tail_reads: set[str] = set()
+    for stmt in tail:
+        tail_reads |= set(ReadWrites.from_ast(stmt).reads)
+
+    # Identify the loop-carried accumulators produced by the unduplicatable
+    # statements — values whose post-region magnitude depends on the matmul and
+    # therefore cannot be recomputed.  These are exactly the names that MUST be
+    # stashed.  Helion emits a matmul K loop as
+    # ``acc = 0; for k: acc_copy = acc; ...; acc_<n> = acc_copy_0 + reduce`` and
+    # an implicit phi makes the post-loop ``acc`` equal the loop output
+    # ``acc_<n>`` (collapsed by a later rename pass).  A name X is carried when:
+    #   * X is written by a non-unduplicatable region statement (its ``acc = 0``
+    #     seed) and read after the region (lane-varying), and
+    #   * an unduplicatable statement's body re-derives X — its forward slice
+    #     from X reaches a write whose SSA-stripped name equals X (``acc_1`` /
+    #     ``acc_copy`` -> ``acc``).
+    # The forward-slice condition distinguishes a true accumulator (``acc``,
+    # rewritten each K step) from a plain input that the matmul merely reads
+    # (``indices_2``, unchanged through the loop).
+    seed_writes: set[str] = set()
+    for i, stmt in enumerate(region):
+        if i in undup_indices:
+            continue
+        seed_writes |= set(ReadWrites.from_ast(stmt).writes)
+    # The carried accumulator's *name* (``acc`` from ``acc = 0``) is not itself
+    # lane-varying — only the loop output alias (``acc_1``) is — so do NOT filter
+    # candidates by ``lane_varying`` here.  The re-derives check confirms the
+    # matmul transforms the accumulator, and below we require the re-deriving
+    # statement to be lane-varying so a genuinely lane-invariant accumulator is
+    # left alone.
+    candidate_carried = seed_writes & tail_reads
+    carried: set[str] = set()
+    for name in candidate_carried:
+        for i in undup_indices:
+            if not _undup_stmt_rederives(body[i], name):
+                continue
+            stmt_reads = set(ReadWrites.from_ast(body[i]).reads)
+            if lane_var in stmt_reads or bool(stmt_reads & lane_varying):
+                carried.add(name)
+                break
+    # Also stash any value DIRECTLY produced by an unduplicatable statement that
+    # is read by the tail (e.g. a matmul whose output is a fresh name rather than
+    # an accumulator phi).
+    undup_writes: set[str] = set()
+    for i in undup_indices:
+        undup_writes |= set(ReadWrites.from_ast(body[i]).writes)
+    direct = undup_writes & lane_varying & tail_reads
+    stash_names = sorted(carried | direct)
+    if not stash_names:
+        return None
+
+    stash_set = set(stash_names)
+
+    # Correctness gate: the register-stash lowering reduces each marker OVER THE
+    # LANE axis (stash per lane, then sum lanes + warp-reduce).  That is only
+    # valid when the lane-distributed axis IS the reduced axis — i.e. the genuine
+    # matmul_layernorm pattern, where the matmul OUTPUT free dim is split across
+    # the lane and the layernorm reduces exactly that dim, then broadcasts the
+    # reduced scalar back into a *per-lane* normalize+store (each lane keeps a
+    # distinct, stash-derived output value).
+    #
+    # A different pattern — e.g. ``baddbmm(...).sum(-1)`` over a small static dim
+    # — folds the reduced axis into the matmul itself, leaving each lane holding a
+    # COMPLETE, distinct output element.  There the lane axis is a *preserved*
+    # output dim, the spurious marker reduces over the wrong (lane) axis, and the
+    # store writes the single reduced scalar to lane-varying addresses (every lane
+    # storing the same collapsed value).  Detect that here and bail to the
+    # correct per-lane path: a side-effecting store whose ADDRESS depends on the
+    # lane var but whose stored VALUE depends only on reduced marker results (no
+    # per-lane stash output) means the lane axis was wrongly collapsed.
+    marker_result_names = {m.result_var for _, m in markers}
+    if _lane_axis_wrongly_collapsed(
+        tail, lane_var, lane_varying, stash_set, marker_result_names
+    ):
+        return None
+    # Region statements that are *duplicatable* and can be recomputed cheaply in
+    # the later passes (e.g. ``indices_2 = thread_idx[0] + lane * 4``).  Drop the
+    # unduplicatable statements and any statement that produces a stashed name.
+    recompute: list[ast.AST] = []
+    for i, stmt in enumerate(region):
+        if i in undup_indices:
+            continue
+        writes = set(ReadWrites.from_ast(stmt).writes)
+        if writes & stash_set:
+            continue
+        recompute.append(stmt)
+    # Keep only the recompute statements that (transitively) feed the tail.
+    recompute_keep_idx, _ = _backward_slice(recompute, tail_reads)
+    recompute_kept = [recompute[i] for i in recompute_keep_idx]
+    # The recompute slice must not pull in an unduplicatable op or reference a
+    # stashed name (which is only available from the fragment, not recomputable).
+    for s in recompute_kept:
+        if _contains_unduplicatable_op(s):
+            return None
+
+    # Allocate one register fragment per stashed value.
+    uid = next(_LANE_STASH_COUNTER)
+    frag_by_name: dict[str, str] = {}
+    decls: list[ast.AST] = []
+    for name in stash_names:
+        frag = f"_lane_stash_{uid}_{name}"
+        frag_by_name[name] = frag
+        dtype = _stash_dtype_for_value(name, body, markers)
+        decls.append(
+            statement_from_string(f"{frag} = cute.make_fragment({extent}, {dtype})")
+        )
+
+    def read_stash_stmts() -> list[ast.AST]:
+        return [
+            statement_from_string(f"{name} = {frag_by_name[name]}[{lane_var}]")
+            for name in stash_names
+        ]
+
+    # Phase 0: run the compute region once and stash the live-out values.
+    phase0_body: list[ast.AST] = list(region)
+    for name in stash_names:
+        phase0_body.append(
+            statement_from_string(f"{frag_by_name[name]}[{lane_var}] = {name}")
+        )
+
+    # The marker assignments within the tail produce already-finalized scalars
+    # (computed once after each reduction pass), so they must NOT be re-run as
+    # per-lane passthroughs inside any later pass.  Build the re-derivable tail
+    # (every non-marker statement) and the set of finalized marker result vars
+    # that downstream slices treat as pre-defined boundaries.
+    marker_result_vars = {m.result_var for _, m in markers}
+    rederivable_tail = [s for s in tail if _is_lane_reduce_marker_assign(s) is None]
+
+    result: list[ast.AST] = []
+    result.extend(decls)
+    result.append(_create_lane_loop(lane_var, extent, phase0_body))
+
+    # Process each marker in source order (they are sequentially dependent: a
+    # later marker's input may read an earlier marker's finalized scalar).
+    for _idx, m in markers:
+        acc_var = f"{m.result_var}_lane_acc"
+        result.append(statement_from_string(f"{acc_var} = {m.identity_expr}"))
+        # Accumulate pass: recompute cheap region producers, read the stash,
+        # then re-derive this marker's input and fold it into the accumulator.
+        # The slice runs over the re-derivable tail only; references to other
+        # markers' results stop at those finalized scalars.
+        input_slice_idx, _ = _backward_slice(rederivable_tail, {m.input_name})
+        input_stmts = [
+            rederivable_tail[i]
+            for i in input_slice_idx
+            if not _assigns_simple_name(rederivable_tail[i], marker_result_vars)
+        ]
+        acc_body: list[ast.AST] = []
+        acc_body.extend(_clone_stmt(s) for s in recompute_kept)
+        acc_body.extend(read_stash_stmts())
+        acc_body.extend(_clone_stmt(s) for s in input_stmts)
+        ctor = _dtype_ctor_from_identity(m.identity_expr)
+        combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
+        acc_body.append(
+            statement_from_string(
+                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
+            )
+        )
+        result.append(_create_lane_loop(lane_var, extent, acc_body))
+        result.extend(_finalize_lane_reduce_marker(m, acc_var))
+
+    # Final consume pass: everything in the tail except the marker assignments,
+    # re-derived from the stash + finalized scalars.  Only keep statements that
+    # feed a side effect (a store / in-place write).
+    consume_candidates = [s for i, s in enumerate(body) if i >= tail_offset]
+    consume_candidates = [
+        s for s in consume_candidates if _is_lane_reduce_marker_assign(s) is None
+    ]
+    keep_idx = _live_phase2_indices(consume_candidates)
+    consume_kept = [s for i, s in enumerate(consume_candidates) if i in keep_idx]
+    if consume_kept:
+        consume_body: list[ast.AST] = []
+        consume_body.extend(_clone_stmt(s) for s in recompute_kept)
+        consume_body.extend(read_stash_stmts())
+        consume_body.extend(_clone_stmt(s) for s in consume_kept)
+        result.append(_create_lane_loop(lane_var, extent, consume_body))
+    return result
+
+
+def _markers_feed_cross_lane_carry(
+    body: list[ast.AST],
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+) -> bool:
+    """Return True when the lane loop carries an accumulator across the lanes
+    that a marker result feeds (online-softmax attention's ``m_i`` / ``l_i`` /
+    ``acc`` recurrence).
+
+    Helion represents a loop-carried value with a phi ``X_copy = X`` read at the
+    TOP of the loop body (before the value is rewritten) and a corresponding
+    output assignment renamed back to ``X`` by a later pass.  Such an
+    accumulating lane loop must keep the existing per-lane restore lowering, so
+    the register-stash path (which assumes each marker result is consumed only by
+    per-lane / store consumers, never carried across lanes) must not fire.
+
+    matmul_layernorm's N-output lane loop has no such top-level ``X_copy = X``
+    carry (its ``acc`` is the matmul accumulator, carried by the *inner* K loop,
+    not across the lane iterations), so this returns False and the stash path is
+    free to run.
+    """
+    from .ast_read_writes import ReadWrites
+
+    if not markers:
+        return False
+
+    # Live-in names of the lane body (read before written), excluding the lane
+    # var.  A loop-carried accumulator phi is live-in.
+    written_so_far: set[str] = set()
+    live_in: set[str] = set()
+    for stmt in body:
+        rw = ReadWrites.from_ast(stmt)
+        for name in rw.reads:
+            if name != lane_var and name not in written_so_far:
+                live_in.add(name)
+        written_so_far |= set(rw.writes)
+
+    # Detect top-level phi copies ``X_copy = X`` of a live-in accumulator.
+    for stmt in body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Name)
+        ):
+            src = stmt.value.id
+            dst = stmt.targets[0].id
+            if src in live_in and _strip_ssa_suffix(dst) == _strip_ssa_suffix(src):
+                return True
+    return False
+
+
+def _has_extra_cross_lane_carry(
+    body: list[ast.AST], lane_var: str, marker_indices: set[int]
+) -> bool:
+    """Return True when ``body`` contains a loop-carried accumulator across the
+    lanes that is INDEPENDENT of the reduction markers.
+
+    Two-pass splitting is correct whenever every cross-lane carried value
+    transitively consumes a marker result (e.g. an online-softmax
+    ``mi = max(mi, local_amax)`` or ``di = di + sum``): after the split the
+    carried update runs once per outer iteration on the fully-reduced scalar.
+    But an *independent* carried accumulator — one that does not depend on any
+    marker result, such as a matmul ``dot_acc += dot_product`` — must keep
+    accumulating once per lane, so the split would drop or corrupt it. In that
+    case the caller falls back to the single-pass per-lane behavior.
+
+    A carried value is detected as a name that is *live-in* to the lane body
+    (read before it is written within the body, directly or through a
+    ``X_copy = X`` alias) and also written within the body.
+    """
+    from .ast_read_writes import ReadWrites
+
+    written_so_far: set[str] = set()
+    aliases: dict[str, str] = {}  # copy_var -> original carried name
+    live_in: set[str] = set()
+    for stmt in body:
+        rw = ReadWrites.from_ast(stmt)
+        for name in rw.reads:
+            if name != lane_var and name not in written_so_far:
+                live_in.add(name)
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Name)
+        ):
+            aliases[stmt.targets[0].id] = stmt.value.id
+        written_so_far |= set(rw.writes)
+
+    def root(name: str) -> str:
+        seen: set[str] = set()
+        while name in aliases and name not in seen:
+            seen.add(name)
+            name = aliases[name]
+        return name
+
+    # Names that (transitively) depend on a marker result. Carried values that
+    # only depend on these are fine under the two-pass split.
+    marker_results = {
+        m.result_var
+        for i, stmt in enumerate(body)
+        if i in marker_indices
+        and (m := _is_lane_reduce_marker_assign(stmt)) is not None
+    }
+    marker_tainted = set(marker_results)
+    changed = True
+    while changed:
+        changed = False
+        for stmt in body:
+            rw = ReadWrites.from_ast(stmt)
+            if set(rw.reads) & marker_tainted:
+                for w in rw.writes:
+                    if w not in marker_tainted:
+                        marker_tainted.add(w)
+                        changed = True
+
+    # Names that (transitively) depend on the lane var. A carried accumulator
+    # whose per-iteration update is lane-varying (e.g. a matmul
+    # ``dot_acc += dot_product(lane)``) cannot move to the once-per-tile tail,
+    # so the two-pass split would break it. A lane-invariant update (e.g.
+    # welford's ``acc_cnt += block_size``) is fine in the tail.
+    lane_varying = _lane_varying_names(body, lane_var)
+
+    # Bail if some carried accumulator is independent of every marker AND its
+    # update consumes a lane-varying value.
+    for idx, stmt in enumerate(body):
+        if idx in marker_indices:
+            continue
+        rw = ReadWrites.from_ast(stmt)
+        reads = set(rw.reads)
+        update_is_lane_varying = lane_var in reads or bool(reads & lane_varying)
+        if not update_is_lane_varying:
+            continue
+        for w in rw.writes:
+            if root(w) in live_in and root(w) not in marker_tainted:
+                return True
+    return False
+
+
+def _restore_per_lane_markers(
+    loop: ast.For, markers: list[tuple[int, _LaneReduceMarker]]
+) -> ast.For:
+    """Replace each ``_helion_lane_reduce`` marker in ``loop`` with its raw
+    per-lane input, restoring the original single-pass behavior (used when the
+    two-pass split is unsafe)."""
+    body = list(loop.body)
+    for idx, m in markers:
+        body[idx] = statement_from_string(
+            f"{m.result_var} = {m.finalize_expr(m.input_name)}"
+        )
+    loop.body = body
+    return loop
+
+
+_UNDUPLICATABLE_CALLS = (
+    "_cute_grouped_reduce_shared_two_stage",
+    "_cute_grouped_reduce_shared_tree",
+    "_cute_grouped_reduce_warp",
+    "cute.gemm",
+    "warp_reduction",
+)
+
+
+def _contains_unduplicatable_op(stmt: ast.AST) -> bool:
+    """Return True when ``stmt`` (or any nested statement) contains a matmul /
+    collective whose shared-memory side effects make it unsafe to re-run in a
+    second lane pass."""
+    src = ast.unparse(stmt)
+    return any(call in src for call in _UNDUPLICATABLE_CALLS)
+
+
+def _has_side_effect(stmt: ast.AST) -> bool:
+    """Return True when ``stmt`` produces an observable side effect (a store,
+    an in-place / atomic write, or any non-plain-assignment statement such as
+    an ``if mask: tensor[...].store(...)``)."""
+    from .ast_read_writes import ReadWrites
+
+    if isinstance(stmt, ast.Assign):
+        return bool(ReadWrites.from_ast(stmt).inplace_writes)
+    # Conservatively treat structured / expression statements as
+    # side-effecting (store calls live inside ``if`` blocks / bare exprs).
+    return True
+
+
+def _live_phase2_indices(body: list[ast.AST]) -> set[int]:
+    """Indices of statements in ``body`` that contribute to a side effect
+    (directly, or by feeding a later side-effecting statement)."""
+    from .ast_read_writes import ReadWrites
+
+    needed_names: set[str] = set()
+    keep: set[int] = set()
+    for idx in range(len(body) - 1, -1, -1):
+        stmt = body[idx]
+        rw = ReadWrites.from_ast(stmt)
+        writes = set(rw.writes)
+        if _has_side_effect(stmt) or (writes & needed_names):
+            keep.add(idx)
+            needed_names |= set(rw.reads)
+    return keep
+
+
+def _lane_loop_extent(loop: ast.For) -> int:
+    call = loop.iter
+    assert isinstance(call, ast.Call)
+    assert len(call.args) == 1
+    return int(ast.literal_eval(call.args[0]))
+
+
+def _lane_varying_names(body: list[ast.AST], lane_var: str) -> set[str]:
+    """Names whose values (transitively) depend on the lane var within ``body``."""
+    from .ast_read_writes import ReadWrites
+
+    varying = {lane_var}
+    changed = True
+    while changed:
+        changed = False
+        for stmt in body:
+            rw = ReadWrites.from_ast(stmt)
+            if set(rw.reads) & varying:
+                for w in rw.writes:
+                    if w not in varying:
+                        varying.add(w)
+                        changed = True
+    varying.discard(lane_var)
+    return varying
+
+
+def _lane_body_live_in(body: list[ast.AST], lane_var: str) -> set[str]:
+    """Names read in ``body`` before they are written (live-in), excluding the
+    lane var.  A loop-carried accumulator phi is live-in to the lane body."""
+    from .ast_read_writes import ReadWrites
+
+    written: set[str] = set()
+    live_in: set[str] = set()
+    for stmt in body:
+        rw = ReadWrites.from_ast(stmt)
+        for name in rw.reads:
+            if name != lane_var and name not in written:
+                live_in.add(name)
+        written |= set(rw.writes)
+    return live_in
+
+
+def _is_serial_for(stmt: ast.AST) -> bool:
+    """Return True when ``stmt`` is an ordinary serial ``for`` loop (a device
+    serial loop), NOT a per-thread lane loop."""
+    return (
+        isinstance(stmt, ast.For)
+        and getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None) is None
+    )
+
+
+def _clone_stmt(stmt: ast.AST) -> ast.AST:
+    """Return an independent copy of ``stmt`` via unparse + reparse.
+
+    ``interchange_lane_outside_serial_reductions`` emits two loop nests that
+    both re-run the shared (side-effect-free) producers. Splicing the same node
+    objects into two places in the tree breaks AST walking, so each reused
+    statement is rebuilt from its source text into a fresh ExtendedAST node.
+    """
+    return statement_from_string(ast.unparse(stmt))
+
+
+def _clone_expr(node: ast.AST) -> ast.AST:
+    return expr_from_string(ast.unparse(node))
+
+
+def _forward_live_names(body: list[ast.AST], roots: set[str]) -> set[str]:
+    """Names produced by the forward slice that (transitively) consumes any
+    name in ``roots`` within ``body``."""
+    from .ast_read_writes import ReadWrites
+
+    tainted = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for stmt in body:
+            rw = ReadWrites.from_ast(stmt)
+            if set(rw.reads) & tainted:
+                for w in rw.writes:
+                    if w not in tainted:
+                        tainted.add(w)
+                        changed = True
+    return tainted
+
+
+def interchange_lane_outside_serial_reductions(
+    body: list[ast.AST],
+) -> list[ast.AST]:
+    """Interchange a ``for LANE: ... for MB: ...`` nest whose inner serial loop
+    contains ``_helion_lane_reduce`` markers.
+
+    layer_norm_bwd / rms_norm_bwd compute, inside a serial ``mb`` loop, BOTH a
+    per-feature accumulator that must keep the lane loop OUTSIDE the ``mb`` loop
+    (``grad_w_acc += ...``) AND a feature reduction whose result is broadcast
+    back into a per-row store (``grad_x``), which needs every lane summed *per*
+    ``mb`` iteration (lane INSIDE ``mb``). A single lane loop cannot satisfy
+    both nestings, so emit two specialized loop nests:
+
+    * Nest B (grad_w): the original ``for LANE: ... for MB: ...`` loop with the
+      lane-reduce markers and the reduction-consuming side effects removed —
+      keeping only the per-feature accumulators and their stores.
+    * Nest A (grad_x): a ``for MB: ... for LANE: ...`` loop carrying only the
+      lane reduction and its broadcast consumer. Its inner lane loop still holds
+      the markers so the subsequent ``split_lane_loop_reductions`` pass produces
+      the per-``mb`` accumulate -> warp-combine -> consume structure.
+
+    Returns ``body`` unchanged when no such pattern is present.
+    """
+    new_body: list[ast.AST] = []
+    for stmt in body:
+        new_body.extend(_interchange_stmt(stmt))
+    return new_body
+
+
+def _interchange_stmt(stmt: ast.AST) -> list[ast.AST]:
+    for field in ("body", "orelse", "finalbody"):
+        old = getattr(stmt, field, None)
+        if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+            setattr(stmt, field, interchange_lane_outside_serial_reductions(old))
+    lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+    if (
+        lane_var is None
+        or not isinstance(stmt, ast.For)
+        or not isinstance(stmt.target, ast.Name)
+        or stmt.target.id != lane_var
+    ):
+        return [stmt]
+    return _interchange_one_lane_loop(stmt, lane_var)
+
+
+def _interchange_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
+    from .ast_read_writes import ReadWrites
+
+    body: list[ast.AST] = list(loop.body)
+    # Find the single inner serial ``for`` loop that carries lane-reduce markers.
+    mb_index: int | None = None
+    for idx, stmt in enumerate(body):
+        if _is_serial_for(stmt) and any(
+            _is_lane_reduce_marker_assign(s) is not None
+            for s in cast("ast.For", stmt).body
+        ):
+            if mb_index is not None:
+                # More than one candidate serial loop: not the simple pattern.
+                return [loop]
+            mb_index = idx
+    if mb_index is None:
+        return [loop]
+
+    mb_loop = cast("ast.For", body[mb_index])
+    lane_prefix = body[:mb_index]
+    lane_suffix = body[mb_index + 1 :]
+    mb_body: list[ast.AST] = list(mb_loop.body)
+
+    markers = [
+        (i, m)
+        for i, s in enumerate(mb_body)
+        if (m := _is_lane_reduce_marker_assign(s)) is not None
+    ]
+    if not markers:
+        return [loop]
+    marker_indices = {i for i, _ in markers}
+    marker_results = {m.result_var for _, m in markers}
+
+    # The mb body's only side effect that consumes a marker result is the
+    # broadcast-reduction store (e.g. ``grad_x[mb] = ...``). Everything else in
+    # the mb body / suffix (the per-feature accumulators and their stores) is
+    # independent of the reduction and is handled correctly by Nest B alone.
+    grad_x_seed = {m.input_name for _, m in markers} | marker_results
+    grad_x_live = _forward_live_names(mb_body, grad_x_seed)
+
+    def is_reduction_store(stmt: ast.AST) -> bool:
+        return _has_side_effect(stmt) and bool(
+            set(ReadWrites.from_ast(stmt).reads) & grad_x_live
+        )
+
+    if not any(is_reduction_store(s) for s in mb_body):
+        # The lane reduction inside the serial loop is not consumed by a
+        # broadcast store, so the interchange does not apply. Markers nested in
+        # a serial loop are not reachable by ``split_lane_loop_reductions`` (it
+        # only rewrites top-level lane loops), so restore them to their raw
+        # per-lane inputs to avoid leaving an unprocessed marker behind.
+        restored: list[ast.stmt] = [cast("ast.stmt", s) for s in mb_body]
+        for idx, m in markers:
+            restored[idx] = statement_from_string(
+                f"{m.result_var} = {m.finalize_expr(m.input_name)}"
+            )
+        mb_loop.body = restored
+        return [loop]
+
+    # A name is lane-varying if it (transitively) depends on the lane var across
+    # the whole lane-loop body; lane-invariant names (mb bounds, masks, ...) are
+    # recomputed once rather than per lane.
+    lane_varying = _lane_varying_names([*lane_prefix, *mb_body, *lane_suffix], lane_var)
+
+    def reads_lane(stmt: ast.AST) -> bool:
+        reads = set(ReadWrites.from_ast(stmt).reads)
+        return lane_var in reads or bool(reads & lane_varying)
+
+    # --- Nest A (grad_x): for MB: for LANE: <reduction + broadcast store> ------
+    # Backward slice from the reduction-broadcast stores and the marker inputs,
+    # across both the mb body and the lane prefix. The per-feature accumulators
+    # feed only the suffix stores (never the reduction store), so they are
+    # naturally excluded — no carry analysis is required.
+    mb_bound_names = set(ReadWrites.from_ast(mb_loop.iter).reads)
+    needed = {m.input_name for _, m in markers} | mb_bound_names
+    keep_mb_a: list[ast.AST] = []
+    for idx in range(len(mb_body) - 1, -1, -1):
+        stmt = mb_body[idx]
+        rw = ReadWrites.from_ast(stmt)
+        if idx in marker_indices:
+            keep_mb_a.append(stmt)
+            needed |= set(rw.reads) - marker_results
+            continue
+        if is_reduction_store(stmt) or (set(rw.writes) & needed):
+            keep_mb_a.append(stmt)
+            needed |= set(rw.reads)
+    keep_mb_a.reverse()
+    keep_prefix_a: list[ast.AST] = []
+    for stmt in reversed(lane_prefix):
+        rw = ReadWrites.from_ast(stmt)
+        if set(rw.writes) & needed:
+            keep_prefix_a.append(stmt)
+            needed |= set(rw.reads)
+    keep_prefix_a.reverse()
+
+    # Partition kept statements into lane-invariant (run once per mb iteration)
+    # vs lane-varying (recomputed per lane inside the inner lane loop).
+    prefix_invariant_a = [_clone_stmt(s) for s in keep_prefix_a if not reads_lane(s)]
+    prefix_varying_a = [_clone_stmt(s) for s in keep_prefix_a if reads_lane(s)]
+    mb_head_a = [_clone_stmt(s) for s in keep_mb_a if not reads_lane(s)]
+    mb_varying_a = [_clone_stmt(s) for s in keep_mb_a if reads_lane(s)]
+
+    extent = _lane_loop_extent(loop)
+    inner_lane_loop_a = _create_lane_loop(
+        lane_var, extent, [*prefix_varying_a, *mb_varying_a]
+    )
+    mb_loop_a = create(
+        ast.For,
+        target=_clone_expr(mb_loop.target),
+        iter=_clone_expr(mb_loop.iter),
+        body=[*mb_head_a, inner_lane_loop_a],
+        orelse=[],
+        type_comment=None,
+    )
+    nest_a: list[ast.AST] = [*prefix_invariant_a, mb_loop_a]
+
+    # --- Nest B (grad_w): the original lane loop with markers reverted to their
+    # raw per-lane inputs. Its per-feature accumulators (lane-outside-mb) are
+    # already correct; its reduction-broadcast store writes a partial (per-lane)
+    # value that Nest A re-stores with the full reduction afterwards.
+    restored_mb_body = list(mb_loop.body)
+    for idx, m in markers:
+        restored_mb_body[idx] = statement_from_string(
+            f"{m.result_var} = {m.finalize_expr(m.input_name)}"
+        )
+    mb_loop.body = restored_mb_body
+    nest_b = loop
+
+    return [nest_b, *nest_a]
+
+
+# ---------------------------------------------------------------------------
+# Chunked-recurrence (GDN) lane-invariant accumulator hoist.
+#
+# A chunked recurrence such as gdn_fwd_h carries an accumulator ``b_h`` across a
+# SERIAL chunk loop and, inside each chunk, contracts a matmul over the
+# within-chunk position ``c`` (lowered as an inner lane loop).  ``matmul_fallback``
+# emits the running-sum ``dot_acc`` form for this matmul (because the per-chunk
+# rescale is lane-invariant), producing inside the lane loop:
+#
+#       dot_acc_base = <lane-invariant rescale of b_h>      # e.g. b_h * decay
+#       dot_acc = dot_acc + <product(c)>                    # accumulate over c
+#       b_h = dot_acc_base + dot_acc                        # WRONG: per-lane reassign
+#
+# with ``dot_acc = <identity>`` reset OUTSIDE the chunk loop.  Reassigning ``b_h``
+# every lane iteration corrupts the recurrence (and any lane-invariant op that
+# must read the chunk-ENTRY ``b_h``, e.g. the store of ``b_h`` and the matmul
+# operand ``c_h = b_h``).  This pass restructures the nest to apply the rescale
+# and the final add once per chunk:
+#
+#   for chunk:
+#       dot_acc = <identity>                  # reset per chunk
+#       <lane-invariant chunk-entry stores using b_h>
+#       dot_acc_base = <rescale of frozen b_h>
+#       for lane:
+#           <producers; dot_acc = dot_acc + product(c)>
+#       b_h = dot_acc_base + dot_acc          # once per chunk
+# ---------------------------------------------------------------------------
+
+
+def _find_dot_acc_recurrence(
+    lane_loop: ast.For, lane_var: str
+) -> tuple[str, str, str] | None:
+    """If ``lane_loop`` ends with the chunked-recurrence ``dot_acc`` triple,
+    return ``(acc_var, dot_acc_base_var, dot_acc_var)``; else ``None``.
+
+    The triple (emitted by ``_emit_cute_matmul``'s lane-invariant ``dot_acc``
+    path) is, as the LAST three statements of the lane-loop body:
+
+        dot_acc_base = <expr>             # lane-invariant rescale of acc
+        dot_acc = dot_acc + <product>    # running sum over the lane axis
+        acc = dot_acc_base + dot_acc     # final combine
+    """
+    body = lane_loop.body
+    if len(body) < 3:
+        return None
+    base_stmt, sum_stmt, final_stmt = body[-3], body[-2], body[-1]
+
+    def assign_name(stmt: ast.AST) -> str | None:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            return stmt.targets[0].id
+        return None
+
+    base_var = assign_name(base_stmt)
+    dot_acc_var = assign_name(sum_stmt)
+    acc_var = assign_name(final_stmt)
+    if base_var is None or dot_acc_var is None or acc_var is None:
+        return None
+    if not (base_var.startswith("dot_acc_base") and dot_acc_var.startswith("dot_acc")):
+        return None
+    # ``dot_acc = dot_acc + product``: a running self-sum over the lane axis.
+    assert isinstance(sum_stmt, ast.Assign)
+    if not (
+        isinstance(sum_stmt.value, ast.BinOp)
+        and isinstance(sum_stmt.value.op, ast.Add)
+        and isinstance(sum_stmt.value.left, ast.Name)
+        and sum_stmt.value.left.id == dot_acc_var
+    ):
+        return None
+    # ``acc = dot_acc_base + dot_acc``: the final per-chunk combine.
+    assert isinstance(final_stmt, ast.Assign)
+    final_reads = {n.id for n in ast.walk(final_stmt.value) if isinstance(n, ast.Name)}
+    if final_reads != {base_var, dot_acc_var}:
+        return None
+    # The rescale (``dot_acc_base``) must be lane-INVARIANT: it must not read the
+    # lane var nor any value derived from it within the lane body.
+    lane_body: list[ast.AST] = list(body)
+    lane_varying = _lane_varying_names(lane_body, lane_var)
+    from .ast_read_writes import ReadWrites
+
+    base_reads = set(ReadWrites.from_ast(base_stmt).reads)
+    if lane_var in base_reads or (base_reads & lane_varying):
+        return None
+    return acc_var, base_var, dot_acc_var
+
+
+def _single_lane_loop_in_body(
+    body: list[ast.AST],
+) -> tuple[int, ast.For, str] | None:
+    """If ``body`` contains exactly one direct lane loop, return its index, the
+    loop node, and its lane var; else ``None``."""
+    found: tuple[int, ast.For, str] | None = None
+    for idx, stmt in enumerate(body):
+        lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
+        if (
+            lane_var is not None
+            and isinstance(stmt, ast.For)
+            and isinstance(stmt.target, ast.Name)
+            and stmt.target.id == lane_var
+        ):
+            if found is not None:
+                return None
+            found = (idx, stmt, lane_var)
+    return found
+
+
+def _find_reset_assign(body: list[ast.AST], var: str) -> int | None:
+    """Index of the last ``var = <expr>`` plain assignment in ``body`` (the
+    ``dot_acc`` reset emitted before the chunk loop), or ``None``."""
+    for idx in range(len(body) - 1, -1, -1):
+        stmt = body[idx]
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == var
+        ):
+            return idx
+    return None
+
+
+def hoist_lane_invariant_chunk_recurrence(
+    body: list[ast.AST],
+) -> list[ast.AST]:
+    """Restructure ``for chunk: for lane: <dot_acc recurrence>`` nests so the
+    lane-invariant rescale, chunk-entry stores, and final accumulator combine
+    run once per chunk (see the module comment above).
+
+    Tightly gated: only fires on a serial chunk loop whose single inner lane
+    loop ends with the ``dot_acc`` triple and whose ``dot_acc`` reset sits in
+    the same statement list before the chunk loop.
+    """
+    new_body: list[ast.AST] = []
+    for stmt in body:
+        # Recurse into nested statement-bearing fields first.
+        for field in ("body", "orelse", "finalbody"):
+            old = getattr(stmt, field, None)
+            if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
+                setattr(stmt, field, hoist_lane_invariant_chunk_recurrence(old))
+
+        info = _detect_chunk_recurrence(stmt)
+        if info is None:
+            new_body.append(stmt)
+            continue
+        dot_acc_var = info[0]
+        reset_idx = _find_reset_assign(new_body, dot_acc_var)
+        if reset_idx is None:
+            # No relocatable reset found: bail out (leave nest unchanged).
+            new_body.append(stmt)
+            continue
+        reset_stmt = new_body.pop(reset_idx)
+        assert isinstance(stmt, ast.For)
+        new_body.append(_rewrite_chunk_recurrence(stmt, info, reset_stmt))
+    return new_body
+
+
+def _detect_chunk_recurrence(
+    stmt: ast.AST,
+) -> tuple[str, int, ast.For, str, str, str, str] | None:
+    """Return ``(dot_acc_var, lane_idx, lane_loop, lane_var, acc_var, base_var,
+    dot_acc_var)`` when ``stmt`` is a serial chunk loop carrying the ``dot_acc``
+    recurrence, else ``None``."""
+    if not _is_serial_for(stmt) or not isinstance(stmt, ast.For):
+        return None
+    found = _single_lane_loop_in_body(list(stmt.body))
+    if found is None:
+        return None
+    lane_idx, lane_loop, lane_var = found
+    triple = _find_dot_acc_recurrence(lane_loop, lane_var)
+    if triple is None:
+        return None
+    acc_var, base_var, dot_acc_var = triple
+    return dot_acc_var, lane_idx, lane_loop, lane_var, acc_var, base_var, dot_acc_var
+
+
+def _rewrite_chunk_recurrence(
+    stmt: ast.For,
+    info: tuple[str, int, ast.For, str, str, str, str],
+    reset_stmt: ast.AST,
+) -> ast.For:
+    """Build the restructured chunk loop (see module comment)."""
+    from .ast_read_writes import ReadWrites
+
+    _dot_acc, lane_idx, lane_loop, lane_var, acc_var, _base_var, _dot_acc2 = info
+    chunk_body: list[ast.AST] = list(stmt.body)
+    lane_body: list[ast.AST] = list(lane_loop.body)
+    base_stmt = lane_body[-3]
+    sum_stmt = lane_body[-2]
+    final_stmt = lane_body[-1]
+    producers: list[ast.AST] = lane_body[:-3]
+
+    lane_varying = _lane_varying_names(lane_body, lane_var)
+
+    def reads_lane(s: ast.AST) -> bool:
+        reads = set(ReadWrites.from_ast(s).reads)
+        return lane_var in reads or bool(reads & lane_varying)
+
+    # The "accumulator family": the names that all hold the chunk-ENTRY
+    # accumulator value.  Helion may capture the loop-carried phi through a chain
+    # of plain copy-aliases (``b_h_copy = b_h``; ``b_h_copy_0 = b_h_copy``) and
+    # the rescale / chunk-entry store read those copies, not ``acc_var`` (which
+    # is the chunk-EXIT result).  Build the copy-alias closure over the chunk
+    # prefix and the lane producers, seeded from the loop-carried phi: a name
+    # that is live-in to the lane body (read before written) and feeds the
+    # lane-invariant rescale ``base_stmt``.
+    chunk_prefix = chunk_body[:lane_idx]
+    copy_src: dict[str, str] = {}
+    for s in (*chunk_prefix, *producers):
+        if (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+            and isinstance(s.value, ast.Name)
+        ):
+            copy_src[s.targets[0].id] = s.value.id
+
+    def copy_root(name: str) -> str:
+        seen: set[str] = set()
+        while name in copy_src and name not in seen:
+            seen.add(name)
+            name = copy_src[name]
+        return name
+
+    base_slice_indices, _ = _backward_slice(
+        producers, set(ReadWrites.from_ast(base_stmt).reads)
+    )
+    base_slice_reads = set(ReadWrites.from_ast(base_stmt).reads)
+    for i in base_slice_indices:
+        base_slice_reads |= set(ReadWrites.from_ast(producers[i]).reads)
+    lane_live_in = _lane_body_live_in(producers, lane_var)
+    phi_roots = {
+        copy_root(name) for name in base_slice_reads if copy_root(name) in lane_live_in
+    }
+    acc_family = set(phi_roots)
+    for name in (*copy_src.keys(),):
+        if copy_root(name) in phi_roots:
+            acc_family.add(name)
+
+    # Backward slice feeding the lane-invariant rescale ``base_stmt``: those
+    # producers are lane-invariant and hoist before the lane loop with it.
+    base_seed = set(ReadWrites.from_ast(base_stmt).reads)
+    hoist_indices, _ = _backward_slice(producers, base_seed)
+    hoist_set = set(hoist_indices)
+
+    # Lane-invariant side-effecting statements whose backward slice reaches the
+    # (frozen) chunk-ENTRY accumulator (the store of ``b_h``) must hoist before
+    # the lane loop so they run once per chunk on the frozen value; bring their
+    # producers along.  A store that does NOT read the accumulator stays in the
+    # lane loop (it is a genuinely per-lane side effect).
+    entry_indices: list[int] = []
+    for idx, prod in enumerate(producers):
+        if idx in hoist_set or reads_lane(prod) or not _has_side_effect(prod):
+            continue
+        slice_indices, _ = _backward_slice(
+            producers[:idx], set(ReadWrites.from_ast(prod).reads)
+        )
+        slice_reads = set(ReadWrites.from_ast(prod).reads)
+        for i in slice_indices:
+            slice_reads |= set(ReadWrites.from_ast(producers[i]).reads)
+        if not (acc_family & slice_reads):
+            continue
+        # The store + its lane-invariant producer slice all hoist.
+        if any(reads_lane(producers[i]) for i in slice_indices):
+            continue
+        entry_indices.append(idx)
+        hoist_set.update(slice_indices)
+
+    hoist_pre = sorted(hoist_set | set(entry_indices))
+    pre_lane = [producers[i] for i in hoist_pre]
+    lane_kept = [
+        producers[i]
+        for i in range(len(producers))
+        if i not in hoist_set and i not in set(entry_indices)
+    ]
+
+    new_lane_loop = _create_lane_loop(
+        lane_var, _lane_loop_extent(lane_loop), [*lane_kept, sum_stmt]
+    )
+    new_chunk_body: list[ast.AST] = [
+        *chunk_body[:lane_idx],
+        reset_stmt,
+        *pre_lane,
+        base_stmt,
+        new_lane_loop,
+        final_stmt,
+        *chunk_body[lane_idx + 1 :],
+    ]
+    return create(
+        ast.For,
+        target=stmt.target,
+        iter=stmt.iter,
+        body=new_chunk_body,
+        orelse=stmt.orelse,
+        type_comment=None,
+    )
+
+
 @dataclasses.dataclass
 class LoopDimInfo:
-    end_var_name: str | None
-    end_expr: sympy.Expr | None
+    begin_var_name: str | None = None
+    begin_expr: sympy.Expr | None = None
+    end_var_name: str | None = None
+    end_expr: sympy.Expr | None = None
 
     def is_end_matching(self, size: int | torch.SymInt) -> bool:
         expected = _to_sympy(size)
@@ -60,15 +1816,23 @@ class LoopDimInfo:
             or _has_unbacked(expected)
         ):
             return False
-        hint = CompileEnvironment.current().shape_env.size_hint
+        shape_env = CompileEnvironment.current().shape_env
         # TODO(jansel): current check is based on size hints, may need to guard here in the future
-        return hint(expected) == hint(self.end_expr)
+        return shape_env_size_hint(shape_env, expected) == shape_env_size_hint(
+            shape_env, self.end_expr
+        )
 
 
 @dataclasses.dataclass
 class DeviceLoopOrGridState:
     strategy: TileStrategy
     block_id_to_info: dict[int, LoopDimInfo]
+    thread_axis_sizes: dict[int, int] = dataclasses.field(
+        default_factory=dict, kw_only=True
+    )
+    block_thread_axes: dict[int, int] = dataclasses.field(
+        default_factory=dict, kw_only=True
+    )
 
     @property
     def block_ids(self) -> list[int]:
@@ -81,15 +1845,57 @@ class DeviceLoopState(DeviceLoopOrGridState):
     inner_statements: list[ast.AST]
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    # Block ids that this device loop distributes across a per-thread lane
+    # loop (CuTe only). A reduction over one of these blocks needs the
+    # two-pass lane structure (see ``split_lane_loop_reductions``).
+    lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
+
+
+@dataclasses.dataclass
+class EmitPipelineLoopState(DeviceLoopOrGridState):
+    """State for emit_pipeline-based loops on TPU (Pallas backend)."""
+
+    body_fn_name: str
+    body_fn_def: ast.FunctionDef | None = None
+    inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    pipeline_call: ast.AST | None = None
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class ForiLoopState(DeviceLoopOrGridState):
+    """State for fori_loop-based loops on TPU (Pallas backend).
+
+    Uses jax.lax.fori_loop with pltpu.make_async_copy for tensors whose
+    inner-block shape passes ``_check_dma_alignment``; tensors that fail
+    are kept on their outer BlockSpec and accessed via ``pl.ds`` from the
+    body.  Per-tensor pipelining membership lives in ``_tensor_to_dma_scratch``.
+    """
+
+    body_fn_name: str
+    loop_var_name: str  # The fori_loop index variable (e.g., "_j")
+    inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+    _tensor_to_dma_scratch: dict[str, str] = dataclasses.field(default_factory=dict)
+    _tensor_to_sem: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, str | int]] = dataclasses.field(default_factory=list)
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
+
+    def add_lane_loop(self, block_id: int, lane_var: str, extent: int) -> None:
+        self.lane_loops.append((lane_var, extent))
+        self.lane_loop_blocks.add(block_id)
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
@@ -104,12 +1910,209 @@ class DeviceGridState(DeviceLoopOrGridState):
                     orelse=[],
                     type_comment=None,
                 )
-            ]
+                wrapped = [
+                    create(
+                        ast.For,
+                        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+                        iter=expr_from_string(iter_expr),
+                        body=[*body_prefix, *wrapped],
+                        orelse=[],
+                        type_comment=None,
+                    )
+                ]
+            else:
+                lane_var, extent = entry
+                wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
         return wrapped
 
 
+@dataclasses.dataclass
 class PersistentReductionState(DeviceLoopOrGridState):
-    pass
+    lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
+    lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
+    outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
+
+    def has_lane_loops(self) -> bool:
+        return bool(self.lane_loops)
+
+    def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
+        wrapped: list[ast.AST] = [*self.lane_setup_statements, *body]
+        for entry in reversed(self.lane_loops):
+            # NKI uses a 3-tuple (lane_var, body_prefix_stmts, extent) to inject
+            # nisa.iota index setup at the top of each loop body where lane_var
+            # is in scope; other backends use the 2-tuple (lane_var, extent).
+            if len(entry) == 3:
+                lane_var, body_prefix, extent = entry
+                iter_expr = (
+                    extent if isinstance(extent, str) else f"range({extent})"
+                )
+                wrapped = [
+                    create(
+                        ast.For,
+                        target=create(ast.Name, id=lane_var, ctx=ast.Store()),
+                        iter=expr_from_string(iter_expr),
+                        body=[*body_prefix, *wrapped],
+                        orelse=[],
+                        type_comment=None,
+                    )
+                ]
+            else:
+                lane_var, extent = entry
+                wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
+        return wrapped
+
+
+# ---------------------------------------------------------------------------
+# NKI tile-strategy helpers (ported from fix-nki-kernel-compilation).
+# Module-level; inert for non-NKI backends (getattr fallbacks).
+# ---------------------------------------------------------------------------
+def _nki_body_leading_count(
+    state: object, block_ids: list[int], env: object
+) -> int:
+    """How many of this loop's block_sizes contribute to the partition
+    dim of the largest 3D+ allocation in the kernel body.
+
+    Scans the FX graph (via ``state.fx_node``'s enclosing graph) for
+    creation ops (hl.full/hl.zeros and similar) with ndim >= 3 whose
+    leading dim symbols match this loop's block_ids. Returns the max
+    number of leading dims whose symbols are in our block_ids.
+
+    For a pure 2D loop with 2D body allocations only, returns 0.
+    For a 2D loop with a 3D body allocation like [tile_b, tile_m, D]
+    (both block_ids in leading dims), returns 2.
+    """
+    block_id_set = set(block_ids)
+    best = 0
+
+    # Walk EVERY sub-graph in device_ir (including inner loop bodies that
+    # aren't root graphs). Inner for loops (e.g. the tile_v inner loop in
+    # grpo_loss) own their own graphs and contain 3D loads that the outer
+    # root graph doesn't see.
+    try:
+        codegen = getattr(state, "codegen", None)
+        hf = getattr(codegen, "host_function", None) if codegen is not None else None
+        if hf is not None:
+            device_ir = hf.device_ir
+            for graph_info in device_ir.graphs:
+                _best = _count_leading_block_id_matches(graph_info.graph, block_id_set, env)
+                if _best > best:
+                    best = _best
+            return best
+    except Exception:
+        pass
+
+    # Fallback: state.fx_node.graph
+    fx_node = getattr(state, "fx_node", None)
+    if fx_node is not None and hasattr(fx_node, "graph"):
+        return _count_leading_block_id_matches(fx_node.graph, block_id_set, env)
+    return best
+
+
+def _count_leading_block_id_matches(graph, block_id_set, env) -> int:
+    """For each node in ``graph`` whose meta['val'] is a 3D+ tensor, count
+    how many of its leading dims (all but the last) have symbols that
+    are block-size symbols for the loop identified by ``block_id_set``.
+    Return the max count seen.
+    """
+    best = 0
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        if val.ndim < 3:
+            continue
+        # Count how many LEADING dims (all but the last) are themselves
+        # this-loop's block_size symbols.
+        leading_matches = 0
+        for d in val.shape[:-1]:
+            if not isinstance(d, torch.SymInt):
+                break
+            sym_expr = d._sympy_()
+            if not hasattr(sym_expr, "free_symbols"):
+                break
+            matched = False
+            for sym in sym_expr.free_symbols:
+                for bid in block_id_set:
+                    try:
+                        bs_info = env.block_sizes[bid]
+                    except IndexError:
+                        continue
+                    if sym == bs_info.symbol():
+                        matched = True
+                        break
+                if matched:
+                    break
+            if not matched:
+                break
+            leading_matches += 1
+        if leading_matches > best:
+            best = leading_matches
+    return best
+
+
+def _backend_loop_index_statements(
+    backend: object,
+    *,
+    offset_var: str,
+    block_size_var: str,
+    dtype: str,
+    axis: int,
+    index_var: str,
+) -> list[ast.stmt]:
+    """Return the statement(s) that compute ``index_var`` from ``offset_var``.
+
+    Most backends produce a single assignment ``index_var = <expr>``. The NKI
+    backend needs an SBUF ndarray allocation plus a nisa.iota fill (so the
+    index is a per-position vector, not a scalar). Backends with that kind
+    of multi-statement setup implement ``loop_index_statements`` and
+    ``grid_index_statements``; everything else falls back to the single
+    ``{index_var} = {loop_index_expr(...)}`` shape.
+    """
+    fn = getattr(backend, "loop_index_statements", None)
+    if fn is not None:
+        stmts = fn(
+            offset_var=offset_var,
+            block_size_var=block_size_var,
+            dtype=dtype,
+            axis=axis,
+            index_var=index_var,
+        )
+        return [
+            s if isinstance(s, ast.stmt) else statement_from_string(s)
+            for s in stmts
+        ]
+    idx_expr = backend.loop_index_expr(offset_var, block_size_var, dtype, axis=axis)
+    return [statement_from_string(f"{index_var} = {idx_expr}")]
+
+
+def _backend_grid_index_statements(
+    backend: object,
+    *,
+    offset_var: str,
+    block_size_var: str,
+    dtype: str,
+    axis: int,
+    index_var: str,
+) -> list[ast.stmt]:
+    """Parallel to ``_backend_loop_index_statements`` for codegen_grid."""
+    fn = getattr(backend, "grid_index_statements", None)
+    if fn is not None:
+        stmts = fn(
+            offset_var=offset_var,
+            block_size_var=block_size_var,
+            dtype=dtype,
+            axis=axis,
+            index_var=index_var,
+        )
+        return [
+            s if isinstance(s, ast.stmt) else statement_from_string(s)
+            for s in stmts
+        ]
+    idx_expr = backend.grid_index_expr(offset_var, block_size_var, dtype, axis=axis)
+    return [statement_from_string(f"{index_var} = {idx_expr}")]
 
 
 class TileStrategy:
@@ -127,8 +2130,30 @@ class TileStrategy:
             block_idx: self.fn.new_var(f"indices_{block_idx}", dce=True)
             for block_idx in block_ids
         }
+        # CuTe DSL preprocessor counter collision: the preprocessor's
+        # negative-step machinery (``_handle_negative_step`` in
+        # ``cutlass.base_dsl.ast_preprocessor.DSLPreprocessor``) emits
+        # ``offset_<counter>`` / ``start_<counter>`` / ``stop_<counter>`` /
+        # ``step_<counter>`` / ``isNegative_<counter>`` helpers at the enclosing
+        # scope of every for-loop whose step is not a positive Python literal.
+        # Helion's tile-offset names share the same ``offset_<n>`` namespace —
+        # Python's name-binding rule sees the late preprocessor assignment and
+        # treats the variable as local for the whole function body, turning
+        # earlier reads into ``UnboundLocalError``. The ``tile_`` prefix moves
+        # Helion's names out of the reserved CuTe DSL namespace. Of the five
+        # reserved suffixes, only ``offset_`` and ``step_`` are emitted by
+        # Helion (``offset_<bid>`` here; ``step_<n>`` via ``codegen.lift(...,
+        # prefix='step')`` in ``codegen_grid_loops`` / ``codegen_lane_loops``);
+        # both are renamed on cute. ``start_/stop_/isNegative_`` collisions are
+        # not currently emitted by Helion. Non-CuTe backends keep the
+        # historical short name to preserve existing goldens — this is a
+        # deliberate trade-off (see ``cute_plan.md`` §7.6.5.2 for the trade-off
+        # rationale; search "CuTe DSL preprocessor counter collision" for the
+        # diagnosis).
+        env = CompileEnvironment.current()
+        offset_prefix = "tile_offset" if env.backend.name == "cute" else "offset"
         self.offset_vars: dict[int, str] = {
-            block_idx: self.fn.new_var(f"offset_{block_idx}", dce=True)
+            block_idx: self.fn.new_var(f"{offset_prefix}_{block_idx}", dce=True)
             for block_idx in block_ids
         }
 
@@ -161,6 +2186,10 @@ class TileStrategy:
         """Return the thread block size for each thread axis this strategy uses."""
         return []
 
+    def thread_block_size_exprs(self) -> list[str]:
+        """Return per-axis thread block sizes as launch-time expressions."""
+        return [str(size) for size in self.thread_block_sizes()]
+
     @staticmethod
     def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
         """Get the range_extra string for loop unroll factor and num_stages based on config."""
@@ -178,7 +2207,7 @@ class TileStrategy:
         )
         num_stages = config.num_stages
 
-        if config.indexing == "tensor_descriptor":
+        if "tensor_descriptor" in config.indexing:
             # Tensor descriptor + multi-stage pipelines in addition to unrolling tend to cause
             # CUDA "misaligned address" or "unspecified launch failure" errors.
             if range_num_stages > 0:
@@ -297,20 +2326,91 @@ class TileStrategy:
         env = CompileEnvironment.current()
         block_id_to_info = {}
 
+        def begin_to_ast(value: object) -> ast.AST:
+            if isinstance(value, ast.AST):
+                return value
+            if isinstance(value, int):
+                return expr_from_string(repr(value))
+            if isinstance(value, sympy.Expr):
+                return expr_from_string(DeviceFunction.current().sympy_expr(value))
+            if isinstance(value, torch.SymInt):
+                return begin_to_ast(value._sympy_())
+            if isinstance(value, torch.Tensor):
+                tensor_arg = DeviceFunction.current().tensor_arg(value)
+                return expr_from_string(env.backend.scalar_load_expr(tensor_arg.name))
+            raise NotImplementedError(f"{type(value)} is not implemented.")
+
+        def normalize_dim_values(value: object) -> list[object]:
+            if isinstance(value, (list, tuple, torch.Size)):
+                return list(value)
+            return [value]
+
+        begin_values: list[object] | None = None
+        proxy_begins: list[object] | None = None
+        if isinstance(state.ast_args, (list, tuple)):
+            if len(state.ast_args) >= 2 and isinstance(state.ast_args[1], list):
+                begin_values = state.ast_args[1]
+        if isinstance(state.proxy_args, (list, tuple)):
+            if len(state.proxy_args) >= 2 and isinstance(
+                state.proxy_args[1], (list, tuple, torch.Size)
+            ):
+                proxy_begins = normalize_dim_values(state.proxy_args[1])
+                if begin_values is None:
+                    begin_values = proxy_begins
+            elif len(state.proxy_args) >= 2:
+                begin_arg, end_arg = state.proxy_args[:2]
+                if end_arg is None:
+                    proxy_begins = [0] * len(normalize_dim_values(begin_arg))
+                else:
+                    proxy_begins = normalize_dim_values(begin_arg)
+                if begin_values is None:
+                    begin_values = proxy_begins
+
         if use_proxy_ends:
-            _, _, proxy_ends, _ = state.proxy_args
+            _, _, proxy_ends, _, _ = state.proxy_args
             assert isinstance(proxy_ends, list)
-            for block_idx, end in zip(self.block_ids, proxy_ends, strict=True):
+            for idx, (block_idx, end) in enumerate(
+                zip(self.block_ids, proxy_ends, strict=True)
+            ):
+                begin_expr = None
+                begin_var_name = None
+                if proxy_begins is not None:
+                    begin = proxy_begins[idx]
+                    if isinstance(begin, (int, torch.SymInt)):
+                        begin_expr = _to_sympy(begin)
+                if begin_values is not None:
+                    begin_var_name = state.codegen.lift(
+                        begin_to_ast(begin_values[idx]),
+                        dce=True,
+                        prefix="begin",
+                    ).id
                 if isinstance(end, (int, torch.SymInt)):
                     end_expr = _to_sympy(end)
                 else:
                     end_expr = None
                 block_id_to_info[block_idx] = LoopDimInfo(
-                    end_var_name=None, end_expr=end_expr
+                    begin_var_name=begin_var_name,
+                    begin_expr=begin_expr,
+                    end_var_name=None,
+                    end_expr=end_expr,
                 )
         elif ends_override is not None:
             # Data-dependent bounds: use the provided ends
-            for block_id, end in zip(self.block_ids, ends_override, strict=True):
+            for idx, (block_id, end) in enumerate(
+                zip(self.block_ids, ends_override, strict=True)
+            ):
+                begin_expr = None
+                begin_var_name = None
+                if proxy_begins is not None:
+                    begin = proxy_begins[idx]
+                    if isinstance(begin, (int, torch.SymInt)):
+                        begin_expr = _to_sympy(begin)
+                if begin_values is not None:
+                    begin_var_name = state.codegen.lift(
+                        begin_to_ast(begin_values[idx]),
+                        dce=True,
+                        prefix="begin",
+                    ).id
                 if isinstance(end, (int, torch.SymInt)):
                     end_expr = _to_sympy(end)
                     end_var_name = state.sympy_expr(end_expr)
@@ -319,11 +2419,26 @@ class TileStrategy:
                     end_expr = None
                     end_var_name = None
                 block_id_to_info[block_id] = LoopDimInfo(
-                    end_var_name=end_var_name, end_expr=end_expr
+                    begin_var_name=begin_var_name,
+                    begin_expr=begin_expr,
+                    end_var_name=end_var_name,
+                    end_expr=end_expr,
                 )
         else:
-            for block_id in self.block_ids:
+            for idx, block_id in enumerate(self.block_ids):
                 block_size_info = env.block_sizes[block_id]
+                begin_expr = None
+                begin_var_name = None
+                if proxy_begins is not None:
+                    begin = proxy_begins[idx]
+                    if isinstance(begin, (int, torch.SymInt)):
+                        begin_expr = _to_sympy(begin)
+                if begin_values is not None:
+                    begin_var_name = state.codegen.lift(
+                        begin_to_ast(begin_values[idx]),
+                        dce=True,
+                        prefix="begin",
+                    ).id
                 if block_size_info.size is None:
                     # Data-dependent bound - skip numel, it will be handled elsewhere
                     end_expr = None
@@ -332,7 +2447,10 @@ class TileStrategy:
                     end_expr = block_size_info.numel
                     end_var_name = state.sympy_expr(end_expr)
                 block_id_to_info[block_id] = LoopDimInfo(
-                    end_var_name=end_var_name, end_expr=end_expr
+                    begin_var_name=begin_var_name,
+                    begin_expr=begin_expr,
+                    end_var_name=end_var_name,
+                    end_expr=end_expr,
                 )
 
         return block_id_to_info
@@ -459,8 +2577,8 @@ class BlockSizeTileStrategy(TileStrategy):
             is not None
             # TODO(jansel): when parent block size is a SymInt, we fail to apply this optimization should fix this
             and isinstance(
-                parent_block_size := env.block_sizes[block_id].from_config(
-                    state.config
+                parent_block_size := state.device_function.resolved_block_size(
+                    block_id
                 ),
                 int,
             )
@@ -471,17 +2589,105 @@ class BlockSizeTileStrategy(TileStrategy):
             return loop_info.end_expr
         return end
 
+    def _compute_thread_axis_offset(
+        self,
+        active_device_loops: dict[int, list[DeviceLoopOrGridState]],
+    ) -> int:
+        """Compute the starting thread axis for the next strategy.
+
+        Counts axes already claimed by active device loops, reserving at
+        least one axis for reduction strategies when the backend places
+        reductions first.
+
+        When a ``CuTeGridExecutionPlan`` with ``block_axis_priority`` is
+        in scope for this strategy's blocks, the offset is instead
+        derived from ``thread_axis_for_strategy`` so the M/N axis order
+        is dictated by the plan (e.g. the warp-per-row layout swaps the
+        outer M-grid and inner N-tile axes so each warp owns one row).
+        """
+        from .reduction_strategy import ReductionStrategy
+
+        env = CompileEnvironment.current()
+
+        # Plan-driven path: honor ``block_axis_priority`` so the outer
+        # grid loop can reserve an axis for a lower-priority inner tile
+        # loop even when that inner loop has not yet entered
+        # ``active_device_loops``.  Used by the warp-per-row layout where
+        # the outer M-grid must take a HIGHER thread-axis index than the
+        # inner N-tile so 32 contiguous threads on axis 0 form one warp
+        # per row.
+        plan = self.fn.tile_strategy.current_cute_grid_execution_plan(
+            block_ids=self.block_ids
+        )
+        if plan is not None and any(
+            plan.priority_for_block(block_id) is not None for block_id in self.block_ids
+        ):
+            offset = self.fn.tile_strategy.thread_axis_for_strategy(self)
+            if offset is not None:
+                return offset
+
+        seen: set[int] = set()
+        active_reduction_axes = 0
+        active_non_reduction_axes = 0
+        for loops in active_device_loops.values():
+            for loop_state in loops:
+                key = id(loop_state)
+                if key in seen:
+                    continue
+                seen.add(key)
+                axes = loop_state.strategy.thread_axes_used()
+                if env.backend.reduction_axis_first() and isinstance(
+                    loop_state.strategy, ReductionStrategy
+                ):
+                    active_reduction_axes += axes
+                else:
+                    active_non_reduction_axes += axes
+
+        if not env.backend.reduction_axis_first():
+            return active_non_reduction_axes + active_reduction_axes
+
+        has_reduction_strategy = any(
+            isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
+            for strategy in self.fn.tile_strategy.strategies
+        )
+        if plan is not None and any(
+            plan.disables_reduction_axis_reservation(block_id)
+            for block_id in self.block_ids
+        ):
+            return active_non_reduction_axes + active_reduction_axes
+        reserved_reduction_axes = max(
+            1 if has_reduction_strategy else 0, active_reduction_axes
+        )
+        return reserved_reduction_axes + active_non_reduction_axes
+
     def select_pid_strategy(self) -> ProgramIDs:
+        backend_name = CompileEnvironment.current().backend.name
         pid_type = self.fn.config.pid_type
         if pid_type == "xyz":
             assert 1 < len(self.block_ids) <= 3
             return XYZProgramIDs()
+        use_tcgen05_scheduler = self._use_tcgen05_persistent_scheduler(
+            pid_type, backend_name
+        )
         if pid_type == "persistent_blocked":
+            if use_tcgen05_scheduler:
+                return Tcgen05PersistentProgramIDs(is_blocked=True)
             return PersistentBlockedProgramIDs()
         if pid_type == "persistent_interleaved":
+            if use_tcgen05_scheduler:
+                return Tcgen05PersistentProgramIDs(is_blocked=False)
             return PersistentInterleavedProgramIDs()
         assert pid_type == "flat"
         return FlatProgramIDs()
+
+    def _use_tcgen05_persistent_scheduler(
+        self, pid_type: str, backend_name: str
+    ) -> bool:
+        if backend_name != "cute" or not pid_type.startswith("persistent"):
+            return False
+        from .backend import _kernel_specialized_mma_impl
+
+        return _kernel_specialized_mma_impl(self.fn, config=self.fn.config) == "tcgen05"
 
 
 class FlattenedTileStrategy(BlockSizeTileStrategy):
@@ -539,40 +2745,203 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             return []
         return [self.block_size]
 
+    def thread_block_size_exprs(self) -> list[str]:
+        if not self._uses_thread_axis():
+            return []
+        if isinstance(self.block_size, int):
+            return [str(self.block_size)]
+        bs_var = self.block_size_var(-1)
+        if bs_var is None:
+            return []
+        return [bs_var]
+
     def _uses_thread_axis(self) -> bool:
         return not (isinstance(self.block_size, int) and self.block_size == 1)
 
-    def _codegen_common(
+    def _numel_str(self, state: CodegenState, value: sympy.Expr | str) -> str:
+        if isinstance(value, str):
+            return value
+        return state.sympy_expr(value)
+
+    def _range_trip_count(
+        self,
+        begin: object,
+        end: object,
+        step: object | None,
+    ) -> sympy.Expr | str:
+        return self._range_numel_expr(begin, end, step)
+
+    def _range_numel_expr(
+        self, begin: object, end: object, step: object | None
+    ) -> sympy.Expr | str:
+        begin_expr = (
+            _to_sympy(begin)
+            if isinstance(begin, (int, torch.SymInt, sympy.Expr))
+            else None
+        )
+        end_expr = (
+            _to_sympy(end) if isinstance(end, (int, torch.SymInt, sympy.Expr)) else None
+        )
+        diff_expr = (
+            sympy.Add(end_expr, sympy.Mul(-1, begin_expr))
+            if begin_expr is not None and end_expr is not None
+            else None
+        )
+        if step is None or step == 1:
+            if diff_expr is not None:
+                return diff_expr
+            return f"(({self._expr_str(end)}) - ({self._expr_str(begin)}))"
+        assert isinstance(step, (int, torch.SymInt, sympy.Expr))
+        step_expr = _to_sympy(step)
+        if getattr(step_expr, "free_symbols", None):
+            return (
+                f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
+                f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
+            )
+        if diff_expr is not None:
+            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+        return (
+            f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
+            f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
+        )
+
+    def _expr_str(self, value: object) -> str:
+        if isinstance(value, (int, torch.SymInt, sympy.Expr)):
+            return self.fn.sympy_expr(_to_sympy(value))
+        if isinstance(value, torch.Tensor):
+            tensor_arg = DeviceFunction.current().tensor_arg(value)
+            return CompileEnvironment.current().backend.scalar_load_expr(
+                tensor_arg.name
+            )
+        if isinstance(value, str):
+            return value
+        raise NotImplementedError(f"{type(value)} is not implemented.")
+
+    def _normalize_loop_steps(
+        self, step_arg: object | None, ndim: int
+    ) -> list[object | None]:
+        if step_arg is None:
+            return [None] * ndim
+        if isinstance(step_arg, (list, tuple)):
+            steps = list(step_arg)
+            assert len(steps) == ndim
+            return steps
+        return [step_arg] * ndim
+
+    def _extract_root_bounds(
         self, state: CodegenState
-    ) -> tuple[str, str, sympy.Expr, list[ast.AST]]:
+    ) -> tuple[list[object], list[object], list[object | None]]:
+        assert len(state.proxy_args) == 3
+        if state.proxy_args[1] is None:
+            begins: list[object] = [0] * len(self.block_ids)
+            ends_arg = state.proxy_args[0]
+        else:
+            begins_arg = state.proxy_args[0]
+            begins = (
+                list(begins_arg)
+                if isinstance(begins_arg, (list, tuple))
+                else [begins_arg]
+            )
+            ends_arg = state.proxy_args[1]
+        ends = list(ends_arg) if isinstance(ends_arg, (list, tuple)) else [ends_arg]
+        steps = self._normalize_loop_steps(state.proxy_args[2], len(self.block_ids))
+        assert len(begins) == len(self.block_ids)
+        assert len(ends) == len(self.block_ids)
+        return begins, ends, steps
+
+    def _extract_device_loop_bounds(
+        self, state: CodegenState
+    ) -> tuple[list[object], list[object], list[object | None]]:
+        if len(state.ast_args) == 5:
+            _, begins_arg, ends_arg, _, steps_arg = state.ast_args
+        else:
+            _, begins_arg, ends_arg, _ = state.ast_args
+            steps_arg = None
+        begins = (
+            list(begins_arg) if isinstance(begins_arg, (list, tuple)) else [begins_arg]
+        )
+        ends = list(ends_arg) if isinstance(ends_arg, (list, tuple)) else [ends_arg]
+        steps = self._normalize_loop_steps(steps_arg, len(self.block_ids))
+        assert len(begins) == len(self.block_ids)
+        assert len(ends) == len(self.block_ids)
+        return begins, ends, steps
+
+    def _codegen_common(
+        self,
+        state: CodegenState,
+        *,
+        begins: list[object] | None = None,
+        ends: list[object] | None = None,
+        steps: list[object | None] | None = None,
+    ) -> tuple[str, str, sympy.Expr | str, list[ast.AST]]:
         offsets_var = self._offsets_var
         block_size_var = self.block_size_var(-1)
         self._setup_block_size_constexpr(state, block_size_var, self.block_size)
         block_ids = self.block_ids
         env = CompileEnvironment.current()
-        total_numel = sympy.S.One
+        if begins is None:
+            begins = [0] * len(block_ids)
+        if ends is None:
+            ends = [env.block_sizes[block_id].numel for block_id in block_ids]
+        if steps is None:
+            steps = [None] * len(block_ids)
+        total_numel: sympy.Expr | str = sympy.S.One
         statements = []
 
         # pyrefly: ignore [bad-assignment]
-        for i, block_idx in enumerate(self._reorder(block_ids)):
-            numel = env.block_sizes[block_idx].numel
+        for i, (block_idx, begin, end, step) in enumerate(
+            self._reorder([*zip(block_ids, begins, ends, steps, strict=True)])
+        ):
+            cute_scalar_tile = (
+                CompileEnvironment.current().backend.name == "cute"
+                and len(block_ids) == 1
+                and self._uses_thread_axis()
+                and step not in (None, 1)
+            )
+            numel = (
+                self._range_numel_expr(begin, end, None)
+                if cute_scalar_tile
+                else self._range_trip_count(begin, end, step)
+            )
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
             if total_numel != sympy.S.One:
-                expr = f"({expr}) // ({state.sympy_expr(total_numel)})"
+                expr = f"({expr}) // ({self._numel_str(state, total_numel)})"
             if i + 1 < len(block_ids):
-                expr = f"({expr}) % ({state.sympy_expr(numel)})"
+                expr = f"({expr}) % ({self._numel_str(state, numel)})"
+            step_expr = self._expr_str(step) if step not in (None, 1) else None
+            if step_expr is not None and not (
+                CompileEnvironment.current().backend.name == "cute"
+                and len(block_ids) == 1
+                and self._uses_thread_axis()
+            ):
+                expr = f"({expr}) * ({step_expr})"
+            if begin != 0:
+                expr = f"({self._expr_str(begin)}) + ({expr})"
             statements.append(statement_from_string(f"{block_index_var} = {expr}"))
-            total_numel = total_numel * numel
+            if isinstance(total_numel, str) or isinstance(numel, str):
+                total_numel = (
+                    f"({self._numel_str(state, total_numel)})"
+                    f" * ({self._numel_str(state, numel)})"
+                )
+            else:
+                assert isinstance(total_numel, sympy.Expr)
+                assert isinstance(numel, sympy.Expr)
+                total_numel = sympy.Mul(total_numel, numel)
 
         mask_var = self.mask_var(-1)
         if mask_var is not None:
-            mask_terms = [f"{offsets_var} < ({state.sympy_expr(total_numel)})"]
-            thread_mask = env.backend.thread_in_tile_mask_expr(
-                block_size_var, axis=self._flat_thread_axis()
-            )
-            if thread_mask is not None:
-                mask_terms.insert(0, f"({thread_mask})")
+            mask_terms = [f"{offsets_var} < ({self._numel_str(state, total_numel)})"]
+            # Skip the ``thread_idx[axis] < block_size`` term for a CuTe
+            # block-size-1 axis (see ``codegen_grid``): the axis is not a thread
+            # axis, so this term would otherwise pin the launch dim to 1 and
+            # block a synthetic free-``hl.arange`` axis from reusing it.
+            if not (env.backend.name == "cute" and not self._uses_thread_axis()):
+                thread_mask = env.backend.thread_in_tile_mask_expr(
+                    block_size_var, axis=self._flat_thread_axis()
+                )
+                if thread_mask is not None:
+                    mask_terms.insert(0, f"({thread_mask})")
             mask_expr = " and ".join(mask_terms)
             statements.append(statement_from_string(f"{mask_var} = {mask_expr}"))
         # pyrefly: ignore [bad-return]
@@ -583,20 +2952,127 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         For CuTe, reduction strategies occupy earlier axes.
         """
-        from .reduction_strategy import ReductionStrategy
-
-        env = CompileEnvironment.current()
-        if not env.backend.reduction_axis_first():
-            return 0
-        axis = 0
-        for strategy in self.fn.tile_strategy.strategies:
-            if isinstance(strategy, ReductionStrategy):
-                axis += strategy.thread_axes_used()
-        return axis
+        return self._compute_thread_axis_offset(self.fn.codegen.active_device_loops)
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
+        assert state.ast_args is None
+
+        from .ast_extension import ExtendedAST
+        from .type_info import GridIndexType
+        from .type_info import IterType
+        from .type_info import SequenceType
+
+        type_info = ExtendedAST.current()[-1]._type_info
+        scalar_grid_loop = False
+        if isinstance(type_info, IterType):
+            inner = (
+                type_info.inner.unpack()
+                if isinstance(type_info.inner, SequenceType)
+                else [type_info.inner]
+            )
+            scalar_grid_loop = len(inner) == 1 and isinstance(inner[0], GridIndexType)
+
+        if (
+            scalar_grid_loop
+            and len(self.block_ids) == 1
+            and len(state.proxy_args) == 3
+            and not isinstance(state.proxy_args[0], (list, tuple))
+            and (
+                state.proxy_args[1] is None
+                or not isinstance(state.proxy_args[1], (list, tuple))
+            )
+            and not isinstance(state.proxy_args[2], (list, tuple))
+        ):
+
+            def _range_bound_to_sympy(value: object) -> sympy.Expr:
+                assert isinstance(value, (int, torch.SymInt, sympy.Expr))
+                return _to_sympy(value)
+
+            step = state.proxy_args[2]
+            if step not in (None, 1):
+                block_id = self.block_ids[0]
+                if state.proxy_args[1] is None:
+                    begin = 0
+                    end = state.proxy_args[0]
+                else:
+                    begin = state.proxy_args[0]
+                    end = state.proxy_args[1]
+                    if isinstance(begin, (list, tuple)):
+                        assert len(begin) == 1
+                        begin = begin[0]
+                    if isinstance(end, (list, tuple)):
+                        assert len(end) == 1
+                        end = end[0]
+                begin_expr = _range_bound_to_sympy(begin)
+                end_expr = _range_bound_to_sympy(end)
+                step_expr = _range_bound_to_sympy(step)
+                trip_count = (
+                    f"(({state.sympy_expr(end_expr)}) - ({state.sympy_expr(begin_expr)}) + "
+                    f"({state.sympy_expr(step_expr)}) - 1) // ({state.sympy_expr(step_expr)})"
+                )
+
+                env = CompileEnvironment.current()
+                dtype = env.index_type()
+                pid_var = state.device_function.new_var("pid_flat", dce=True)
+                offsets_var = self._offsets_var
+                block_size_var = self.block_size_var(-1)
+                self._setup_block_size_constexpr(state, block_size_var, self.block_size)
+                pids = self.select_pid_strategy()
+                if isinstance(state.device_function.pid, ForEachProgramID):
+                    pids.shared_pid_var = state.device_function.pid.shared_pid_var
+                pids.append(PIDInfo(pid_var, block_size_var, trip_count, block_id))
+                state.add_statement(
+                    env.backend.arange_expr(
+                        offsets_var,
+                        pid_var,
+                        block_size_var,
+                        dtype,
+                        axis=self._flat_thread_axis(),
+                    )
+                )
+                index_var = self.index_var(block_id)
+                state.add_statement(
+                    f"{index_var} = ({state.sympy_expr(begin_expr)}) + ({offsets_var}) * ({state.sympy_expr(step_expr)})"
+                )
+                mask_var = self.mask_var(-1)
+                if mask_var is not None:
+                    mask_terms = [f"{offsets_var} < ({trip_count})"]
+                    thread_mask = env.backend.thread_in_tile_mask_expr(
+                        block_size_var, axis=self._flat_thread_axis()
+                    )
+                    if thread_mask is not None:
+                        mask_terms.insert(0, f"({thread_mask})")
+                    state.add_statement(
+                        statement_from_string(
+                            f"{mask_var} = {' and '.join(mask_terms)}"
+                        )
+                    )
+                pids.codegen(state)
+                if isinstance(state.device_function.pid, ForEachProgramID):
+                    shared_pid = state.device_function.pid
+                    shared_pid.cases.append(pids)
+                    shared_pid.codegen(state)
+                else:
+                    state.device_function.set_pid(pids)
+                tracker = ThreadAxisTracker()
+                if self._uses_thread_axis() and isinstance(self.block_size, int):
+                    tracker.record_all(
+                        self.block_ids, self._flat_thread_axis(), self.block_size
+                    )
+                return DeviceGridState(
+                    self,
+                    block_id_to_info=self._create_block_id_info_dict(
+                        state, ends_override=[end]
+                    ),
+                    thread_axis_sizes=tracker.sizes,
+                    block_thread_axes=tracker.block_axes,
+                )
+        begins, ends, steps = self._extract_root_bounds(state)
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
-            state
+            state,
+            begins=begins,
+            ends=ends,
+            steps=steps,
         )
         env = CompileEnvironment.current()
         dtype = env.index_type()
@@ -608,15 +3084,27 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
 
-        state.add_statement(
-            env.backend.arange_expr(
-                offsets_var,
-                pid_var,
-                block_size_var,
-                dtype,
-                axis=self._flat_thread_axis(),
+        # A CuTe grid whose block size is 1 does not claim a thread axis: its
+        # ``offsets = pid * 1 + thread_idx[axis]`` term is always 0 (launch dim
+        # for the axis is 1). Emit ``offsets = pid * 1`` instead so the axis is
+        # genuinely free for a synthetic free-``hl.arange`` thread axis to reuse
+        # without the grid's ``thread_idx[axis] < 1`` mask filtering its lanes.
+        if env.backend.name == "cute" and not self._uses_thread_axis():
+            state.add_statement(
+                statement_from_string(
+                    f"{offsets_var} = ({pid_var}) * ({block_size_var})"
+                )
             )
-        )
+        else:
+            state.add_statement(
+                env.backend.arange_expr(
+                    offsets_var,
+                    pid_var,
+                    block_size_var,
+                    dtype,
+                    axis=self._flat_thread_axis(),
+                )
+            )
         state.codegen.statements_stack[-1].extend(statements)
 
         pids.codegen(state)
@@ -628,21 +3116,54 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         else:
             state.device_function.set_pid(pids)
 
-        block_id_to_info = self._create_block_id_info_dict(state)
-        return DeviceGridState(self, block_id_to_info=block_id_to_info)
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
+        tracker = ThreadAxisTracker()
+        if self._uses_thread_axis():
+            thread_size: int | None = None
+            if isinstance(self.block_size, int):
+                thread_size = self.block_size
+            elif isinstance(self.block_size, torch.SymInt):
+                if (block_size_id := env.get_block_id(self.block_size)) is not None:
+                    config_block_size = env.config_spec.block_sizes.config_get(
+                        state.config.block_sizes,
+                        block_size_id,
+                    )
+                    if isinstance(config_block_size, int):
+                        thread_size = config_block_size
+            if thread_size is not None:
+                tracker.record_all(
+                    self.block_ids, self._flat_thread_axis(), thread_size
+                )
+        return DeviceGridState(
+            self,
+            block_id_to_info=block_id_to_info,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
+        )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
+        begins, ends, steps = self._extract_device_loop_bounds(state)
         block_size_var, offsets_var, total_numel, statements = self._codegen_common(
-            state
+            state,
+            begins=begins,
+            ends=ends,
+            steps=steps,
         )
         env = CompileEnvironment.current()
         dtype = env.index_type()
         lid = self.new_var("lid")
-        numel_str = state.sympy_expr(total_numel)
+        numel_str = self._numel_str(state, total_numel)
         end_var = env.backend.cdiv_expr(numel_str, block_size_var, is_device=True)
-        arange_expr = env.backend.arange_expr(
-            offsets_var, lid, block_size_var, dtype, axis=self._flat_thread_axis()
-        )
+        # Mirror ``codegen_grid``: a CuTe block-size-1 loop axis does not claim a
+        # thread axis, so drop the always-zero ``+ thread_idx[axis]`` term so the
+        # axis stays free (and consistent with the mask emitted by
+        # ``_codegen_common``, which also drops its thread term for this case).
+        if env.backend.name == "cute" and not self._uses_thread_axis():
+            arange_expr = f"{offsets_var} = ({lid}) * ({block_size_var})"
+        else:
+            arange_expr = env.backend.arange_expr(
+                offsets_var, lid, block_size_var, dtype, axis=self._flat_thread_axis()
+            )
         for_node = create(
             ast.For,
             target=create(ast.Name, id=lid, ctx=ast.Store()),
@@ -658,13 +3179,31 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             orelse=[],
             type_comment=None,
         )
-        block_id_to_info = self._create_block_id_info_dict(state, use_proxy_ends=True)
-
+        block_id_to_info = self._create_block_id_info_dict(state, ends_override=ends)
+        tracker = ThreadAxisTracker()
+        if self._uses_thread_axis():
+            thread_size: int | None = None
+            if isinstance(self.block_size, int):
+                thread_size = self.block_size
+            elif isinstance(self.block_size, torch.SymInt):
+                if (block_size_id := env.get_block_id(self.block_size)) is not None:
+                    config_block_size = env.config_spec.block_sizes.config_get(
+                        state.config.block_sizes,
+                        block_size_id,
+                    )
+                    if isinstance(config_block_size, int):
+                        thread_size = config_block_size
+            if thread_size is not None:
+                tracker.record_all(
+                    self.block_ids, self._flat_thread_axis(), thread_size
+                )
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=body,
             block_id_to_info=block_id_to_info,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
         )
 
     @classmethod
@@ -764,6 +3303,19 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
     def _uses_thread_axis(self, block_size: SymIntLike) -> bool:
         return not (isinstance(block_size, int) and block_size == 1)
 
+    def _uses_thread_axis_for_block(
+        self, block_id: int, block_size: SymIntLike
+    ) -> bool:
+        """Hook: does ``block_id`` claim a CUDA thread axis under this strategy?
+
+        Defaults to ``_uses_thread_axis(block_size)``. Subclasses that
+        track per-block-id state (e.g. ``CuteNDTileStrategy``'s
+        ``inactive_block_ids``) override this to return False for
+        block_ids that don't claim an axis so the grid / device-loop
+        codegen does not emit ``thread_idx[axis]`` for them.
+        """
+        return self._uses_thread_axis(block_size)
+
     def thread_axes_used(self) -> int:
         return sum(
             1 for block_size in self.block_size if self._uses_thread_axis(block_size)
@@ -778,32 +3330,24 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 sizes.append(bs)
         return sizes
 
-    def _thread_axis_offset(self, state: CodegenState) -> int:
-        from .reduction_strategy import ReductionStrategy
+    def thread_block_size_exprs(self) -> list[str]:
+        exprs: list[str] = []
+        block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            bs = block_size_by_id[block_id]
+            if not self._uses_thread_axis(bs):
+                continue
+            if isinstance(bs, int):
+                exprs.append(str(bs))
+            else:
+                bs_var = self.block_size_var(block_id)
+                if bs_var is None:
+                    return []
+                exprs.append(bs_var)
+        return exprs
 
-        seen: set[int] = set()
-        offset = 0
-        env = CompileEnvironment.current()
-        reduction_axis_first = env.backend.reduction_axis_first()
-        if reduction_axis_first:
-            # Reduction strategies claim axis 0, so grid/loop
-            # strategies must offset past them.
-            for strategy in self.fn.tile_strategy.strategies:
-                if isinstance(strategy, ReductionStrategy):
-                    offset += strategy.thread_axes_used()
-        for loops in state.codegen.active_device_loops.values():
-            for loop_state in loops:
-                key = id(loop_state)
-                if key in seen:
-                    continue
-                seen.add(key)
-                if reduction_axis_first and isinstance(
-                    loop_state.strategy, ReductionStrategy
-                ):
-                    # Reduction axes are already accounted for above.
-                    continue
-                offset += loop_state.strategy.thread_axes_used()
-        return offset
+    def _thread_axis_offset(self, state: CodegenState) -> int:
+        return self._compute_thread_axis_offset(state.codegen.active_device_loops)
 
     def _thread_axis_map(self) -> dict[int, int]:
         block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
@@ -815,6 +3359,73 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             if self._uses_thread_axis(block_size_by_id[block_id]):
                 axis += 1
         return mapping
+
+    def _normalize_loop_steps(
+        self, step_arg: object | None, ndim: int
+    ) -> list[object | None]:
+        if step_arg is None:
+            return [None] * ndim
+        if isinstance(step_arg, (list, tuple)):
+            steps = list(step_arg)
+            assert len(steps) == ndim
+            return steps
+        return [step_arg] * ndim
+
+    def _root_grid_steps(self, state: CodegenState) -> list[object | None]:
+        from .ast_extension import ExtendedAST
+        from .type_info import GridIndexType
+        from .type_info import IterType
+        from .type_info import SequenceType
+
+        type_info = ExtendedAST.current()[-1]._type_info
+        assert isinstance(type_info, IterType)
+        inner = (
+            type_info.inner.unpack()
+            if isinstance(type_info.inner, SequenceType)
+            else [type_info.inner]
+        )
+        if not all(isinstance(value, GridIndexType) for value in inner):
+            return [None] * len(self.block_ids)
+        return self._normalize_loop_steps(state.proxy_args[2], len(self.block_ids))
+
+    def _range_numel_expr(
+        self, begin: object, end: object, step: object | None
+    ) -> sympy.Expr | str:
+        begin_expr = (
+            _to_sympy(begin)
+            if isinstance(begin, (int, torch.SymInt, sympy.Expr))
+            else None
+        )
+        end_expr = (
+            _to_sympy(end) if isinstance(end, (int, torch.SymInt, sympy.Expr)) else None
+        )
+        diff_expr = (
+            sympy.Add(end_expr, sympy.Mul(-1, begin_expr))
+            if begin_expr is not None and end_expr is not None
+            else None
+        )
+        if step is None or step == 1:
+            if diff_expr is not None:
+                return diff_expr
+            return f"(({self._expr_str(end)}) - ({self._expr_str(begin)}))"
+        assert isinstance(step, (int, torch.SymInt, sympy.Expr))
+        step_expr = _to_sympy(step)
+        if getattr(step_expr, "free_symbols", None):
+            return (
+                f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
+                f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
+            )
+        if diff_expr is not None:
+            return sympy.ceiling(sympy.Mul(diff_expr, sympy.Pow(step_expr, -1)))
+        return (
+            f"((({self._expr_str(end)}) - ({self._expr_str(begin)})) + "
+            f"({self._expr_str(step)}) - 1) // ({self._expr_str(step)})"
+        )
+
+    def _expr_str(self, value: object) -> str:
+        if isinstance(value, (int, torch.SymInt, sympy.Expr)):
+            return self.fn.sympy_expr(_to_sympy(value))
+        return ast.unparse(self._to_ast(value))
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
         block_ids = self.block_ids
@@ -849,18 +3460,14 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
 
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
-        for i, (block_idx, block_size, begin, end) in enumerate(
+        for i, (block_idx, block_size, begin, end, step) in enumerate(
             reversed(
-                self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
+                self._reorder(
+                    [*zip(block_ids, block_sizes, begins, ends, steps, strict=True)]
+                )
             )
         ):
-            block_size_info = env.block_sizes[block_idx]
-            # Handle data-dependent bounds: if size is None, use the end value from proxy_args
-            if block_size_info.size is None:
-                # Data-dependent bound - use the tensor end value
-                numel = self._get_data_dependent_numel(state, end, begin)
-            else:
-                numel = block_size_info.numel
+            numel = self._range_numel_expr(begin, end, step)
             device_function = state.device_function
             dtype = env.index_type()
             offset_var = self.offset_var(block_idx)
@@ -893,13 +3500,23 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 block_size_var = "1"
                 state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
             axis = thread_axis_offset + thread_axis_map[block_idx]
-            uses_thread_axis = self._uses_thread_axis(block_size)
+            # Inactive block_ids never claim a CUDA thread axis (per
+            # ``_thread_axis_map``); without the polymorphic
+            # ``_uses_thread_axis_for_block`` hook the grid would emit
+            # ``thread_idx[axis]`` for them and collide with the inner
+            # device-loop on the same axis.
+            uses_thread_axis = step in (
+                None,
+                1,
+            ) and self._uses_thread_axis_for_block(block_idx, block_size)
             bs = block_size_var if uses_thread_axis else "1"
             idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
+            if uses_thread_axis and isinstance(block_size, int):
+                tracker.record(block_idx, axis, block_size)
             state.add_statement(f"{index_var} = {idx_expr}")
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
-                state, block_idx, block_size, index_var, numel
+                state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
                 state.add_statement(mask_statement)
@@ -921,7 +3538,278 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             )
         else:
             block_id_to_info = self._create_block_id_info_dict(state)
-        return DeviceGridState(self, block_id_to_info=block_id_to_info)
+        return DeviceGridState(
+            self,
+            block_id_to_info=block_id_to_info,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
+        )
+
+    def _codegen_grid_nki(
+        self,
+        state: CodegenState,
+        block_ids: list[int],
+        block_sizes: list[int],
+        begins: list[object],
+        ends: list[object],
+    ) -> DeviceGridState:
+        """NKI: emit nl.affine_range loops instead of program_id grid parallelism.
+
+        NKI SBUF is 2D: the partition dim is capped at 128. Helion reshapes
+        3D+ inputs [B, M, K] → [B*M, K] at kernel entry, so the effective
+        partition extent of a tile group is ``prod(block_sizes[:-1])``.
+
+        To keep user configs running unchanged when they are "too big" for
+        NKI (e.g. ``block_sizes=[128, 128, 128]`` for a 3D kernel gives a
+        flattened partition of 16384), we auto-clamp the leading tile dims
+        downward — 1 at a time from the outermost — until the flattened
+        partition product fits in 128. The outermost loop then iterates
+        more times with a smaller step, preserving correctness. The user's
+        config is treated as an upper bound; we only reduce, never grow.
+        """
+        env = CompileEnvironment.current()
+        _NKI_PMAX = 128
+        _orig_block_sizes = list(block_sizes)
+        block_sizes = list(block_sizes)  # make mutable
+
+        # Scan the FX graph for creation ops with higher-rank shapes. If any
+        # allocation has N>=2 leading dims (plus a trailing free dim) whose
+        # symbols match this loop's block_ids, the flattened partition
+        # extent of that allocation is the product of our block_sizes at
+        # those positions — and must fit in 128. We collect the maximum
+        # number of leading block_sizes that would contribute to a body
+        # allocation's partition, then cap the product of those
+        # block_sizes at _NKI_PMAX.
+        _body_leading_count = _nki_body_leading_count(state, block_ids, env)
+
+        # NKI SBUF is 2D with partition dim ≤128. Helion reshapes 3D+ tiles
+        # [B, M, K] to [B*M, K] at allocation time, so when a kernel body
+        # allocates a tile like ``hl.zeros([tile_b, tile_m, head_dim])``,
+        # the flattened partition is ``tile_b * tile_m``. If the user's
+        # config declares a product of tile sizes that exceeds 128, clamp
+        # the outermost dims down to 1 (one at a time) until the product
+        # fits. This keeps user configs "just working" when they're too
+        # big for NKI — the outer loop just iterates more times with a
+        # smaller step. The final tile dim (free axis) is never clamped.
+        if len(block_sizes) >= 2:
+            def _resolve_bs(bs: object) -> int | None:
+                if isinstance(bs, (int, bool)):
+                    return int(bs)
+                if isinstance(bs, torch.SymInt):
+                    try:
+                        return env.size_hint(bs)
+                    except Exception:
+                        return None
+                return None
+
+            resolved = [_resolve_bs(bs) for bs in block_sizes]
+            if all(r is not None for r in resolved):
+                def _prod_leading() -> int:
+                    p = 1
+                    for r in resolved[:-1]:
+                        assert r is not None
+                        p *= r
+                    return p
+
+                target = _NKI_PMAX
+
+                def _prod_body_leading() -> int:
+                    # How many of THIS loop's block_sizes end up as
+                    # partition dims for the largest body allocation.
+                    #
+                    # For a simple 2D tile loop (e.g. bmm [B,M,N]), the
+                    # kernel reshape flattens [B,M,K]→[B*M,K] so N-1
+                    # leading dims contribute to the partition.
+                    #
+                    # For a higher-rank loop (e.g. 5D mamba2 tile), the
+                    # body allocations may only use 1-2 of the loop's
+                    # block_ids — scanning the FX graph via
+                    # ``_body_leading_count`` gives the actual count.
+                    #
+                    # Use _body_leading_count when > 0 (the scan found real
+                    # body allocations). Fall back to len(block_sizes)-1
+                    # only when the scan returned 0 (couldn't detect any),
+                    # and only when the loop rank is ≤ 3 (the simple case
+                    # the conservative floor was designed for). For loops
+                    # with rank > 3, using len-1 as the floor causes
+                    # over-clamping: a 5D loop with a 2D body allocation
+                    # would get floor=4 instead of 1, collapsing the
+                    # partition-contributing tile dim to block_size=1.
+                    if _body_leading_count > 0:
+                        count = _body_leading_count
+                    elif len(block_sizes) <= 3:
+                        # Conservative fallback for simple 2D/3D loops
+                        count = len(block_sizes) - 1
+                    else:
+                        # High-rank loop with no detected body allocations:
+                        # use 1 as the minimal safe count rather than
+                        # len-1 which would over-clamp.
+                        count = 1
+                    count = min(count, len(block_sizes))  # can't exceed loop rank
+                    p = 1
+                    for r in resolved[:count]:
+                        assert r is not None
+                        p *= r
+                    return p
+
+                for i in range(len(block_sizes)):
+                    # Leave at least the last dim uncollapsed so we don't
+                    # accidentally force the free axis to 1.
+                    if i == len(block_sizes) - 1 and _prod_body_leading() <= target:
+                        break
+                    while _prod_body_leading() > target:
+                        if resolved[i] is None or resolved[i] <= 1:
+                            break
+                        new_bs = max(1, resolved[i] // 2)
+                        if new_bs == resolved[i]:
+                            new_bs = 1
+                        resolved[i] = new_bs
+                        block_sizes[i] = new_bs
+                    if _prod_body_leading() <= target:
+                        break
+
+                # If the body uses a 3D allocation of the same shape as the
+                # tile variables (common pattern like hl.zeros([tile_b,
+                # tile_m, head_dim])), the second-to-last block_size also
+                # contributes to the flattened partition. We already cap
+                # leading dims above; as a safety net, if prod_all > cap
+                # and prod_leading ≤ cap, also clamp the last leading-ish
+                # dim once. In practice this case is rare and the above
+                # loop handles it.
+                if block_sizes != _orig_block_sizes:
+                    # Propagate the clamp into state.config so any code
+                    # that re-derives the block size via
+                    # env.block_sizes[bid].from_config_assert(state.config)
+                    # (e.g. hl.full / hl.zeros body allocations, mm sizing)
+                    # sees the reduced value.
+                    try:
+                        config_block_sizes = state.config.config.get("block_sizes")
+                        if isinstance(config_block_sizes, list):
+                            for bid, new_bs in zip(block_ids, block_sizes, strict=True):
+                                try:
+                                    idx = env.config_spec.block_sizes.block_id_to_index(bid)
+                                except Exception:
+                                    continue
+                                config_block_sizes[idx] = new_bs
+                    except Exception:
+                        pass
+
+        lane_loops: list[tuple[str, list[ast.stmt], str]] = []
+
+        # Clamp block_size to loop extent. NKI's dma_copy uses
+        # ``offset:offset+block_size`` which goes OOB when block_size > extent
+        # even though the outer range limits iterations. For tensors where
+        # dim size is small (e.g. x_offsets [B+1=33]), reduce block_size.
+        _clamped: list[object] = []
+        for bsz, begin, end, block_idx in zip(block_sizes, begins, ends, block_ids, strict=True):
+            _numel = env.block_sizes[block_idx].numel
+            _num_int: int | None = None
+            if isinstance(_numel, (int, bool)):
+                _num_int = int(_numel)
+            elif isinstance(_numel, torch.SymInt):
+                try:
+                    _num_int = env.size_hint(_numel)
+                except Exception:
+                    _num_int = None
+            elif isinstance(_numel, sympy.Expr):
+                try:
+                    _num_int = int(_numel)
+                except (TypeError, ValueError):
+                    try:
+                        _num_int = int(env.size_hint(_numel))
+                    except Exception:
+                        _num_int = None
+            if _num_int is not None and isinstance(bsz, (int, bool)) and int(bsz) > _num_int:
+                _clamped.append(_num_int)
+            else:
+                _clamped.append(bsz)
+        if _clamped != list(block_sizes):
+            # Propagate to config
+            try:
+                config_block_sizes = state.config.config.get("block_sizes")
+                if isinstance(config_block_sizes, list):
+                    for bid, new_bs in zip(block_ids, _clamped, strict=True):
+                        try:
+                            idx = env.config_spec.block_sizes.block_id_to_index(bid)
+                        except Exception:
+                            continue
+                        config_block_sizes[idx] = new_bs
+            except Exception:
+                pass
+            block_sizes = _clamped
+
+        for block_idx, block_size, begin, end in zip(
+            block_ids, block_sizes, begins, ends, strict=True
+        ):
+            block_size_info = env.block_sizes[block_idx]
+            numel = block_size_info.numel
+            offset_var = self.offset_var(block_idx)
+            index_var = self.index_var(block_idx)
+
+            self._setup_block_size_constexpr(
+                state,
+                self.block_size_var(block_idx),
+                block_size,
+                block_idx=block_idx,
+            )
+
+            def _safe_int(x: object) -> int | None:
+                if isinstance(x, (int, bool)):
+                    return int(x)
+                if isinstance(x, float):
+                    return int(x)
+                if isinstance(x, torch.SymInt):
+                    return env.size_hint(x)
+                if isinstance(x, sympy.Expr):
+                    try:
+                        return int(x)
+                    except (TypeError, ValueError):
+                        if x.free_symbols:
+                            try:
+                                return int(env.size_hint(x))
+                            except Exception:
+                                return None
+                        return None
+                return None
+
+            begin_int = _safe_int(begin)
+            begin_str = str(begin_int) if begin_int is not None else "0"
+            if numel is not None:
+                numel_int = _safe_int(numel)
+                end_str = str(numel_int) if numel_int is not None else state.sympy_expr(_to_sympy(numel))
+            else:
+                end_int = _safe_int(end)
+                end_str = str(end_int) if end_int is not None else str(end)
+            step_int = _safe_int(block_size)
+            step_str = str(step_int) if step_int is not None else "1"
+            range_expr = f"nl.affine_range({begin_str}, {end_str}, {step_str})"
+
+            # Emit the per-position index tile (nisa.iota) at the top of the
+            # loop body so tile.index / tile.index-based masks can be
+            # evaluated against a real SBUF vector. ``bs`` matches what the
+            # generic codegen_device_loop path uses — see _BaseNDTileStrategy.
+            uses_thread_axis = self._uses_thread_axis(block_size)
+            bs = self.block_size_var(block_idx) if uses_thread_axis else "1"
+            if bs is None:
+                bs = "1"
+            dtype_str = env.index_type()
+            idx_stmts = _backend_loop_index_statements(
+                env.backend,
+                offset_var=offset_var,
+                block_size_var=bs,
+                dtype=dtype_str,
+                axis=0,
+                index_var=index_var,
+            )
+            lane_loops.append((offset_var, idx_stmts, range_expr))
+
+        if state.device_function.pid is None:
+            state.device_function.set_pid(NKIProgramIDs())
+
+        block_id_to_info = self._create_block_id_info_dict(state)
+        return DeviceGridState(
+            self, block_id_to_info=block_id_to_info, lane_loops=lane_loops
+        )
 
     def _codegen_grid_nki(
         self,
@@ -997,6 +3885,153 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
         # TODO(jansel): refactor this to share code with codegen_grid
         block_ids = self.block_ids
         env = CompileEnvironment.current()
+        if env.backend.name == "nki":
+            return self._codegen_device_loop_nki(state)
+        dtype = env.index_type()
+        block_sizes = self.block_size
+        body = innermost_body = []
+        for_node: ast.For | None = None
+        assert len(block_sizes) == len(block_ids)
+        if len(state.ast_args) == 5:
+            _, begins, ends, _, steps = state.ast_args
+        else:
+            _, begins, ends, _ = state.ast_args
+            steps = None
+        _, _, proxy_ends, *_ = state.proxy_args
+        assert isinstance(begins, list)
+        assert isinstance(ends, list)
+        if steps is None:
+            steps = [None] * len(block_ids)
+        assert isinstance(steps, list)
+        assert isinstance(proxy_ends, list)
+        # For NKI device loops, use dimension size as loop end (e.g. x.shape[1] for K)
+        # so the range is 0..dim_size with step block_size, not 0..128.
+        # Only apply when begin == 0 (top-level loops).  For nested loops with a
+        # non-zero begin (e.g. inner tile of hl.tile(mb_cta.begin, mb_cta.end)),
+        # bs_info.size is the range *length* (32), not the absolute end
+        # (offset_0 + 32), so replacing ends[i] with bs_info.size would give a
+        # wrong constant stop value and make all but the first outer iteration empty.
+        if env.backend.name == "nki":
+            ends = list(ends)
+            proxy_ends = list(proxy_ends)
+            for i, block_idx in enumerate(block_ids):
+                begin_i = begins[i]
+                begin_is_zero = (
+                    (isinstance(begin_i, int) and begin_i == 0)
+                    or (
+                        isinstance(begin_i, torch.SymInt)
+                        and begin_i._sympy_() == 0
+                    )
+                )
+                if not begin_is_zero:
+                    continue  # keep the original absolute end for nested loops
+                bs_info = env.block_sizes[block_idx]
+                if isinstance(bs_info.size, (int, torch.SymInt)):
+                    ends[i] = bs_info.size
+                    proxy_ends[i] = bs_info.size
+        block_id_to_info = {}
+        tracker = ThreadAxisTracker()
+        thread_axis_offset = self._thread_axis_offset(state)
+        thread_axis_map = self._thread_axis_map()
+        for block_idx, block_size, begin, end, step, proxy_end in self._reorder(
+            [*zip(block_ids, block_sizes, begins, ends, steps, proxy_ends, strict=True)]
+        ):
+            offset_var = self.offset_var(block_idx)
+            index_var = self.index_var(block_idx)
+            if block_size != 1:
+                block_size_var_for_constexpr = self.block_size_var(block_idx)
+                assert block_size_var_for_constexpr is not None
+                self._setup_block_size_constexpr(
+                    state,
+                    block_size_var_for_constexpr,
+                    block_size,
+                    block_idx=block_idx,
+                )
+                block_size_var = self.block_size_var(block_idx)
+                assert block_size_var is not None
+            else:
+                block_size_var = "1"
+            end_var_name = state.codegen.lift(
+                self._to_ast(end, to_dtype=dtype), dce=True, prefix="end"
+            ).id
+            begin_var_name = state.codegen.lift(
+                self._to_ast(begin, to_dtype=dtype), dce=True, prefix="begin"
+            ).id
+            block_id_to_info[block_idx] = LoopDimInfo(
+                begin_var_name=begin_var_name,
+                begin_expr=_to_sympy(begin)
+                if isinstance(begin, (int, torch.SymInt))
+                else None,
+                end_var_name=end_var_name,
+                end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
+            )
+
+            # When the backend uses Python range() (e.g. Pallas), range
+            # bounds must be plain Python ints — skip the dtype cast so
+            # that concrete values stay as ints and are not wrapped in
+            # backend-traced dtype conversions.
+            range_dtype = None if env.backend.range_requires_python_int else dtype
+            for_node = create(
+                ast.For,
+                target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                iter=expr_from_string(
+                    self.get_range_call_str(
+                        state.config,
+                        [block_idx],
+                        begin="{begin}",
+                        end="{end}",
+                        step=(
+                            ast.unparse(self._to_ast(step, to_dtype=range_dtype))
+                            if step not in (None, 1)
+                            else block_size_var
+                        ),
+                    ),
+                    begin=self._to_ast(begin, to_dtype=range_dtype),
+                    end=self._to_ast(end, to_dtype=range_dtype),
+                ),
+                body=body,
+                orelse=[],
+                type_comment=None,
+            )
+            assert for_node.body is body
+            # Inactive block_ids never claim a CUDA thread axis (per
+            # ``_thread_axis_map``); see ``codegen_grid`` above for the
+            # collision this guards against.
+            uses_thread_axis = step in (
+                None,
+                1,
+            ) and self._uses_thread_axis_for_block(block_idx, block_size)
+            axis = thread_axis_offset + thread_axis_map[block_idx]
+            bs = block_size_var if uses_thread_axis else "1"
+            idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
+            if uses_thread_axis and isinstance(block_size, int):
+                tracker.record(block_idx, axis, block_size)
+            extra_body = [
+                statement_from_string(f"{index_var} = {idx_expr}"),
+            ]
+            # pyrefly: ignore [missing-attribute]
+            mask_statement = self._setup_mask(
+                state, block_idx, block_size, index_var, end
+            )
+            if mask_statement is not None:
+                extra_body.append(mask_statement)
+            # pyrefly: ignore [unsupported-operation]
+            body[:] = [*extra_body, *body]
+            body = [for_node]
+        assert for_node is not None
+        return DeviceLoopState(
+            self,
+            for_node=for_node,
+            inner_statements=innermost_body,
+            block_id_to_info=block_id_to_info,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
+        )
+
+    def _codegen_device_loop_nki(self, state: CodegenState) -> DeviceLoopState:
+        # TODO(jansel): refactor this to share code with codegen_grid
+        block_ids = self.block_ids
+        env = CompileEnvironment.current()
         dtype = env.index_type()
         block_sizes = self.block_size
         body = innermost_body = []
@@ -1032,9 +4067,206 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 if isinstance(bs_info.size, (int, torch.SymInt)):
                     ends[i] = bs_info.size
                     proxy_ends[i] = bs_info.size
+                elif bs_info.size is None:
+                    # Dynamic bound.
+                    # neuronx-cc does not support nested dynamic_range loops.
+                    # When multiple jagged tiles with data-dependent bounds are
+                    # nested, outer ones must use affine_range (with a static
+                    # ceiling derived from the block-size spec) while only the
+                    # innermost uses dynamic_range.
+                    #
+                    # Detection: if this is a jagged tile AND there exists
+                    # another jagged tile registered in the env with a HIGHER
+                    # block_id (allocated later → lives in an inner scope), this
+                    # tile is an outer jagged tile and should use affine_range.
+                    # Block IDs are allocated in source order, so a higher id
+                    # means it appears lexically later (inside) this loop.
+                    _is_outer_jagged = False
+                    if env.is_jagged_tile(block_idx):
+                        # A jagged tile should use affine_range (instead of
+                        # dynamic_range) only if there is another jagged tile
+                        # CURRENTLY BEING LOWERED (i.e. its add_device_loop
+                        # context is open) that has a lower block_id.
+                        # Lower block_id = allocated earlier in source order =
+                        # outer loop.  Sequential sibling jagged loops never
+                        # overlap in active_device_loops; only true nesting
+                        # does.  This is the retroactive detection: when the
+                        # INNER tile is processed, we demote the outer tile
+                        # in-place from dynamic_range to affine_range (see
+                        # the post-build block below).
+                        _active_loops = getattr(state.codegen, "active_device_loops", {})
+                        _outer_jagged_bid: int | None = None
+                        for _chk_bid in _active_loops:
+                            if (
+                                env.is_jagged_tile(_chk_bid)
+                                and _chk_bid < block_idx
+                                and _active_loops.get(_chk_bid)
+                            ):
+                                _outer_jagged_bid = _chk_bid
+                                break
+                        _is_outer_jagged = (_outer_jagged_bid is not None)
+                    if _is_outer_jagged:
+                        # THIS tile is the inner tile; _outer_jagged_bid is
+                        # the outer jagged tile that already used dynamic_range.
+                        # Demote the outer tile retroactively: replace its
+                        # for_node.iter from dynamic_range to affine_range with
+                        # a static max_size bound.  The outer tile's mask
+                        # (_NKINDTileStrategy._setup_mask) handles per-row
+                        # jagged masking so correctness is preserved.
+                        assert _outer_jagged_bid is not None
+                        _outer_loop_states = _active_loops.get(_outer_jagged_bid, [])
+                        if _outer_loop_states:
+                            _outer_state = _outer_loop_states[-1]
+                            _outer_for = getattr(_outer_state, "for_node", None)
+                            if _outer_for is not None:
+                                try:
+                                    _outer_bs_spec = env.config_spec.block_sizes.block_id_lookup(_outer_jagged_bid)
+                                    _outer_max = _outer_bs_spec.max_size
+                                    _outer_bs_size = env.block_sizes[_outer_jagged_bid].from_config(state.config)
+                                    _outer_bs_str = str(int(_outer_bs_size)) if isinstance(_outer_bs_size, (int, bool)) else str(_outer_max)
+                                    _outer_for.iter = expr_from_string(
+                                        f"nl.affine_range(0, {_outer_max}, {_outer_bs_str})"
+                                    )
+                                    # Remove from _nki_dyn_loops so downstream
+                                    # codegen (iota, DMA AP) treats it as static.
+                                    _dyn_loops_demote = getattr(state.device_function, "_nki_dyn_loops", {})
+                                    _dyn_loops_demote.pop(_outer_jagged_bid, None)
+                                except Exception:
+                                    pass
+                        # THIS (inner) tile proceeds to dynamic_range setup below.
+                        # Fall through — do NOT continue.
+                    # Dynamic bound: emit register setup + SBUF counter.
+                    # The loop body will rewrite offset_var uses to reference
+                    # the counter tile.
+                    from .ast_extension import statement_from_string
+                    import ast as _ast_mod
+                    end_ast = ends[i]
+                    end_expr_str = (
+                        _ast_mod.unparse(end_ast)
+                        if isinstance(end_ast, _ast_mod.AST)
+                        else str(end_ast)
+                    )
+                    bnd_reg = state.device_function.new_var("_dyn_bnd_reg")
+                    counter_var = state.device_function.new_var("_dyn_counter")
+                    counter_float_var = state.device_function.new_var("_dyn_counter_f")
+                    def _nki_has_sbuf_shape(name: str) -> bool:
+                        if name in state.device_function._nki_sbuf_shapes:
+                            return True
+                        lookup = name
+                        while "_copy" in lookup:
+                            lookup = lookup[: lookup.rfind("_copy")]
+                            if lookup in state.device_function._nki_sbuf_shapes:
+                                return True
+                        return False
+
+                    if _nki_has_sbuf_shape(end_expr_str):
+                        bnd_sbuf = end_expr_str
+                    else:
+                        bnd_sbuf = state.device_function.new_var("_dyn_bnd_sbuf")
+                        state.add_statement(statement_from_string(
+                            f"{bnd_sbuf} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={bnd_sbuf}, src={end_expr_str})"
+                        ))
+                    state.add_statement(statement_from_string(
+                        f"{bnd_reg} = nisa.register_alloc()"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.register_load({bnd_reg}, {bnd_sbuf})"
+                    ))
+                    # Init counter to -step (int32 SBUF tile). We increment
+                    # at the start of each iteration, so iter 1 counter = 0,
+                    # iter 2 counter = step, etc.
+                    step_init = int(block_sizes[i]) if isinstance(block_sizes[i], (int, bool)) else 1
+                    state.add_statement(statement_from_string(
+                        f"{counter_var} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.memset({counter_var}, value={-step_init})"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"{counter_float_var} = nl.ndarray([1, 1], nl.float32, buffer=nl.sbuf)"
+                    ))
+                    state.add_statement(statement_from_string(
+                        f"nisa.memset({counter_float_var}, value={float(-step_init)})"
+                    ))
+                    # Stash state on device_function so load/store/iota can
+                    # detect we're inside a dynamic loop and rewrite.
+                    if not hasattr(state.device_function, "_nki_dyn_loops"):
+                        state.device_function._nki_dyn_loops = {}
+                    step_int = int(block_sizes[i]) if isinstance(block_sizes[i], (int, bool)) else 1
+                    _offset_var = self.offset_var(block_idx)
+                    state.device_function._nki_dyn_loops[block_idx] = {
+                        "reg": bnd_reg,
+                        "counter": counter_var,
+                        "counter_float": counter_float_var,
+                        "step": step_int,
+                        "bound_sbuf": bnd_sbuf,
+                        "offset_var": _offset_var,
+                        # Signals memory_ops.py to emit a static prefill and
+                        # redirect y-loads to the padded output buffer, fixing
+                        # the oob_mode.skip partial-tile data loss bug.
+                        # Only set for jagged-style loops where the end bound
+                        # comes from a tensor_reduce(max) — those always produce
+                        # a variable named "nki_reduce".  General tensor-bound
+                        # loops (hl.tile(end[0])) use DMA-loaded scalars and
+                        # must NOT trigger the prefill path.
+                        "needs_prefill": bnd_sbuf.startswith("nki_reduce"),
+                    }
+                    state.device_function._nki_dyn_range_end_var = bnd_reg
+                    state.device_function._nki_dyn_current_block_id = block_idx
+            # Clamp block_size to loop extent: NKI's dma_copy uses
+            # [offset:offset+block_size] which can go OOB when block_size
+            # exceeds tensor dim (e.g. x_offsets[33] with block_size=64).
+            _clamped_bs = list(block_sizes)
+            for i, block_idx in enumerate(block_ids):
+                try:
+                    _numel = env.block_sizes[block_idx].numel
+                except (AssertionError, AttributeError):
+                    # Dynamic (tensor) bound: can't clamp at compile time
+                    continue
+                _num_int: int | None = None
+                if isinstance(_numel, (int, bool)):
+                    _num_int = int(_numel)
+                elif isinstance(_numel, torch.SymInt):
+                    try:
+                        _num_int = env.size_hint(_numel)
+                    except Exception:
+                        _num_int = None
+                elif isinstance(_numel, sympy.Expr):
+                    try:
+                        _num_int = int(_numel)
+                    except (TypeError, ValueError):
+                        try:
+                            _num_int = int(env.size_hint(_numel))
+                        except Exception:
+                            _num_int = None
+                cur_bs = block_sizes[i]
+                if (_num_int is not None
+                        and isinstance(cur_bs, (int, bool))
+                        and int(cur_bs) > _num_int):
+                    _clamped_bs[i] = _num_int
+            if _clamped_bs != list(block_sizes):
+                try:
+                    config_block_sizes = state.config.config.get("block_sizes")
+                    if isinstance(config_block_sizes, list):
+                        for bid, new_bs in zip(block_ids, _clamped_bs, strict=True):
+                            try:
+                                idx = env.config_spec.block_sizes.block_id_to_index(bid)
+                            except Exception:
+                                continue
+                            config_block_sizes[idx] = new_bs
+                except Exception:
+                    pass
+                block_sizes = _clamped_bs
         block_id_to_info = {}
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
+        # If we set up _nki_dyn_loops above, clear the legacy single-var
+        # so the range_str fallback doesn't consume it for the wrong dimension.
+        if getattr(state.device_function, "_nki_dyn_loops", {}):
+            state.device_function._nki_dyn_range_end_var = None
         for block_idx, block_size, begin, end, proxy_end in self._reorder(
             [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
         ):
@@ -1061,40 +4293,204 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
 
-            for_node = create(
-                ast.For,
-                target=create(ast.Name, id=offset_var, ctx=ast.Store()),
-                iter=expr_from_string(
-                    self.get_range_call_str(
-                        state.config,
-                        [block_idx],
-                        begin="{begin}",
-                        end="{end}",
-                        step=block_size_var,
+            # For dynamic-bound loops (block_idx in _nki_dyn_loops), emit
+            # nl.dynamic_range with the pre-allocated register directly instead
+            # of going through range_str (which can't know the block_id).
+            _dyn_info_here = getattr(state.device_function, "_nki_dyn_loops", {}).get(block_idx)
+            if _dyn_info_here is not None and env.backend.name == "nki":
+                _dyn_reg_here = _dyn_info_here["reg"]
+                _begin_str = "0"
+                if isinstance(begin, int):
+                    _begin_str = str(begin)
+                for_node = create(
+                    ast.For,
+                    target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                    iter=expr_from_string(
+                        f"nl.dynamic_range({_begin_str}, {_dyn_reg_here}, {block_size_var})"
                     ),
-                    begin=self._to_ast(begin, to_dtype=dtype),
-                    end=self._to_ast(end, to_dtype=dtype),
-                ),
-                body=body,
-                orelse=[],
-                type_comment=None,
-            )
+                    body=body,
+                    orelse=[],
+                    type_comment=None,
+                )
+                # Consume the legacy single-var if it was set for this block
+                if getattr(state.device_function, "_nki_dyn_range_end_var", None) == _dyn_reg_here:
+                    state.device_function._nki_dyn_range_end_var = None
+            else:
+                # NKI: if begin is a [1,1] SBUF tensor (dynamic scalar), load it into
+                # a register and use dynamic_range(begin_reg, end, step).
+                _nki_dyn_begin_reg = None
+                if env.backend.name == "nki" and begin is not None and not isinstance(begin, (int, bool)):
+                    import ast as _ast_mod_begin
+                    from .ast_extension import statement_from_string
+                    _begin_ast = self._to_ast(begin, to_dtype=dtype)
+                    _begin_name = _ast_mod_begin.unparse(_begin_ast) if isinstance(_begin_ast, _ast_mod_begin.AST) else str(begin)
+                    _sbuf_shapes = getattr(state.device_function, "_nki_sbuf_shapes", {})
+                    _begin_sbuf_shape = _sbuf_shapes.get(_begin_name)
+                    if _begin_sbuf_shape is None:
+                        _lk = _begin_name
+                        while "_copy" in _lk:
+                            _lk = _lk[:_lk.rfind("_copy")]
+                            _begin_sbuf_shape = _sbuf_shapes.get(_lk)
+                            if _begin_sbuf_shape is not None:
+                                break
+                    if _begin_sbuf_shape is not None and _begin_sbuf_shape == [1, 1]:
+                        # If a preceding needs_prefill dynamic loop used this SBUF
+                        # as its end-bound, the static prefill already wrote y to all
+                        # columns. The tail loop is redundant — suppress it entirely.
+                        _dyn_loops_skip = getattr(state.device_function, "_nki_dyn_loops", {})
+                        _skip_tail = any(
+                            _dl.get("needs_prefill") and _dl.get("bound_sbuf") == _begin_name
+                            for _dl in _dyn_loops_skip.values()
+                        )
+                        if _skip_tail:
+                            state.device_function._nki_skip_tail_loop = True
+                            _nki_dyn_begin_reg = None
+                        else:
+                            state.device_function._nki_skip_tail_loop = False
+                            _nki_dyn_begin_reg = state.device_function.new_var("_dyn_begin_reg")
+                            state.add_statement(statement_from_string(
+                                f"{_nki_dyn_begin_reg} = nisa.register_alloc()"
+                            ))
+                            state.add_statement(statement_from_string(
+                                f"nisa.register_load({_nki_dyn_begin_reg}, {_begin_name})"
+                            ))
+                        # Emit a counter SBUF that tracks the actual integer offset.
+                        # Init to begin - step; first loop-body increment → begin.
+                        # This mirrors the dyn-end loop counter so dma_copy AP can use it.
+                        _step_val = int(block_size) if isinstance(block_size, (int, bool)) else 1
+                        _dyn_begin_counter = state.device_function.new_var("_dyn_begin_counter")
+                        _dyn_begin_counter_f = state.device_function.new_var("_dyn_begin_counter_f")
+                        state.device_function._nki_sbuf_shapes[_dyn_begin_counter] = [1, 1]
+                        state.device_function._nki_sbuf_dtypes[_dyn_begin_counter] = "nl.int32"
+                        state.device_function._nki_sbuf_shapes[_dyn_begin_counter_f] = [1, 1]
+                        state.device_function._nki_sbuf_dtypes[_dyn_begin_counter_f] = "nl.float32"
+                        state.add_statement(statement_from_string(
+                            f"{_dyn_begin_counter} = nl.ndarray([1, 1], nl.int32, buffer=nl.sbuf)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_copy(dst={_dyn_begin_counter}, src={_begin_name})"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_scalar(dst={_dyn_begin_counter}, "
+                            f"data={_dyn_begin_counter}, op0=nl.subtract, operand0={_step_val})"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"{_dyn_begin_counter_f} = nl.ndarray([1, 1], nl.float32, buffer=nl.sbuf)"
+                        ))
+                        # Cast int32 → float32: memset to 0.0, then add the int32 value.
+                        # tensor_tensor(float32, float32, int32, nl.add) converts int32 to float.
+                        state.add_statement(statement_from_string(
+                            f"nisa.memset({_dyn_begin_counter_f}, value=0.0)"
+                        ))
+                        state.add_statement(statement_from_string(
+                            f"nisa.tensor_tensor(dst={_dyn_begin_counter_f}, "
+                            f"data1={_dyn_begin_counter_f}, data2={_dyn_begin_counter}, op=nl.add)"
+                        ))
+                        # Track the offset var so guards skip the >= 0 check for it
+                        if not hasattr(state.device_function, "_nki_dyn_begin_offset_vars"):
+                            state.device_function._nki_dyn_begin_offset_vars = set()
+                        state.device_function._nki_dyn_begin_offset_vars.add(offset_var)
+                        # Store counter info so loop_index_statements and dma_copy AP can use it
+                        if not hasattr(state.device_function, "_nki_dyn_loops"):
+                            state.device_function._nki_dyn_loops = {}
+                        state.device_function._nki_dyn_loops[block_idx] = {
+                            "reg": _nki_dyn_begin_reg,
+                            "counter": _dyn_begin_counter,
+                            "counter_float": _dyn_begin_counter_f,
+                            "step": _step_val,
+                            "bound_sbuf": _begin_name,
+                            "offset_var": offset_var,
+                        }
+                _skip_tail_loop = getattr(state.device_function, "_nki_skip_tail_loop", False)
+                if _skip_tail_loop:
+                    for_node = create(
+                        ast.For,
+                        target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        iter=expr_from_string("nl.affine_range(0, 0, 1)"),
+                        body=body, orelse=[], type_comment=None,
+                    )
+                elif _nki_dyn_begin_reg is not None:
+                    for_node = create(
+                        ast.For,
+                        target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        iter=expr_from_string(
+                            f"nl.dynamic_range({_nki_dyn_begin_reg}, {{end}}, {block_size_var})",
+                            end=self._to_ast(end, to_dtype=dtype),
+                        ),
+                        body=body,
+                        orelse=[],
+                        type_comment=None,
+                    )
+                else:
+                    for_node = create(
+                        ast.For,
+                        target=create(ast.Name, id=offset_var, ctx=ast.Store()),
+                        iter=expr_from_string(
+                            self.get_range_call_str(
+                                state.config,
+                                [block_idx],
+                                begin="{begin}",
+                                end="{end}",
+                                step=block_size_var,
+                            ),
+                            begin=self._to_ast(begin, to_dtype=dtype),
+                            end=self._to_ast(end, to_dtype=dtype),
+                        ),
+                        body=body,
+                        orelse=[],
+                        type_comment=None,
+                    )
             assert for_node.body is body
             uses_thread_axis = self._uses_thread_axis(block_size)
             axis = thread_axis_offset + thread_axis_map[block_idx]
             bs = block_size_var if uses_thread_axis else "1"
-            idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
-            extra_body = [
-                statement_from_string(f"{index_var} = {idx_expr}"),
-            ]
+            idx_stmts = _backend_loop_index_statements(
+                env.backend,
+                offset_var=offset_var,
+                block_size_var=bs,
+                dtype=dtype,
+                axis=axis,
+                index_var=index_var,
+            )
+            extra_body = list(idx_stmts)
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
-                extra_body.append(mask_statement)
+                if isinstance(mask_statement, list):
+                    extra_body.extend(mask_statement)
+                else:
+                    extra_body.append(mask_statement)
+            # If this block is dynamic, prepend counter-increment at the
+            # START of the loop body (counter was init to -step, so first
+            # iteration brings it to 0 before index use).
+            _dyn_loops_sa = getattr(state.device_function, "_nki_dyn_loops", {})
+            _counter_inc_stmt = None
+            if block_idx in _dyn_loops_sa:
+                from .ast_extension import statement_from_string
+                _counter = _dyn_loops_sa[block_idx]["counter"]
+                _counter_float = _dyn_loops_sa[block_idx].get("counter_float")
+                _step = _dyn_loops_sa[block_idx]["step"]
+                _counter_inc_stmt = statement_from_string(
+                    f"nisa.tensor_scalar(dst={_counter}, data={_counter}, op0=nl.add, operand0={_step})"
+                )
+                if _counter_float is not None:
+                    _counter_inc_stmt = [
+                        _counter_inc_stmt,
+                        statement_from_string(
+                            f"nisa.tensor_scalar(dst={_counter_float}, data={_counter_float}, op0=nl.add, operand0={float(_step)})"
+                        ),
+                    ]
             # pyrefly: ignore [unsupported-operation]
-            body[:] = [*extra_body, *body]
+            if _counter_inc_stmt is not None:
+                # Put increment BEFORE iota/mask so indices use the updated counter.
+                if isinstance(_counter_inc_stmt, list):
+                    body[:] = [*_counter_inc_stmt, *extra_body, *body]
+                else:
+                    body[:] = [_counter_inc_stmt, *extra_body, *body]
+            else:
+                body[:] = [*extra_body, *body]
             body = [for_node]
         assert for_node is not None
         return DeviceLoopState(
@@ -1135,16 +4531,50 @@ class NDTileStrategy(_BaseNDTileStrategy):
         index_var: str,
         end: object,
     ) -> ast.stmt | None:
+        env = CompileEnvironment.current()
         if (
-            CompileEnvironment.current()
-            .block_sizes[block_idx]
-            .known_multiple(block_size)
+            not env.backend.force_tile_mask()
+            and env.block_sizes[block_idx].known_multiple(block_size)
+            and not env.is_jagged_tile(block_idx)
         ):
             self.mask_vars[block_idx] = None
             return None
         self.mask_vars[block_idx] = mask_var = self.fn.new_var(
             f"mask_{block_idx}", dce=True
         )
+
+        if env.is_jagged_tile(block_idx):
+            jagged_tile_parents_ast = state.ast_args[3]
+            jagged_tile_parents_proxy = state.proxy_args[3]
+            assert isinstance(jagged_tile_parents_ast, list)
+            assert isinstance(jagged_tile_parents_proxy, list)
+            # We guarantee the first lifted loop input is the jagged_tile parent tensor.
+            jagged_tile_parent = jagged_tile_parents_ast[0]
+            jagged_tile_block_size = env.block_sizes[block_idx].var
+            jagged_tile_parent_proxy = jagged_tile_parents_proxy[0]
+            assert isinstance(jagged_tile_parent_proxy, torch.Tensor)
+            parent_dims: list[torch.SymInt] = []
+            for d in jagged_tile_parent_proxy.size():
+                assert isinstance(d, torch.SymInt)
+                parent_dims.append(d)
+            assert len(parent_dims) >= 1
+            env.jagged_tile_mask_shapes[block_idx] = [
+                *parent_dims,
+                jagged_tile_block_size,
+            ]
+            if not self.supports_index_rank_expansion():
+                return statement_from_string(
+                    f"{mask_var} = ({index_var}) < {{parent}}",
+                    parent=self._to_ast(jagged_tile_parent),
+                )
+            k = len(parent_dims)
+            child_expand = "[" + ", ".join(["None"] * k + [":"]) + "]"
+            parent_expand = "[" + ", ".join([":"] * k + ["None"]) + "]"
+            return statement_from_string(
+                f"{mask_var} = ({index_var}){child_expand} < {{parent}}{parent_expand}",
+                parent=self._to_ast(jagged_tile_parent),
+            )
+
         return statement_from_string(
             f"{mask_var} = ({index_var}) < {{end}}", end=self._to_ast(end)
         )
@@ -1168,51 +4598,167 @@ class CuteNDTileStrategy(NDTileStrategy):
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
         l2_grouping: int,
-        elements_per_thread: list[int] | None = None,
+        num_threads: list[int] | None = None,
+        mma_mode: bool = False,
+        inactive_block_ids: set[int] | None = None,
     ) -> None:
         super().__init__(fn, block_ids, block_size, loop_order, l2_grouping)
         assert isinstance(block_size, list)
-        if elements_per_thread is None:
-            elements_per_thread = [1 for _ in block_ids]
-        assert len(elements_per_thread) == len(block_ids)
-        self.elements_per_thread = elements_per_thread
+        if num_threads is None:
+            num_threads = [0 for _ in block_ids]
+        assert len(num_threads) == len(block_ids)
+        self.num_threads = num_threads
+        self.mma_mode = mma_mode
+        self.inactive_block_ids = inactive_block_ids or set()
         self._lane_var_by_block: dict[int, str] = {}
-        for block_id, ept in zip(block_ids, elements_per_thread, strict=True):
-            if ept > 1:
-                self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
+        # Per-block vec width for the lane loop (1 = scalar).  Populated
+        # from the autotuner-selected ``cute_vector_widths`` config when
+        # the block has a lane loop and its ``elements_per_thread`` is
+        # divisible by the picked V.  When > 1, ``codegen_device_loop``
+        # partitions the lane loop into outer (epT/V) x inner constexpr V
+        # so memory_ops can hoist a single ``cute.arch.load(..., V)`` per
+        # outer-lane iter (LDG.64 / LDG.128).
+        self._cute_lane_vec_width_by_block: dict[int, int] = {}
+        # Per-block constexpr V-loop var (only set when the lane loop is
+        # vec-partitioned). Used by memory_ops to find the inner loop's
+        # target var when emitting per-lane bitcasts.
+        self._cute_vec_lane_var_by_block: dict[int, str] = {}
+        # Per-block lane-base index var (the per-thread base of a V-wide
+        # contiguous chunk).  Set when lane vec is in play; used by
+        # memory_ops to compute the vec load pointer once per outer-lane
+        # iter.
+        self._cute_lane_base_index_var_by_block: dict[int, str] = {}
+        # Per-block lane body (list of AST statements inside the outer
+        # lane loop, ending in the constexpr V-loop). memory_ops uses
+        # ``insert(len(lane_body)-1, hoist_stmt)`` to splice the vec
+        # load just before the inner V-loop.
+        self._cute_lane_body_by_block: dict[int, list] = {}
+        # Shared per-block hoist cache: (tensor_name, base_ptr_expr) ->
+        # (hoist_var, dtype).  Same shape as
+        # ``LoopedReductionStrategy._cute_lane_vec_loads``.
+        self._cute_lane_vec_loads_by_block: dict[int, dict] = {}
+        if not mma_mode:
+            from ..autotuner.config_spec import CuteVectorWidthSpec
 
-    def _ept_for_block(self, block_id: int) -> int:
+            env_local = CompileEnvironment.current()
+            cute_vec_widths_cfg = cast(
+                "list[int]",
+                fn.config.config.get("cute_vector_widths", []) or [],
+            )
+            for block_id, nt, bs in zip(
+                block_ids, num_threads, block_size, strict=True
+            ):
+                if block_id in self.inactive_block_ids:
+                    continue
+                static_bs = self._configured_block_size_int(bs)
+                if (
+                    nt > 0
+                    and static_bs is not None
+                    and static_bs > nt
+                    and static_bs % nt == 0
+                ):
+                    self._lane_var_by_block[block_id] = self.fn.new_var(
+                        f"lane_{block_id}"
+                    )
+                    # Register a cute_vector_widths slot for this lane
+                    # block if not already present (rolled reductions
+                    # register their own via device_ir).  We add idempotently
+                    # so the autotuner can explore V in {1,2,4,8}.
+                    if (
+                        block_id
+                        not in env_local.config_spec.cute_vector_widths.valid_block_ids()
+                    ):
+                        import contextlib
+
+                        # Silently skip when append fails (e.g.
+                        # config_spec frozen) — the lane loop just
+                        # runs in scalar mode in that case.
+                        with contextlib.suppress(Exception):
+                            env_local.config_spec.cute_vector_widths.append(
+                                CuteVectorWidthSpec(
+                                    block_id=block_id,
+                                    size_hint=static_bs,
+                                )
+                            )
+                    elements_per_thread = static_bs // nt
+                    vec_width = env_local.config_spec.cute_vector_widths.config_get(
+                        cute_vec_widths_cfg,
+                        block_id,
+                        1,
+                    )
+                    if (
+                        isinstance(vec_width, int)
+                        and vec_width > 1
+                        and elements_per_thread % vec_width == 0
+                    ):
+                        self._cute_lane_vec_width_by_block[block_id] = vec_width
+
+    def _configured_block_size_int(self, block_size: SymIntLike) -> int | None:
+        if isinstance(block_size, int):
+            return block_size
+        env = CompileEnvironment.current()
+        resolved_block_id = env.resolve_block_id(block_size)
+        if resolved_block_id is not None:
+            configured_size = self.fn.resolved_block_size(resolved_block_id)
+            if isinstance(configured_size, int):
+                return configured_size
+        block_size_expr = _to_sympy(block_size)
+        block_size_expr = env.specialize_expr(block_size_expr)
+        if getattr(block_size_expr, "free_symbols", None):
+            return None
+        return int(block_size_expr)
+
+    def _elements_per_thread_for_block(self, block_id: int) -> int:
+        """Elements per thread for *block_id* (derived from num_threads)."""
+        if block_id in self.inactive_block_ids:
+            return 1
         idx = self.block_ids.index(block_id)
-        return self.elements_per_thread[idx]
+        nt = self.num_threads[idx]
+        if nt == 0:
+            return 1
+        bs = self._configured_block_size_int(self.block_size[idx])
+        assert isinstance(bs, int)  # validated by _thread_extent_for_axis
+        return bs // nt
 
     def _thread_extent_for_axis(
         self, block_id: int, block_size: SymIntLike
     ) -> SymIntLike:
-        ept = self._ept_for_block(block_id)
-        if ept == 1:
+        if block_id in self.inactive_block_ids:
+            return 1
+        if self.mma_mode:
+            return 1  # MMA handles element distribution, no CUDA threads needed
+        idx = self.block_ids.index(block_id)
+        nt = self.num_threads[idx]
+        if nt == 0:
             return block_size
-        if not isinstance(block_size, int):
-            raise exc.BackendUnsupported(
-                "cute",
-                "elements_per_thread requires static ND block sizes for cute",
-            )
-        if block_size % ept != 0:
+        resolved_block_size = block_size
+        if not isinstance(resolved_block_size, int):
+            static_block_size = self._configured_block_size_int(resolved_block_size)
+            if static_block_size is None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "num_threads requires static ND block sizes for cute",
+                )
+            resolved_block_size = static_block_size
+        if resolved_block_size % nt != 0:
             raise exc.BackendUnsupported(
                 "cute",
                 (
-                    "elements_per_thread must divide block size for cute axis "
-                    f"{block_id}: {ept} does not divide {block_size}"
+                    "block size must be divisible by num_threads for cute axis "
+                    f"{block_id}: {resolved_block_size} is not divisible by {nt}"
                 ),
             )
-        return block_size // ept
+        return nt
 
     def _uses_thread_axis_for_block(
         self, block_id: int, block_size: SymIntLike
     ) -> bool:
+        if block_id in self.inactive_block_ids:
+            return False
         thread_extent = self._thread_extent_for_axis(block_id, block_size)
         return not (isinstance(thread_extent, int) and thread_extent == 1)
 
-    def _thread_axis_map_with_ept(self) -> dict[int, int]:
+    def _thread_axis_map(self) -> dict[int, int]:
         block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
         axis_order = [self.block_ids[i] for i in self.loop_order]
         axis = 0
@@ -1232,6 +4778,14 @@ class CuteNDTileStrategy(NDTileStrategy):
             if self._uses_thread_axis_for_block(block_idx, block_size)
         )
 
+    def _static_thread_extent_for_block(
+        self, block_id: int, block_size: SymIntLike
+    ) -> int | None:
+        thread_extent = self._thread_extent_for_axis(block_id, block_size)
+        if isinstance(thread_extent, int):
+            return thread_extent
+        return self._configured_block_size_int(thread_extent)
+
     def thread_block_sizes(self) -> list[int]:
         sizes: list[int] = []
         block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
@@ -1239,14 +4793,39 @@ class CuteNDTileStrategy(NDTileStrategy):
             thread_extent = self._thread_extent_for_axis(
                 block_id, block_size_by_id[block_id]
             )
-            if self._uses_thread_axis_for_block(
-                block_id, block_size_by_id[block_id]
-            ) and isinstance(thread_extent, int):
-                sizes.append(thread_extent)
+            if self._uses_thread_axis_for_block(block_id, block_size_by_id[block_id]):
+                static_extent = thread_extent
+                if not isinstance(static_extent, int):
+                    static_extent = self._configured_block_size_int(static_extent)
+                if isinstance(static_extent, int):
+                    sizes.append(static_extent)
         return sizes
 
+    def thread_block_size_exprs(self) -> list[str]:
+        exprs: list[str] = []
+        block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            bs = block_size_by_id[block_id]
+            if not self._uses_thread_axis_for_block(block_id, bs):
+                continue
+            thread_extent = self._thread_extent_for_axis(block_id, bs)
+            if isinstance(thread_extent, int):
+                exprs.append(str(thread_extent))
+                continue
+            if not isinstance(bs, torch.SymInt):
+                return []
+            bs_var = self.block_size_var(block_id)
+            if bs_var is None:
+                return []
+            elements_per_thread = self._elements_per_thread_for_block(block_id)
+            if elements_per_thread == 1:
+                exprs.append(bs_var)
+            else:
+                exprs.append(f"({bs_var}) // {elements_per_thread}")
+        return exprs
+
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
-        if all(ept == 1 for ept in self.elements_per_thread):
+        if not self._lane_var_by_block:
             return super().codegen_grid(state)
 
         block_ids = self.block_ids
@@ -1274,20 +4853,21 @@ class CuteNDTileStrategy(NDTileStrategy):
         else:
             ends = [ends_arg]
         assert len(ends) == len(block_ids)
+        steps = self._root_grid_steps(state)
 
         lane_setup_statements: list[ast.AST] = []
+        outer_setup_statements: list[ast.AST] = []
+        tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
-        thread_axis_map = self._thread_axis_map_with_ept()
-        for i, (block_idx, block_size, begin, end) in enumerate(
+        thread_axis_map = self._thread_axis_map()
+        for i, (block_idx, block_size, begin, end, step) in enumerate(
             reversed(
-                self._reorder([*zip(block_ids, block_sizes, begins, ends, strict=True)])
+                self._reorder(
+                    [*zip(block_ids, block_sizes, begins, ends, steps, strict=True)]
+                )
             )
         ):
-            block_size_info = env.block_sizes[block_idx]
-            if block_size_info.size is None:
-                numel = self._get_data_dependent_numel(state, end, begin)
-            else:
-                numel = block_size_info.numel
+            numel = self._range_numel_expr(begin, end, step)
             device_function = state.device_function
             dtype = env.index_type()
             offset_var = self.offset_var(block_idx)
@@ -1301,7 +4881,18 @@ class CuteNDTileStrategy(NDTileStrategy):
                     f"{state.codegen.lift(begin_ast, dce=True, prefix='begin').id} + "
                 )
 
-            if block_size != 1:
+            if step not in (None, 1):
+                step_ast = self._to_ast(step, to_dtype=dtype)
+                # CuTe DSL preprocessor reserves ``step_<counter>`` (see comment
+                # in ``TileStrategy.__init__``) — rename our lifted step var to
+                # avoid the same UnboundLocalError that drove the offset rename.
+                step_prefix = "tile_step" if env.backend.name == "cute" else "step"
+                step_var = state.codegen.lift(step_ast, dce=True, prefix=step_prefix).id
+                block_size_var = "1"
+                state.add_statement(
+                    f"{offset_var} = {begin_offset_expr}({pid_var}) * {step_var}"
+                )
+            elif block_size != 1:
                 block_size_var = self.block_size_var(block_idx)
                 assert block_size_var is not None
                 self._setup_block_size_constexpr(
@@ -1314,24 +4905,42 @@ class CuteNDTileStrategy(NDTileStrategy):
                 block_size_var = "1"
                 state.add_statement(f"{offset_var} = {begin_offset_expr}{pid_var}")
 
-            ept = self._ept_for_block(block_idx)
-            uses_thread_axis = self._uses_thread_axis_for_block(block_idx, block_size)
+            elements_per_thread = self._elements_per_thread_for_block(block_idx)
+            uses_thread_axis = step in (None, 1) and self._uses_thread_axis_for_block(
+                block_idx, block_size
+            )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {ept}"
+                idx_expr = env.backend.lane_index_expr(
+                    offset_var, elements_per_thread, axis=axis
+                )
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                static_extent = (
+                    thread_extent
+                    if isinstance(thread_extent, int)
+                    else self._static_thread_extent_for_block(block_idx, block_size)
+                )
+                if isinstance(static_extent, int):
+                    tracker.record(block_idx, axis, static_extent)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + cutlass.Int32({lane_var})"
-            lane_setup_statements.append(
-                statement_from_string(f"{index_var} = {idx_expr}")
-            )
+                idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
+                target = lane_setup_statements
+            else:
+                # Setup that does not depend on a lane variable can be hoisted
+                # out of the lane loops. This avoids reassignments inside the
+                # lane-loop body that confuse the CuTe DSL preprocessor when
+                # its internal negative-step machinery emits identifiers like
+                # ``offset_<n>`` that collide with helion's tile offsets.
+                target = outer_setup_statements
+            target.append(statement_from_string(f"{index_var} = {idx_expr}"))
 
             mask_statement = self._setup_mask(
-                state, block_idx, block_size, index_var, numel
+                state, block_idx, block_size, index_var, end
             )
             if mask_statement is not None:
-                lane_setup_statements.append(mask_statement)
+                target.append(mask_statement)
             pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
             pids.append(pid)
         pids.codegen(state)
@@ -1350,7 +4959,10 @@ class CuteNDTileStrategy(NDTileStrategy):
         else:
             block_id_to_info = self._create_block_id_info_dict(state)
         lane_loops = [
-            (self._lane_var_by_block[block_id], self._ept_for_block(block_id))
+            (
+                self._lane_var_by_block[block_id],
+                self._elements_per_thread_for_block(block_id),
+            )
             for block_id in (self.block_ids[i] for i in self.loop_order)
             if block_id in self._lane_var_by_block
         ]
@@ -1358,46 +4970,93 @@ class CuteNDTileStrategy(NDTileStrategy):
             self,
             block_id_to_info=block_id_to_info,
             lane_loops=lane_loops,
+            lane_loop_blocks=set(self._lane_var_by_block),
             lane_setup_statements=lane_setup_statements,
+            outer_prefix=outer_setup_statements,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
-        if all(ept == 1 for ept in self.elements_per_thread):
+        if not self._lane_var_by_block and not self.mma_mode:
             return super().codegen_device_loop(state)
 
         block_ids = self.block_ids
         env = CompileEnvironment.current()
         dtype = env.index_type()
         block_sizes = self.block_size
-        body = user_body = []
-        lane_loops = [
-            (self._lane_var_by_block[block_id], self._ept_for_block(block_id))
-            for block_id in (self.block_ids[i] for i in self.loop_order)
-            if block_id in self._lane_var_by_block
-        ]
-        for lane_var, extent in reversed(lane_loops):
-            lane_for = create(
-                ast.For,
-                target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-                iter=expr_from_string(f"range({extent})"),
-                body=body,
-                orelse=[],
-                type_comment=None,
-            )
-            body = [lane_for]
+        user_body: list[ast.AST] = []
+        body: list[ast.AST] = user_body
+        # Capture per-block (lane_var, full_extent, vec_width).  When
+        # vec_width > 1, the outer lane runs (full_extent // vec_width)
+        # iters; the inner constexpr-V loop handles V elements per outer
+        # iter.  The memory_ops vec-load dispatcher splices a single
+        # ``cute.arch.load(..., V)`` between the outer lane setup and the
+        # inner constexpr loop, so per-thread bytes-per-load grow from
+        # ``sizeof(dtype)`` to ``V * sizeof(dtype)`` (LDG.64 / LDG.128).
+        lane_loops_meta: list[tuple[int, str, int, int]] = []
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            if block_id not in self._lane_var_by_block:
+                continue
+            lane_var = self._lane_var_by_block[block_id]
+            extent = self._elements_per_thread_for_block(block_id)
+            vec_width = self._cute_lane_vec_width_by_block.get(block_id, 1)
+            lane_loops_meta.append((block_id, lane_var, extent, vec_width))
+        for block_id, lane_var, extent, vec_width in reversed(lane_loops_meta):
+            if vec_width > 1 and extent > 0 and extent % vec_width == 0:
+                # Partition the lane loop into outer x inner constexpr V.
+                # The inner constexpr-V loop's body re-runs the user body
+                # for each of the V lanes (the user body's per-lane
+                # ``index_var = ...`` setup keys off the COMPOSITE lane =
+                # outer*V + inner so the per-element index is correct).
+                vec_lane_var = self.fn.new_var(f"vec_lane_{block_id}", dce=False)
+                self._cute_vec_lane_var_by_block[block_id] = vec_lane_var
+                inner_for = cast(
+                    "ast.For",
+                    ast.parse(
+                        f"for {vec_lane_var} in cutlass.range_constexpr({vec_width}):\n"
+                        f"    pass"
+                    ).body[0],
+                )
+                inner_for.body = body  # type: ignore[assignment]
+                # ``lane_body`` is what's INSIDE the outer lane loop:
+                # statements above the constexpr V-loop, plus the loop
+                # itself (last entry).  memory_ops.py splices a hoisted
+                # ``cute.arch.load(..., V)`` into ``lane_body[-1:]`` via
+                # the same protocol ``LoopedReductionStrategy`` uses.
+                lane_body: list[ast.AST] = [inner_for]
+                self._cute_lane_body_by_block[block_id] = lane_body
+                outer_extent = extent // vec_width
+                # Always emit the outer lane loop even when ``outer_extent
+                # == 1`` (i.e. EPT == V): the lane-base index expression
+                # references ``lane_var``, which must be defined in scope.
+                # The CuTe DSL constant-folds the 1-iter loop away.
+                outer_for = _create_lane_loop(lane_var, outer_extent, lane_body)
+                body = [outer_for]
+            else:
+                lane_for = _create_lane_loop(lane_var, extent, body)
+                body = [lane_for]
         for_node: ast.For | None = None
         assert len(block_sizes) == len(block_ids)
-        _, begins, ends, _ = state.ast_args
-        _, _, proxy_ends, _ = state.proxy_args
+        if len(state.ast_args) == 5:
+            _, begins, ends, _, steps = state.ast_args
+        else:
+            _, begins, ends, _ = state.ast_args
+            steps = None
+        _, _, proxy_ends, *_ = state.proxy_args
         assert isinstance(begins, list)
         assert isinstance(ends, list)
+        if steps is None:
+            steps = [None] * len(block_ids)
+        assert isinstance(steps, list)
         assert isinstance(proxy_ends, list)
         block_id_to_info = {}
+        tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
-        thread_axis_map = self._thread_axis_map_with_ept()
+        thread_axis_map = self._thread_axis_map()
         index_setup: list[ast.stmt] = []
-        for block_idx, block_size, begin, end, proxy_end in self._reorder(
-            [*zip(block_ids, block_sizes, begins, ends, proxy_ends, strict=True)]
+        for block_idx, block_size, begin, end, step, proxy_end in self._reorder(
+            [*zip(block_ids, block_sizes, begins, ends, steps, proxy_ends, strict=True)]
         ):
             offset_var = self.offset_var(block_idx)
             index_var = self.index_var(block_idx)
@@ -1417,11 +5076,23 @@ class CuteNDTileStrategy(NDTileStrategy):
             end_var_name = state.codegen.lift(
                 self._to_ast(end, to_dtype=dtype), dce=True, prefix="end"
             ).id
+            begin_var_name = state.codegen.lift(
+                self._to_ast(begin, to_dtype=dtype), dce=True, prefix="begin"
+            ).id
             block_id_to_info[block_idx] = LoopDimInfo(
+                begin_var_name=begin_var_name,
+                begin_expr=_to_sympy(begin)
+                if isinstance(begin, (int, torch.SymInt))
+                else None,
                 end_var_name=end_var_name,
                 end_expr=self._fold_tile_end_op(state, proxy_end, block_size),
             )
 
+            # When the backend uses Python range() (e.g. Pallas), range
+            # bounds must be plain Python ints — skip the dtype cast so
+            # that concrete values stay as ints and are not wrapped in
+            # backend-traced dtype conversions.
+            range_dtype = None if env.backend.range_requires_python_int else dtype
             for_node = create(
                 ast.For,
                 target=create(ast.Name, id=offset_var, ctx=ast.Store()),
@@ -1431,24 +5102,76 @@ class CuteNDTileStrategy(NDTileStrategy):
                         [block_idx],
                         begin="{begin}",
                         end="{end}",
-                        step=block_size_var,
+                        step=(
+                            ast.unparse(self._to_ast(step, to_dtype=range_dtype))
+                            if step not in (None, 1)
+                            else block_size_var
+                        ),
                     ),
-                    begin=self._to_ast(begin, to_dtype=dtype),
-                    end=self._to_ast(end, to_dtype=dtype),
+                    begin=self._to_ast(begin, to_dtype=range_dtype),
+                    end=self._to_ast(end, to_dtype=range_dtype),
                 ),
                 body=body,
                 orelse=[],
                 type_comment=None,
             )
-            ept = self._ept_for_block(block_idx)
-            uses_thread_axis = self._uses_thread_axis_for_block(block_idx, block_size)
+            elements_per_thread = self._elements_per_thread_for_block(block_idx)
+            uses_thread_axis = step in (None, 1) and self._uses_thread_axis_for_block(
+                block_idx, block_size
+            )
             axis = thread_axis_offset + thread_axis_map[block_idx]
             if uses_thread_axis:
-                idx_expr = f"{offset_var} + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {ept}"
+                idx_expr = env.backend.lane_index_expr(
+                    offset_var, elements_per_thread, axis=axis
+                )
+                thread_extent = self._thread_extent_for_axis(block_idx, block_size)
+                static_extent = (
+                    thread_extent
+                    if isinstance(thread_extent, int)
+                    else self._static_thread_extent_for_block(block_idx, block_size)
+                )
+                if isinstance(static_extent, int):
+                    tracker.record(block_idx, axis, static_extent)
             else:
                 idx_expr = offset_var
+            block_vec_width = self._cute_lane_vec_width_by_block.get(block_idx, 1)
+            vec_lane_var = self._cute_vec_lane_var_by_block.get(block_idx)
             if lane_var := self._lane_var_by_block.get(block_idx):
-                idx_expr = f"{idx_expr} + cutlass.Int32({lane_var})"
+                if block_vec_width > 1 and vec_lane_var is not None:
+                    # Composite per-element lane index = outer*V + inner.
+                    # outer (``lane_var``) ranges [0, EPT/V); inner
+                    # (``vec_lane_var``) ranges [0, V).  Per-thread base
+                    # (the start of the V-wide chunk this thread owns
+                    # for this outer iter) is stashed in
+                    # ``_cute_lane_base_index_var_by_block`` so the vec
+                    # load can use it directly (mirrors the
+                    # ``LoopedReductionStrategy`` unroll path).
+                    base_index_var = self.fn.new_var(
+                        f"lane_base_{block_idx}", dce=False
+                    )
+                    self._cute_lane_base_index_var_by_block[block_idx] = base_index_var
+                    # ``base = offset + tid*EPT + outer*V``  (per-thread
+                    # V-aligned base) — emitted INSIDE the outer lane
+                    # loop's body (above the constexpr V-loop) so a
+                    # single ``cute.arch.load(..., V)`` can be hoisted
+                    # at the same level by memory_ops.
+                    lane_body_list = self._cute_lane_body_by_block.get(block_idx)
+                    if lane_body_list is not None:
+                        base_expr = (
+                            f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)} "
+                            f"* {block_vec_width}"
+                        )
+                        lane_body_list.insert(
+                            0,
+                            statement_from_string(f"{base_index_var} = {base_expr}"),
+                        )
+                    # The user-body's per-element index uses the base +
+                    # the inner constexpr-V var so the existing scalar
+                    # pipeline (mask + cast + reduce-or-store) keeps
+                    # working unchanged.
+                    idx_expr = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
+                else:
+                    idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
             index_setup.append(statement_from_string(f"{index_var} = {idx_expr}"))
             mask_statement = self._setup_mask(
                 state, block_idx, block_size, index_var, end
@@ -1464,6 +5187,9 @@ class CuteNDTileStrategy(NDTileStrategy):
             for_node=for_node,
             inner_statements=user_body,
             block_id_to_info=block_id_to_info,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
+            lane_loop_blocks=set(self._lane_var_by_block),
         )
 
     def supports_index_rank_expansion(self) -> bool:
@@ -1479,31 +5205,39 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         block_ids: list[int],
         block_size: list[SymIntLike] | SymIntLike,
         loop_order: list[int],
-        elements_per_thread: int = 1,
+        num_threads: int = 0,
     ) -> None:
         super().__init__(fn, block_ids, block_size, loop_order)
-        self.elements_per_thread = elements_per_thread
+        self._num_threads = num_threads
         self._lane_var: str | None = None
-        if elements_per_thread > 1:
+        if num_threads > 0 and isinstance(block_size, int) and num_threads < block_size:
             self._lane_var = self.new_var("lane", dce=False)
 
+    @property
+    def _elements_per_thread(self) -> int:
+        """Elements per thread (derived from num_threads and block_size)."""
+        if self._num_threads == 0:
+            return 1
+        assert isinstance(self.block_size, int)
+        return self.block_size // self._num_threads
+
     def _thread_extent(self) -> SymIntLike:
-        if self.elements_per_thread == 1:
+        if self._num_threads == 0:
             return self.block_size
         if not isinstance(self.block_size, int):
             raise exc.BackendUnsupported(
                 "cute",
-                "elements_per_thread requires static flattened block sizes for cute",
+                "num_threads requires static flattened block sizes for cute",
             )
-        if self.block_size % self.elements_per_thread != 0:
+        if self.block_size % self._num_threads != 0:
             raise exc.BackendUnsupported(
                 "cute",
                 (
-                    "elements_per_thread must divide flattened block size for cute: "
-                    f"{self.elements_per_thread} does not divide {self.block_size}"
+                    "block size must be divisible by num_threads for cute: "
+                    f"{self.block_size} is not divisible by {self._num_threads}"
                 ),
             )
-        return self.block_size // self.elements_per_thread
+        return self._num_threads
 
     def thread_block_sizes(self) -> list[int]:
         if not self._uses_thread_axis():
@@ -1513,12 +5247,27 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
             return []
         return [thread_extent]
 
+    def thread_block_size_exprs(self) -> list[str]:
+        if not self._uses_thread_axis():
+            return []
+        thread_extent = self._thread_extent()
+        if isinstance(thread_extent, int):
+            return [str(thread_extent)]
+        if not isinstance(self.block_size, torch.SymInt):
+            return []
+        bs_var = self.block_size_var(-1)
+        if bs_var is None:
+            return []
+        if self._num_threads == 0:
+            return [bs_var]
+        return [f"({bs_var}) // {self._elements_per_thread}"]
+
     def _uses_thread_axis(self) -> bool:
         thread_extent = self._thread_extent()
         return not (isinstance(thread_extent, int) and thread_extent == 1)
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
-        if self.elements_per_thread == 1:
+        if self._lane_var is None:
             return super().codegen_grid(state)
 
         offsets_var = self._offsets_var
@@ -1532,7 +5281,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
 
         lane_setup_statements.append(
             statement_from_string(
-                f"{offsets_var} = {offsets_base_var} + cutlass.Int32({self._lane_var})"
+                f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
             )
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
@@ -1563,7 +5312,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
         axis = self._flat_thread_axis()
         state.add_statement(
-            f"{offsets_base_var} = ({pid_var}) * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self.elements_per_thread}"
+            f"{offsets_base_var} = {env.backend.lane_index_expr(f'({pid_var}) * ({block_size_var})', self._elements_per_thread, axis=axis)}"
         )
         pids.codegen(state)
         if isinstance(state.device_function.pid, ForEachProgramID):
@@ -1575,16 +5324,23 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         block_id_to_info = self._create_block_id_info_dict(state)
         lane_loops = []
         if self._lane_var is not None:
-            lane_loops = [(self._lane_var, self.elements_per_thread)]
+            lane_loops = [(self._lane_var, self._elements_per_thread)]
+        tracker = ThreadAxisTracker()
+        thread_extent = self._thread_extent()
+        if self._uses_thread_axis() and isinstance(thread_extent, int):
+            tracker.record_all(self.block_ids, axis, thread_extent)
         return DeviceGridState(
             self,
             block_id_to_info=block_id_to_info,
             lane_loops=lane_loops,
+            lane_loop_blocks=set(self.block_ids) if lane_loops else set(),
             lane_setup_statements=lane_setup_statements,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
-        if self.elements_per_thread == 1:
+        if self._lane_var is None:
             return super().codegen_device_loop(state)
 
         env = CompileEnvironment.current()
@@ -1598,7 +5354,7 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
 
         lane_setup_statements.append(
             statement_from_string(
-                f"{offsets_var} = {offsets_base_var} + cutlass.Int32({self._lane_var})"
+                f"{offsets_var} = {offsets_base_var} + {env.backend.lane_offset_expr(self._lane_var)}"
             )
         )
         for i, block_idx in enumerate(self._reorder(block_ids)):
@@ -1631,18 +5387,15 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
         body: list[ast.AST] = user_body
         user_body[:0] = lane_setup_statements
         if self._lane_var is not None:
-            lane_for = create(
-                ast.For,
-                target=create(ast.Name, id=self._lane_var, ctx=ast.Store()),
-                iter=expr_from_string(f"range({self.elements_per_thread})"),
-                body=body,
-                orelse=[],
-                type_comment=None,
+            lane_for = _create_lane_loop(
+                self._lane_var,
+                self._elements_per_thread,
+                body,
             )
             body = [lane_for]
         body[:0] = [
             statement_from_string(
-                f"{offsets_base_var} = {lid} * ({block_size_var}) + cutlass.Int32(cute.arch.thread_idx()[{axis}]) * {self.elements_per_thread}"
+                f"{offsets_base_var} = {env.backend.lane_index_expr(f'{lid} * ({block_size_var})', self._elements_per_thread, axis=axis)}"
             )
         ]
         for_node = create(
@@ -1656,11 +5409,17 @@ class CuteFlattenedTileStrategy(FlattenedTileStrategy):
             type_comment=None,
         )
         block_id_to_info = self._create_block_id_info_dict(state, use_proxy_ends=True)
+        tracker = ThreadAxisTracker()
+        thread_extent = self._thread_extent()
+        if self._uses_thread_axis() and isinstance(thread_extent, int):
+            tracker.record_all(self.block_ids, axis, thread_extent)
         return DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=user_body,
             block_id_to_info=block_id_to_info,
+            thread_axis_sizes=tracker.sizes,
+            block_thread_axes=tracker.block_axes,
         )
 
     def offset_var(self, block_idx: int) -> str:

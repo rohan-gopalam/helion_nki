@@ -1,28 +1,46 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import itertools
 import operator
 import random
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import cast
 
 from .._compat import warps_to_threads
+from ..exc import InvalidConfig
+from .block_id_sequence import BlockIdSequence
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
+from .config_fragment import ListOf
 from .config_fragment import PowerOfTwoFragment
+from .config_spec import shrink_block_sizes_for_numel_constraints
+from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from collections.abc import Sequence
 
     from .. import Config
     from . import ConfigSpec
+    from .config_priors import ValuePrior
 
 FlatConfig = list[object]
 
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
+
+
+def _value_or(value: object, fallback: Callable[[], object]) -> object:
+    """Return ``value`` unless it is ``None``, in which case call ``fallback``.
+
+    Used by the biased sampler: a prior returns ``None`` to decline a slot, and
+    the slot then falls back to the fragment's uniform ``random()``.
+    """
+    return fallback() if value is None else value
 
 
 class ConfigGeneration:
@@ -31,6 +49,8 @@ class ConfigGeneration:
         config_spec: ConfigSpec,
         *,
         overrides: Mapping[str, object] | None = None,
+        advanced_controls_files: list[str] | None = None,
+        process_group_name: str | None = None,
     ) -> None:
         def _collect_spec(spec: ConfigSpecFragment) -> object:
             """
@@ -47,8 +67,13 @@ class ConfigGeneration:
 
         super().__init__()
         self.config_spec = config_spec
+        self.process_group_name = process_group_name
+        self._advanced_controls_files = advanced_controls_files
         self.flat_spec: list[ConfigSpecFragment] = []
-        config_spec.flat_config(_collect_spec)
+        config_spec.flat_config(
+            _collect_spec,
+            advanced_controls_files=advanced_controls_files,
+        )
         assert self.flat_spec, "No config values to tune"
         self._override_values = dict(overrides or {})
         self.block_size_indices: list[int] = [
@@ -56,6 +81,13 @@ class ConfigGeneration:
             for i, spec in enumerate(self.flat_spec)
             if spec.category() == Category.BLOCK_SIZE
         ]
+        self.num_threads_indices: list[int] = []
+        self._cute_num_thread_block_pairs: list[tuple[int, int]] = []
+        self._cute_block_index_by_id: dict[int, int] = {}
+        self._cute_num_thread_index_by_id: dict[int, int] = {}
+        self._cute_flatten_loop_groups: list[tuple[int, list[int]]] = []
+        if self.config_spec.backend_name == "cute":
+            self._init_cute_num_thread_pairs()
         self.num_warps_index: int = next(
             (
                 i
@@ -70,13 +102,211 @@ class ConfigGeneration:
             else 1
         )
 
+    def _init_cute_num_thread_pairs(self) -> None:
+        """Pair each CuTe num_threads flat slot with its block_size slot."""
+        try:
+            block_indices, _ = self._key_to_flat_indices["block_sizes"]
+            num_thread_indices, _ = self._key_to_flat_indices["num_threads"]
+        except KeyError:
+            return
+        self.num_threads_indices = num_thread_indices
+        block_index_by_id = {
+            spec.block_id: block_indices[i]
+            for i, spec in enumerate(self.config_spec.block_sizes)
+            if i < len(block_indices)
+        }
+        num_thread_index_by_id = {
+            spec.block_id: num_thread_indices[i]
+            for i, spec in enumerate(self.config_spec.num_threads)
+            if i < len(num_thread_indices)
+        }
+        self._cute_block_index_by_id = block_index_by_id
+        self._cute_num_thread_index_by_id = num_thread_index_by_id
+        self._cute_num_thread_block_pairs = [
+            (num_thread_indices[i], block_index_by_id[spec.block_id])
+            for i, spec in enumerate(self.config_spec.num_threads)
+            if i < len(num_thread_indices) and spec.block_id in block_index_by_id
+        ]
+        try:
+            flatten_indices, _ = self._key_to_flat_indices["flatten_loops"]
+        except KeyError:
+            return
+        self._cute_flatten_loop_groups = [
+            (
+                flatten_indices[i],
+                [
+                    block_id
+                    for block_id in spec.block_ids
+                    if block_id in block_index_by_id
+                    and block_id in num_thread_index_by_id
+                ],
+            )
+            for i, spec in enumerate(self.config_spec.flatten_loops)
+            if i < len(flatten_indices)
+        ]
+
+    @functools.cached_property
+    def overridden_flat_indices(self) -> set[int]:
+        """Return flat_spec indices that are frozen by config overrides."""
+        if not self._override_values:
+            return set()
+        result: set[int] = set()
+        for key in self._override_values:
+            if key in self._key_to_flat_indices:
+                indices, _ = self._key_to_flat_indices[key]
+                result.update(indices)
+        return result
+
+    @functools.cached_property
+    def _key_to_flat_indices(self) -> dict[str, tuple[list[int], bool]]:
+        """Build mapping from config key names to (flat_spec indices, is_sequence).
+
+        Derived from ConfigSpec.flat_key_layout().
+        """
+        mapping: dict[str, tuple[list[int], bool]] = {}
+        idx = 0
+        for key, count, is_sequence in self.config_spec.flat_key_layout(
+            advanced_controls_files=self._advanced_controls_files
+        ):
+            mapping[key] = (list(range(idx, idx + count)), is_sequence)
+            idx += count
+        assert idx == len(self.flat_spec), (
+            f"flat_key_layout() total ({idx}) != flat_spec length ({len(self.flat_spec)})"
+        )
+        return mapping
+
     def _apply_overrides(self, config: Config) -> Config:
         if not self._override_values:
             return config
         for key, value in self._override_values.items():
             config.config[key] = copy.deepcopy(value)
+        self.config_spec.prepare_override_normalization(
+            config.config,
+            self._override_values,
+        )
         self.config_spec.normalize(config.config)
         return config
+
+    @staticmethod
+    def _largest_power_of_two_at_most(value: int) -> int:
+        return 1 << (max(value, 1).bit_length() - 1)
+
+    def _repair_cute_num_threads(self, flat_config: FlatConfig) -> None:
+        """Keep CuTe launch-thread choices compatible with tuned block sizes."""
+        if not self._cute_num_thread_block_pairs:
+            return
+
+        for num_threads_idx, block_size_idx in self._cute_num_thread_block_pairs:
+            num_threads = flat_config[num_threads_idx]
+            block_size = flat_config[block_size_idx]
+            if (
+                type(num_threads) is not int
+                or num_threads == 0
+                or type(block_size) is not int
+                or block_size <= 0
+            ):
+                continue
+            if num_threads > block_size:
+                num_threads = self._largest_power_of_two_at_most(block_size)
+            while num_threads > 1 and block_size % num_threads != 0:
+                num_threads //= 2
+            flat_config[num_threads_idx] = max(num_threads, 1)
+
+        for flatten_idx, block_ids in self._cute_flatten_loop_groups:
+            if flat_config[flatten_idx] is not True:
+                continue
+            group: list[tuple[int, int, bool, int]] = []
+            for block_id in block_ids:
+                block_size = flat_config[self._cute_block_index_by_id[block_id]]
+                num_threads_idx = self._cute_num_thread_index_by_id[block_id]
+                num_threads = flat_config[num_threads_idx]
+                if (
+                    type(block_size) is not int
+                    or block_size <= 0
+                    or type(num_threads) is not int
+                ):
+                    group = []
+                    break
+                resolved_threads = num_threads if num_threads > 0 else block_size
+                group.append(
+                    (num_threads_idx, block_size, num_threads == 0, resolved_threads)
+                )
+            if not group:
+                continue
+            thread_product = functools.reduce(
+                operator.mul, (item[3] for item in group), 1
+            )
+            auto_positions = [i for i, item in enumerate(group) if item[2]]
+            while thread_product > 1024 and auto_positions:
+                largest_pos = max(auto_positions, key=lambda i: group[i][3])
+                num_threads_idx, block_size, is_auto, resolved_threads = group[
+                    largest_pos
+                ]
+                if resolved_threads <= 1:
+                    auto_positions.remove(largest_pos)
+                    continue
+                next_threads = resolved_threads // 2
+                while next_threads > 1 and block_size % next_threads != 0:
+                    next_threads //= 2
+                if next_threads == resolved_threads:
+                    auto_positions.remove(largest_pos)
+                    continue
+                flat_config[num_threads_idx] = next_threads
+                group[largest_pos] = (
+                    num_threads_idx,
+                    block_size,
+                    is_auto,
+                    next_threads,
+                )
+                thread_product = (thread_product // resolved_threads) * next_threads
+
+        explicit_indices = [
+            idx
+            for idx, _ in self._cute_num_thread_block_pairs
+            if type(flat_config[idx]) is int and cast("int", flat_config[idx]) > 0
+        ]
+        thread_product = functools.reduce(
+            operator.mul,
+            (cast("int", flat_config[idx]) for idx in explicit_indices),
+            1,
+        )
+        while thread_product > 1024 and explicit_indices:
+            largest_idx = max(
+                explicit_indices,
+                key=lambda idx: cast("int", flat_config[idx]),
+            )
+            largest = cast("int", flat_config[largest_idx])
+            if largest <= 1:
+                break
+            flat_config[largest_idx] = largest // 2
+            thread_product //= 2
+
+    def flatten(self, config: Config) -> FlatConfig:
+        """Inverse of unflatten: convert a Config to a FlatConfig."""
+        result = self._fragment_default_flat()
+        flat_fields = self.config_spec._flat_fields()
+        for key, (indices, is_sequence) in self._key_to_flat_indices.items():
+            if key not in config.config:
+                has_default, value = self.config_spec.flatten_missing_field_default(
+                    key,
+                    config.config,
+                )
+                if not has_default:
+                    continue
+            else:
+                value = config.config[key]
+            if is_sequence:
+                assert isinstance(value, list)
+                field = flat_fields[key]
+                assert isinstance(field, BlockIdSequence)
+                encoded_values = field._encode_flat_values(self.config_spec, value)
+                for idx, encoded_value in zip(indices, encoded_values, strict=True):
+                    result[idx] = encoded_value
+            else:
+                assert len(indices) == 1
+                result[indices[0]] = value
+        self._repair_cute_num_threads(result)
+        return result
 
     def unflatten(self, flat_values: FlatConfig) -> Config:
         """
@@ -95,10 +325,17 @@ class ConfigGeneration:
             return flat_values[i]
 
         assert len(flat_values) == len(self.flat_spec)
+        self._repair_cute_num_threads(flat_values)
         count: itertools.count[int] = itertools.count()
-        config = self.config_spec.flat_config(get_next_value)
+        config = self.config_spec.flat_config(
+            get_next_value,
+            advanced_controls_files=self._advanced_controls_files,
+        )
         assert next(count) == len(flat_values)
-        return self._apply_overrides(config)
+        config = self._apply_overrides(config)
+        # Overrides may reintroduce pointer stores that break subtiled outputs
+        self.config_spec.fix_epilogue_subtile_store_indexing(config.config)
+        return config
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(
@@ -106,6 +343,20 @@ class ConfigGeneration:
             [cast("int", flat_config[i]) for i in self.block_size_indices],
             1,
         )
+
+    def _shrink_for_numel_constraints(self, flat_config: FlatConfig) -> None:
+        """Shrink block sizes in flat_config to satisfy numel constraints."""
+        constraints = self.config_spec.tensor_numel_constraints
+        if not constraints:
+            return
+        block_sizes = [cast("int", flat_config[i]) for i in self.block_size_indices]
+        min_sizes = [
+            max(self.flat_spec[i].get_minimum(), self.min_block_size)
+            for i in self.block_size_indices
+        ]
+        shrink_block_sizes_for_numel_constraints(constraints, block_sizes, min_sizes)
+        for idx, fi in enumerate(self.block_size_indices):
+            flat_config[fi] = block_sizes[idx]
 
     def shrink_config(
         self, flat_config: FlatConfig, max_elements_per_thread: int
@@ -121,10 +372,21 @@ class ConfigGeneration:
         if self.num_warps_index < 0 or not self.block_size_indices:
             return
         num_threads = warps_to_threads(cast("int", flat_config[self.num_warps_index]))
-        # Respect Triton's maximum tensor element limit
-        triton_limit = TRITON_MAX_TENSOR_NUMEL
+        # Respect the backend's per-tile element ceiling (Triton: 2**20;
+        # Pallas: None, since the real bound is VMEM bytes). Unit-test
+        # callers may invoke shrink_config without an active environment;
+        # default to the Triton limit in that case.
+        from .._compiler.compile_environment import CompileEnvironment
+
+        backend_limit: int | None = TRITON_MAX_TENSOR_NUMEL
+        if CompileEnvironment.has_current():
+            backend_limit = CompileEnvironment.current().backend.max_tensor_numel
         theoretical_max_elements = max_elements_per_thread * num_threads
-        max_elements = min(theoretical_max_elements, triton_limit)
+        max_elements = (
+            theoretical_max_elements
+            if backend_limit is None
+            else min(theoretical_max_elements, backend_limit)
+        )
         while self.block_numel(flat_config) > max_elements:
             changes = 0
             for i in self.block_size_indices:
@@ -136,6 +398,20 @@ class ConfigGeneration:
                     changes += 1
             if changes == 0:
                 break
+        self._shrink_for_numel_constraints(flat_config)
+        self._repair_cute_num_threads(flat_config)
+
+    def _fragment_default_flat(self) -> FlatConfig:
+        """
+        Retrieve the default flat configuration from raw fragment defaults.
+
+        Returns:
+            The default flat configuration values.
+        """
+        config = [spec.default() for spec in self.flat_spec]
+        self._shrink_for_numel_constraints(config)
+        self._repair_cute_num_threads(config)
+        return config
 
     def default_flat(self) -> FlatConfig:
         """
@@ -144,7 +420,69 @@ class ConfigGeneration:
         Returns:
             The default flat configuration values.
         """
-        return [spec.default() for spec in self.flat_spec]
+        if self.config_spec.compiler_default_config is None:
+            return self._fragment_default_flat()
+        return self.flatten(self.config_spec.default_config())
+
+    def seed_flat_config_pairs(
+        self,
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[tuple[FlatConfig, Config]]:
+        """Return ConfigSpec-provided seeds as flat and normalized configs.
+
+        ``ConfigSpec.compiler_seed_configs`` is compiler-owned and must
+        contain configs that match the live spec structurally. Invalid seeds
+        are skipped with the same transfer policy as user-provided seed configs.
+        """
+        result: list[tuple[FlatConfig, Config]] = []
+        seen: set[Config] = set()
+        for i, config in enumerate(self.config_spec.compiler_seed_configs):
+            try:
+                flat = self.flatten(config)
+                normalized = self.unflatten(flat)
+            except (
+                InvalidConfig,
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+            ) as e:
+                if log_func is not None:
+                    log_func(f"Failed to transfer compiler seed config {i + 1}: {e}")
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append((flat, normalized))
+        return result
+
+    def user_seed_flat_config_pairs(
+        self,
+        user_seed_configs: Sequence[Config],
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[tuple[FlatConfig, Config]]:
+        """Return user-provided seed configs as flat and normalized configs."""
+        result: list[tuple[FlatConfig, Config]] = []
+        seen: set[Config] = set()
+        for i, config in enumerate(user_seed_configs):
+            try:
+                flat = self.flatten(config)
+                normalized = self.unflatten(flat)
+            except (
+                InvalidConfig,
+                ValueError,
+                TypeError,
+                KeyError,
+                AssertionError,
+            ) as e:
+                if log_func is not None:
+                    log_func(f"Failed to transfer autotune seed config {i + 1}: {e}")
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append((flat, normalized))
+        return result
 
     def random_flat(self) -> FlatConfig:
         """
@@ -153,18 +491,142 @@ class ConfigGeneration:
         Returns:
             A random flat configuration.
         """
-        config = [spec.random() for spec in self.flat_spec]
-        self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
-        return config
+
+        with sync_seed(process_group_name=self.process_group_name):
+            config = [spec.random() for spec in self.flat_spec]
+            self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
+            self._repair_cute_num_threads(config)
+            return config
+
+    @functools.cached_property
+    def _config_value_priors(self) -> dict[str, ValuePrior]:
+        """Per-config-key sampling priors supplied by the active backend."""
+        return dict(self.config_spec.backend.config_value_priors(self.config_spec))
+
+    @functools.cached_property
+    def _flat_index_to_key_pos(self) -> dict[int, tuple[str, int]]:
+        """Map each flat_spec index to its ``(config key, position-in-key)``."""
+        mapping: dict[int, tuple[str, int]] = {}
+        for key, (indices, _is_sequence) in self._key_to_flat_indices.items():
+            for position, flat_idx in enumerate(indices):
+                mapping[flat_idx] = (key, position)
+        return mapping
+
+    def biased_random_flat(self) -> FlatConfig:
+        """Random flat config biased by the backend's per-key value priors.
+
+        Identical to :meth:`random_flat` except that, for each flat slot whose
+        config key has a registered prior, the value is drawn from that prior
+        (falling back to the fragment's uniform ``random()`` when the prior
+        declines). Used for half of the random portion of the initial
+        population; with no priors this is exactly ``random_flat``.
+        """
+        priors = self._config_value_priors
+        if not priors:
+            return self.random_flat()
+        index_to_key_pos = self._flat_index_to_key_pos
+        with sync_seed(process_group_name=self.process_group_name):
+            config: FlatConfig = []
+            for i, spec in enumerate(self.flat_spec):
+                key_pos = index_to_key_pos.get(i)
+                prior = priors.get(key_pos[0]) if key_pos is not None else None
+                if prior is None or key_pos is None:
+                    config.append(spec.random())
+                elif isinstance(spec, ListOf):
+                    # A list-valued key (e.g. ``indexing``) occupies one flat slot
+                    # holding a list; bias each element via the inner fragment.
+                    config.append(
+                        [
+                            _value_or(prior(spec.inner, j), spec.inner.random)
+                            for j in range(spec.length)
+                        ]
+                    )
+                else:
+                    config.append(_value_or(prior(spec, key_pos[1]), spec.random))
+            self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
+            self._repair_cute_num_threads(config)
+            return config
 
     def random_config(self) -> Config:
-        return self.unflatten(self.random_flat())
+        errors: dict[str, int] = {}
+        for _ in range(64):
+            try:
+                return self.unflatten(self.random_flat())
+            except InvalidConfig as e:
+                msg = str(e)
+                errors[msg] = errors.get(msg, 0) + 1
+                continue
+        summary = "; ".join(f"{msg} (x{n})" for msg, n in errors.items())
+        raise InvalidConfig(
+            f"failed to generate a valid random config after 64 attempts: {summary}"
+        )
 
-    def random_population_flat(self, n: int) -> list[FlatConfig]:
-        return [self.default_flat(), *[self.random_flat() for _ in range(n - 1)]]
+    def random_population_flat(
+        self,
+        n: int,
+        *,
+        user_seed_configs: Sequence[Config] = (),
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[FlatConfig]:
+        if n <= 0:
+            return [self.default_flat()]
+        default_flat = self.default_flat()
+        result = [default_flat]
 
-    def random_population(self, n: int) -> list[Config]:
-        return [*map(self.unflatten, self.random_population_flat(n))]
+        # Initial population order is default -> user seed configs -> compiler seeds
+        # -> random.  This preserves user seed priority without dropping built-in
+        # backend/compiler seeds from ConfigSpec.compiler_seed_configs.
+        for flat, _config in self.user_seed_flat_config_pairs(
+            user_seed_configs, log_func
+        ):
+            if any(flat == existing for existing in result):
+                continue
+            result.append(flat)
+            if len(result) >= n:
+                return result[:n]
+
+        for flat, _config in self.seed_flat_config_pairs(log_func):
+            if any(flat == existing for existing in result):
+                continue
+            result.append(flat)
+            if len(result) >= n:
+                return result[:n]
+
+        # Fill the remainder with random configs. When the backend supplies
+        # value priors, half the random fill is drawn from those priors (biased
+        # toward the region good configs occupy) and half stays uniform so the
+        # search keeps full coverage; with no priors every fill is uniform,
+        # leaving the historical behavior unchanged.
+        priors_present = bool(self._config_value_priors)
+        for j in range(n - len(result)):
+            if priors_present and j % 2 == 0:
+                result.append(self.biased_random_flat())
+            else:
+                result.append(self.random_flat())
+        return result
+
+    def random_population(
+        self,
+        n: int,
+        *,
+        user_seed_configs: Sequence[Config] = (),
+        log_func: Callable[[str], None] | None = None,
+    ) -> list[Config]:
+        result: list[Config] = []
+        attempts = 0
+        for flat in self.random_population_flat(
+            n, user_seed_configs=user_seed_configs, log_func=log_func
+        ):
+            try:
+                result.append(self.unflatten(flat))
+            except InvalidConfig:
+                attempts += 1
+        # Retry to fill the population to the requested size
+        while len(result) < n and attempts < 64:
+            with contextlib.suppress(InvalidConfig):
+                result.append(self.unflatten(self.random_flat()))
+            attempts += 1
+        return result
 
     def differential_mutation(
         self,
@@ -177,14 +639,21 @@ class ConfigGeneration:
         """
         The main op in differential evolution, randomly combine `x` with `a + (b - c)`.
         """
-        crossover_mask = [random.random() < crossover_rate for _ in self.flat_spec]
-        crossover_mask[random.randrange(len(crossover_mask))] = True
+        overridden = self.overridden_flat_indices
         result = [*x]
-        for i, crossover in enumerate(crossover_mask):
-            if crossover:
+        mutated = False
+        for i, spec in enumerate(self.flat_spec):
+            if i not in overridden and random.random() < crossover_rate:
+                result[i] = spec.differential_mutation(a[i], b[i], c[i])
+                mutated = True
+        if not mutated:
+            eligible = [i for i in range(len(self.flat_spec)) if i not in overridden]
+            if eligible:
+                i = random.choice(eligible)
                 result[i] = self.flat_spec[i].differential_mutation(a[i], b[i], c[i])
         # TODO(jansel): can this be larger? (too large and Triton compile times blow up)
         self.shrink_config(result, 8192)
+        self._repair_cute_num_threads(result)
         return result
 
     def encode_config(self, flat_config: FlatConfig) -> list[float]:

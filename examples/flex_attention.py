@@ -24,6 +24,7 @@ from torch.nn.attention.flex_attention import _score_mod_signature
 from torch.nn.attention.flex_attention import flex_attention
 
 import helion
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -89,11 +90,9 @@ def helion_flex_attention_kernel(
 
         # iterate through full tiles (no mask needed)
         if block_mask_full_kv_indices is not None:
-            sparse_num_blocks = (
-                block_mask_full_kv_num_blocks[  # pyrefly: ignore[unsupported-operation]
-                    b_idx, h_idx, sparse_row
-                ]
-            )
+            sparse_num_blocks = block_mask_full_kv_num_blocks[  # pyrefly: ignore[unsupported-operation]
+                b_idx, h_idx, sparse_row
+            ]
 
             for block_idx in hl.tile(sparse_num_blocks, block_size=1):
                 start_n = block_mask_full_kv_indices[
@@ -279,8 +278,8 @@ def main() -> None:
     Main entry point that runs the attention kernel test with specific parameters.
     Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
     """
-    test(2, 32, 1024, 64, torch.float16)
-    test(2, 4, 1024, 64, torch.float16, lambda score, *_: torch.tanh(score))
+    test(2, 32, 1024, 64, HALF_DTYPE)
+    test(2, 4, 1024, 64, HALF_DTYPE, lambda score, *_: torch.tanh(score))
 
 
 if __name__ == "__main__":

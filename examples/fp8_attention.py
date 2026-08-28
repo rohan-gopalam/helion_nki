@@ -18,6 +18,7 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import HALF_DTYPE
 from helion._testing import run_example
 import helion.language as hl
 
@@ -166,6 +167,19 @@ def fp8_attention_tritonbench(
 
 
 # %%
+def fp8_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """End-to-end FP8 attention: preprocess bf16 (q,k,v) and run the kernel.
+
+    Tensor-returning entry point used by `benchmarks/run_tpu.py` (the
+    harness expects `fn(*args) -> Tensor`, while `fp8_attention_tritonbench`
+    returns a callable factory).
+    """
+    batch, heads, *_ = q.shape
+    q_fp8, k_fp8, v_fp8 = preprocess_fp8_attention_inputs(q, k, v)
+    return fp8_attention_kernel(q_fp8, k_fp8, v_fp8, batch, heads)
+
+
+# %%
 def _fp8_attention_pytorch_impl(
     q_fp8: torch.Tensor,
     k_fp8: torch.Tensor,
@@ -278,9 +292,9 @@ def check(batch: int, heads: int, seq_len: int, head_dim: int) -> None:
         head_dim: Dimension of each attention head
     """
     torch.manual_seed(42)
-    q = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device=DEVICE)
-    k = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device=DEVICE)
-    v = torch.randn(batch, heads, seq_len, head_dim, dtype=torch.float16, device=DEVICE)
+    q = torch.randn(batch, heads, seq_len, head_dim, dtype=HALF_DTYPE, device=DEVICE)
+    k = torch.randn(batch, heads, seq_len, head_dim, dtype=HALF_DTYPE, device=DEVICE)
+    v = torch.randn(batch, heads, seq_len, head_dim, dtype=HALF_DTYPE, device=DEVICE)
 
     helion_fn = fp8_attention_tritonbench(None, q, k, v)
     pytorch_fn = fp8_attention_pytorch(q, k, v)
@@ -300,7 +314,6 @@ def main() -> None:
     Tests with small, medium, and large attention configurations.
     """
     # TODO(adam-smnk): generalize to XPU
-    assert DEVICE.type == "cuda", "Requires CUDA device"
     check(1, 2, 128, 64)
     check(2, 4, 256, 64)
     check(4, 8, 512, 128)

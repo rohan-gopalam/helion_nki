@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from itertools import zip_longest
 from typing import TYPE_CHECKING
 
 import torch
@@ -9,14 +10,89 @@ from torch._subclasses.fake_tensor import FakeTensor
 from .. import exc
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _to_sympy
 from .._compiler.compile_environment import format_shape
+from .._compiler.compile_environment import shape_env_var_hints
+from .._compiler.cute.indexing import CutePackedAffineLoad
+from .._compiler.cute.indexing import CutePackedTerms
+from .._compiler.cute.matmul_fallback import _emit_cute_matmul
+from .._compiler.cute.matmul_utils import cute_lower_rhs_for_matmul
+from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
+from .._compiler.cute.matmul_utils import cute_outer_accumulator_dtype
+from .._compiler.cute.matmul_utils import cute_outer_accumulator_out_dtype
+from .._compiler.cute.matmul_utils import cute_resolve_active_block_id
+from .._compiler.cute.matmul_utils import cute_resolve_active_matmul_k_block_id
+from .._compiler.cute.matmul_utils import cute_static_k_invariant_extent
+from .._compiler.cute.strategies import is_pure_matmul_role_lifecycle_config
+from .._compiler.cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .._compiler.matmul_utils import _compute_out_dtype
+from .._compiler.matmul_utils import _emit_pallas_matmul
 from .._compiler.matmul_utils import _emit_tl_dot_scaled
+from .._compiler.matmul_utils import _needs_f32_accumulator
 from .._compiler.matmul_utils import emit_tl_dot_with_padding
+from ..autotuner.config_spec import MatmulFact
 from . import _decorators
 
 if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
+
+
+def _static_dim_value(env: CompileEnvironment, size: int | torch.SymInt) -> int | None:
+    if isinstance(size, int):
+        return size
+    expr = _to_sympy(size)
+    expr = env.specialize_expr(env.shape_env.replace(expr))
+    if expr.free_symbols:
+        if not env.settings.static_shapes:
+            return None
+        expr = expr.xreplace(shape_env_var_hints(env.shape_env))
+    if expr.free_symbols:
+        return None
+    return int(expr)
+
+
+def _cute_dot_outer_accumulates_result(fx_node: object, *, is_acc_none: bool) -> bool:
+    if not isinstance(fx_node, torch.fx.Node):
+        fx_node = getattr(fx_node, "fx_node", fx_node)
+    if not isinstance(fx_node, torch.fx.Node):
+        fx_node = None
+    return cute_outer_accumulates_result(fx_node, is_acc_none=is_acc_none)
+
+
+def _requested_pure_matmul_role_lifecycle(state: CodegenState) -> bool:
+    return is_pure_matmul_role_lifecycle_config(state.device_function.config)
+
+
+def _requested_tcgen05_flat_role_coordinates(state: CodegenState) -> bool:
+    return bool(
+        state.device_function.config.get(
+            TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False
+        )
+    )
+
+
+def _cuda_num_sms_or_zero(device: torch.device) -> int:
+    """Return the device SM count, or 0 on devices ``get_num_sm`` does not support.
+
+    Used by the cluster_m=2 small-shape wave-quantization gate in
+    ``enforce_dot_requirements`` (cute_plan.md §7.6.3.2). The 0 fallback
+    keeps cluster_m=2 search live for configuration round-trip tests
+    that bind on CPU or other unsupported device types.
+    """
+    if device.type != "cuda":
+        return 0
+    # Local import: ``helion.runtime`` is in the import chain that loads
+    # this module, so a top-level import would be circular.
+    from ..runtime import get_num_sm
+
+    try:
+        return get_num_sm(device)
+    except (AssertionError, NotImplementedError):
+        return 0
 
 
 @_decorators.api(is_device_only=True)
@@ -68,6 +144,18 @@ def dot(
     raise exc.NotInsideKernel
 
 
+def _cute_mma_matches_dot_semantics(
+    lhs_dtype: torch.dtype,
+    rhs_dtype: torch.dtype,
+    acc_dtype: torch.dtype | None,
+    out_dtype: torch.dtype | None,
+) -> bool:
+    """Return True when fixed-f32 MMA accumulation matches hl.dot semantics."""
+    if not _needs_f32_accumulator(lhs_dtype, rhs_dtype):
+        return True
+    return out_dtype in (None, torch.float32) and acc_dtype in (None, torch.float32)
+
+
 @_decorators.prepare_args(dot)
 def _(
     mat1: torch.Tensor,
@@ -110,8 +198,6 @@ def _(
 
     # Check batch dimension compatibility (broadcastable or matching) if any input is 3D
     if mat1.ndim == 3 or mat2.ndim == 3:
-        from itertools import zip_longest
-
         batch_shape_1 = mat1.shape[:-2] if mat1.ndim > 2 else ()
         batch_shape_2 = mat2.shape[:-2] if mat2.ndim > 2 else ()
 
@@ -188,12 +274,222 @@ def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> None:
     for shape, min_size in ((m, a), (n, b), (k, c)):
         block_idx = env.get_block_id(shape)
         if block_idx is not None:
+            # On Pallas, clamp min to the tensor dimension so we don't
+            # force blocks larger than the tensor (Pallas BlockSpecs can't
+            # handle that, unlike Triton which masks out-of-bounds accesses).
+            # The dot-level padding in matmul_utils.py will pad the smaller
+            # tile up to min_dot_size at codegen time.
+            if env.backend_name == "pallas":
+                try:
+                    bspec = env.config_spec.block_sizes.block_id_lookup(block_idx)
+                    min_size = min(min_size, bspec.size_hint)
+                except KeyError:
+                    pass
             env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
+
+    # Blackwell tcgen05 matmuls require an explicit MxNxK tile family that the
+    # generic power-of-two search space rarely reaches on its own. Reuse the
+    # same block-size constraint path as Triton/Pallas so CuTe matmul search
+    # space shaping lives in one place. On current B200 runs the stable family
+    # now scales well past N=8, with N=256 outperforming the earlier narrow
+    # clamp on large bf16/f16 GEMMs.
+    def static_problem_extent(size: int | torch.SymInt) -> int | None:
+        block_idx = env.get_block_id(size)
+        if block_idx is not None:
+            block_size = env.block_sizes[block_idx].size
+            if isinstance(block_size, (int, torch.SymInt)):
+                return _static_dim_value(env, block_size)
+        return _static_dim_value(env, size)
+
+    static_m = static_problem_extent(m)
+    static_n = static_problem_extent(n)
+    static_k = static_problem_extent(k)
+    env.config_spec.matmul_facts.append(
+        MatmulFact(
+            lhs_ndim=lhs.ndim,
+            rhs_ndim=rhs.ndim,
+            m_block_id=env.get_block_id(m),
+            n_block_id=env.get_block_id(n),
+            k_block_id=env.get_block_id(k),
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            lhs_dtype=lhs.dtype,
+            rhs_dtype=rhs.dtype,
+        )
+    )
+    if (
+        env.backend_name == "cute"
+        and lhs.ndim == 2
+        and rhs.ndim == 2
+        and lhs.dtype in (torch.float16, torch.bfloat16)
+        and rhs.dtype == lhs.dtype
+        and static_m is not None
+        and static_n is not None
+        and static_k is not None
+        and static_m >= 64
+        and static_n >= 8
+        and static_k >= 16
+    ):
+        from .._compiler.cute.mma_support import get_cute_mma_support
+
+        if get_cute_mma_support().tcgen05_f16bf16:
+
+            def pow2_floor_at_least(value: int, minimum: int) -> int:
+                return 1 << (max(minimum, value).bit_length() - 1)
+
+            max_tcgen05_n = min(256, pow2_floor_at_least(static_n, 8))
+            max_tcgen05_m = 256 if max_tcgen05_n >= 128 and static_m >= 256 else 128
+            # Larger tile_k packs more cute.gemm instructions per K loop
+            # iteration on tcgen05 (mma instruction K is fixed at 16 for
+            # BF16/FP16). Cap at 128 to keep AB SMEM staging budget sane.
+            max_tcgen05_k = min(128, pow2_floor_at_least(static_k, 16))
+            max_search_m = min(max_tcgen05_m, pow2_floor_at_least(static_m, 64))
+            max_search_n = max_tcgen05_n
+            max_search_k = max_tcgen05_k
+            min_search_m = 128 if max_tcgen05_m >= 256 else 64
+            two_cta_m_edge = static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
+            two_cta_n_edge = static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+            two_cta_k_tail = static_k % max_search_k != 0
+            if static_m % max_search_m != 0 and static_n % max_search_n != 0:
+                # Flat tcgen05 cluster_m=1 kernels now handle partial M and
+                # partial N output tiles in the SIMT edge epilogue. Keep N
+                # wide so edge-heavy shapes such as 5000x5000 do not collapse
+                # to block_n=8. M still caps at 128 because block_m=256 is
+                # validated through the cluster_m=2 CtaGroup.TWO path, which
+                # remains gated to static-full persistent kernels below.
+                max_search_m = min(max_search_m, 128)
+            spec = env.config_spec
+            spec.cute_tcgen05_search_enabled = True
+            # Persistent pid types may re-enter autotune only if every
+            # power-of-two block-size candidate in the tcgen05 search space
+            # is a static full tile. Since each candidate divides the maximum
+            # power-of-two candidate, checking the maximum per axis is enough.
+            # Multi-root kernels are rejected later once device IR root count
+            # is known.
+            allow_full_tile_persistent_pid_types = (
+                static_m % max_search_m == 0
+                and static_n % max_search_n == 0
+                and static_k % max_search_k == 0
+            )
+            # ``tcgen05_cluster_m`` is searched independently from bk. Expose
+            # 2 when at least the largest searched bk fits the cap; smaller
+            # invalid bk samples fall back to cluster_m=1 during normalization.
+            max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
+            allow_full_tile_cluster_m2_search = (
+                allow_full_tile_persistent_pid_types
+                and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
+                and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+                and static_k <= max_cluster_m2_search_k
+            )
+            # Admit only the validated large double-output-edge + K-tail
+            # CtaGroup.TWO family: 256x256x128, persistent_interleaved.
+            # Smaller edge-heavy shapes continue using the established flat
+            # SIMT-edge fallback.
+            allow_edge_cluster_m2_search = (
+                not allow_full_tile_persistent_pid_types
+                and max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
+                and max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
+                and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+                and static_n >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+                and static_k >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+                and static_k <= max_cluster_m2_search_k
+                and two_cta_m_edge
+                and two_cta_n_edge
+                and two_cta_k_tail
+            )
+            allow_cluster_m2_search = (
+                allow_full_tile_cluster_m2_search or allow_edge_cluster_m2_search
+            )
+            # Small-shape wave-quantization gate. Suppress cluster_m=2 search
+            # only for genuinely tiny problems that cannot fill a meaningful
+            # fraction of the device; below that the persistent warp-spec
+            # prologue dominates and cluster_m=1 wins. The original gate used
+            # ``num_sms // 2`` (one full wave of 2-SM cluster slots), but that
+            # was calibrated for the DEFAULT-layout cluster_m=2 path. The
+            # generalized TVM-FFI direct entry (see
+            # ``CuteTcgen05ClusterM2FfiHeuristic``) has a much lower launch +
+            # epilogue overhead, which shifts the cluster_m=1/2 crossover well
+            # below one wave: full-autotune A/B on B200 shows cluster_m=2 + FFI
+            # winning at 64 work clusters (1024x4096x1024 and 2048^3, ~64
+            # clusters on the 148-SM B200 = 0.86 of a wave) by 7-21% over
+            # cluster_m=1. Use ``num_sms // 4`` so those validated shapes are
+            # admitted on current and larger Blackwell SKUs while still
+            # suppressing the truly tiny shapes (fewer than a quarter-wave of
+            # cluster slots) that have no FFI coverage. ``num_sms == 0`` (non-CUDA / mocked) keeps search
+            # live. See cute_plan.md §7.6.3.2 for the original NCU rationale.
+            if allow_cluster_m2_search:
+                num_sms_for_cm2_threshold = _cuda_num_sms_or_zero(lhs.device)
+                if num_sms_for_cm2_threshold > 0:
+                    cm2_work_clusters = (static_m // TCGEN05_TWO_CTA_BLOCK_M) * (
+                        static_n // TCGEN05_TWO_CTA_BLOCK_N
+                    )
+                    cm2_min_clusters = num_sms_for_cm2_threshold // 4
+                    if cm2_work_clusters < cm2_min_clusters:
+                        allow_cluster_m2_search = False
+            # Narrow the autotune search to tcgen05 configs that have been
+            # validated to compile and run correctly on B200. Static full-tile
+            # single-root role-local persistent kernels have coverage, so the
+            # helper keeps persistent pid types when all search block sizes
+            # are full tiles. ``cluster_m=2`` re-enters search for static-full
+            # CtaGroup.TWO problems and for the large validated double-edge +
+            # K-tail family whose search space can form 256x256 tiles within
+            # the K-tile cap. Search-time
+            # normalization projects cluster_m=2 products onto that validated
+            # tile/pid shape and caps cluster_m=1 persistent products at
+            # tcgen05-supported M tiles so search does not fall through the
+            # universal fallback. ``num_epi_warps != 4`` remains excluded
+            # because only 4 is validated correct; 1 and 2 are directly
+            # verified to produce wrong output and 3 is unsafe by extension.
+            # The num_epi_warps restriction also tightens normalize() so an
+            # explicit user config that bypasses autotune raises
+            # ``InvalidConfig`` rather than silently miscomputing — there is
+            # no loud crash for this failure mode.
+            # Admit ``tcgen05_ab_stages=3`` into search whenever the
+            # active dtype is BF16/FP16 — the matmul path's outer guard
+            # already proved that. The per-CTA SMEM-budget gate inside
+            # ``allow_tcgen05_ab_stages_three_search`` queries
+            # ``lhs.device`` (not the host's current CUDA device) so a
+            # multi-GPU / heterogeneous setup cannot accidentally enable
+            # an over-budget config or suppress the canonical seed. If
+            # the target device's SMEM optin cap is below the B200
+            # envelope the gate keeps search at ``max=2``, and the
+            # per-config search-time fixup demotes over-budget ``ab=3``
+            # samples back to ``ab=2``. cute_plan.md §7.0 documents the
+            # canonical 4096^3 acceptance criterion.
+            ab_dtype_bytes = lhs.dtype.itemsize
+            spec.narrow_tcgen05_autotune_to_validated_configs(
+                allow_persistent_pid_types=allow_full_tile_persistent_pid_types,
+                allow_cluster_m2_search=allow_cluster_m2_search,
+                cluster_m2_static_k=static_k if allow_cluster_m2_search else None,
+                allow_cluster_m2_edge_k_tail_family=allow_edge_cluster_m2_search,
+                ab_stages_three_dtype_bytes=ab_dtype_bytes,
+                ab_stages_three_device=lhs.device,
+            )
+            for axis_name, shape, max_size in (
+                ("m", m, max_search_m),
+                ("n", n, max_search_n),
+                ("k", k, max_search_k),
+            ):
+                block_idx = env.get_block_id(shape)
+                if block_idx is None:
+                    continue
+                if axis_name == "k":
+                    min_size = 16
+                elif axis_name == "m":
+                    min_size = min_search_m
+                else:
+                    min_size = 8
+                env.block_sizes[block_idx].update_min_block(
+                    min_size, allow_flattened=True
+                )
+                env.block_sizes[block_idx].update_max_block(max_size)
 
     # Triton only supports 2D dot operations.  When the operands are 3D
     # (batched matmul), constrain the batch dimension block size to 1 so
     # the codegen can squeeze it away before emitting tl.dot.
-    if len(lshape) == 3:
+    # Pallas uses jnp.dot_general which handles batched matmul natively.
+    if len(lshape) == 3 and env.backend_name != "pallas":
         for batch_dim in (lshape[0], rshape[0]):
             block_idx = env.get_block_id(batch_dim)
             if block_idx is not None:
@@ -225,6 +521,8 @@ def _(state: CodegenState) -> object:
     lhs_ast = state.ast_arg(0)
     rhs_ast = state.ast_arg(1)
     acc_ast = state.ast_arg(2)
+    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
+    assert isinstance(rhs_ast, ast.AST)
 
     # Get the dtypes of the inputs from proxy args
     lhs_proxy = state.proxy_args[0]
@@ -647,7 +945,17 @@ def _(
         )
     else:
         # For non-FP8 tensors, use regular matmul
-        result = torch.mm(mat1, mat2, out_dtype=resolved_out_dtype)
+        if mat1.ndim == 3 or mat2.ndim == 3:
+            mat1_batched = mat1 if mat1.ndim == 3 else mat1.unsqueeze(0)
+            mat2_batched = mat2 if mat2.ndim == 3 else mat2.unsqueeze(0)
+            batch = max(mat1_batched.shape[0], mat2_batched.shape[0])
+            result = torch.bmm(
+                mat1_batched.expand(batch, -1, -1),
+                mat2_batched.expand(batch, -1, -1),
+                out_dtype=resolved_out_dtype,
+            )
+        else:
+            result = torch.mm(mat1, mat2, out_dtype=resolved_out_dtype)
 
     if acc is not None:
         return acc + result
@@ -862,3 +1170,333 @@ def _(
     if acc is not None:
         return acc + result
     return result
+
+
+# --- NKI codegen (ported from fix-nki-kernel-compilation) ---
+@_decorators.codegen(dot, "nki")
+def _(state: CodegenState) -> object:
+    from .._compiler.ast_extension import expr_from_string
+    from .._compiler.ast_extension import statement_from_string
+    from .._compiler.ast_extension import create
+
+    import sympy as _sympy
+
+    lhs_ast = state.ast_arg(0)
+    rhs_ast = state.ast_arg(1)
+    acc_ast = state.ast_arg(2)
+
+    lhs_proxy = state.proxy_args[0]
+    rhs_proxy = state.proxy_args[1]
+    acc_proxy = state.proxy_args[2] if len(state.proxy_args) > 2 else None
+    assert isinstance(lhs_proxy, FakeTensor)
+    assert isinstance(rhs_proxy, FakeTensor)
+
+    is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
+
+    env = CompileEnvironment.current()
+    _bs_subs: dict[_sympy.Symbol, int] = {}
+    for _bid in range(len(env.block_sizes)):
+        _bs = env.block_sizes[_bid]
+        _bs_subs[_bs.symbol()] = int(_bs.from_config_assert(state.config))
+
+    def _to_int(s: int | torch.SymInt) -> int:
+        if isinstance(s, int):
+            return s
+        return int(s._sympy_().subs(_bs_subs))
+
+    lhs_shape = list(lhs_proxy.shape)
+    rhs_shape = list(rhs_proxy.shape)
+    # Squeeze leading batch dims for 3D+ shapes (batch_block=1)
+    while len(lhs_shape) > 2:
+        lhs_shape = lhs_shape[1:]
+    while len(rhs_shape) > 2:
+        rhs_shape = rhs_shape[1:]
+    M_tile = _to_int(lhs_shape[0])
+    K_tile = _to_int(lhs_shape[1])
+    N_tile = _to_int(rhs_shape[-1])
+
+    TILE_M = 128
+    TILE_K = 128
+    TILE_N = 512
+
+    assert M_tile % TILE_M == 0 or M_tile < TILE_M, (
+        f"M_tile={M_tile} must be <= {TILE_M} or a multiple of {TILE_M}"
+    )
+    assert K_tile % TILE_K == 0 or K_tile < TILE_K, (
+        f"K_tile={K_tile} must be <= {TILE_K} or a multiple of {TILE_K}"
+    )
+
+    actual_tile_m = min(M_tile, TILE_M)
+    actual_tile_k = min(K_tile, TILE_K)
+    N_sub = min(TILE_N, N_tile)
+    n_sub_m = max(1, M_tile // TILE_M)
+    n_sub_k = max(1, K_tile // TILE_K)
+    n_sub_n = max(1, N_tile // N_sub) if N_tile > TILE_N else 1
+
+    # NKI nc_transpose requires dst.dtype == data.dtype (validated on gen3+).
+    # We therefore allocate the transpose-result PSUM tile with the lhs dtype
+    # (not fp32 hardcoded). When lhs and rhs differ, the transposed
+    # stationary operand is explicitly cast to the rhs (moving) dtype for
+    # nc_matmul.
+    lhs_dtype = lhs_proxy.dtype
+    rhs_dtype = rhs_proxy.dtype
+    matmul_dtype_str = env.backend.dtype_str(rhs_dtype)
+    transpose_dtype_str = env.backend.dtype_str(lhs_dtype)
+    need_cast_after_transpose = lhs_dtype != rhs_dtype
+
+    lhs_name = ast.unparse(lhs_ast)
+    rhs_name = ast.unparse(rhs_ast)
+    device_fn = state.device_function
+
+    lhs_tile_vars = device_fn.get_tile_list_vars(lhs_name)
+    rhs_tile_vars = device_fn.get_tile_list_vars(rhs_name)
+    lhs_is_list = lhs_tile_vars is not None
+    rhs_is_list = rhs_tile_vars is not None
+    result_is_list = n_sub_m > 1
+
+    # PSUM-reuse fusion: if this hl.dot node was tagged by nki_fusion and
+    # the result is a single tile with no accumulator, skip the final
+    # PSUM→SBUF copy below and let the downstream Vector/Scalar consumer
+    # read from the PSUM buffer directly.
+    _fx_node = state.fx_node
+    _keep_in_psum = bool(
+        _fx_node is not None
+        and _fx_node.meta.get("nki_keep_in_psum", False)
+        and is_acc_none
+        and not result_is_list
+        and n_sub_n == 1
+    )
+
+    mm_result = device_fn.new_var("_nki_dot_result")
+    mm_result_tile_vars: list[str] = []
+    if result_is_list:
+        for i in range(n_sub_m):
+            rv = device_fn.new_var(f"{mm_result}_{i}")
+            mm_result_tile_vars.append(rv)
+            state.add_statement(
+                statement_from_string(
+                    f"{rv} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+        device_fn.register_tile_list(mm_result, mm_result_tile_vars)
+    elif not _keep_in_psum:
+        state.add_statement(
+            statement_from_string(
+                f"{mm_result} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+
+    sub_k_var = device_fn.new_var("_dot_sub_k")
+    lhs_t_psum = device_fn.new_var("_dot_lhs_t_psum")
+    lhs_t_sbuf = device_fn.new_var("_dot_lhs_t_sbuf")
+    lhs_t_cast = device_fn.new_var("_dot_lhs_t_cast") if need_cast_after_transpose else None
+    mm_psum = device_fn.new_var("_dot_mm_psum")
+    # stationary operand for nc_matmul: cast buffer if dtype cast needed
+    _stationary = lhs_t_cast if need_cast_after_transpose else lhs_t_sbuf
+
+    def _lhs_k_slice(m_i: int, k_expr: str) -> str:
+        if lhs_is_list:
+            assert lhs_tile_vars is not None
+            if n_sub_k > 1:
+                return (
+                    f"{lhs_tile_vars[m_i]}[0:{actual_tile_m}, "
+                    f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+                )
+            return lhs_tile_vars[m_i]
+        if n_sub_m > 1:
+            return (
+                f"{lhs_name}[{m_i} * {actual_tile_m} : ({m_i} + 1) * {actual_tile_m}, "
+                f"{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+            )
+        if n_sub_k > 1:
+            return f"{lhs_name}[0:{actual_tile_m}, {k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}]"
+        return lhs_name
+
+    def _rhs_ref(k_expr: str, n_expr: str) -> str:
+        if rhs_is_list:
+            assert rhs_tile_vars is not None
+            idx = int(k_expr) if k_expr.isdigit() else 0
+            if n_sub_n > 1:
+                return (
+                    f"{rhs_tile_vars[idx]}[0:{TILE_K}, "
+                    f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+                )
+            return rhs_tile_vars[idx]
+        if n_sub_k > 1 or n_sub_n > 1:
+            return (
+                f"{rhs_name}[{k_expr} * {TILE_K} : ({k_expr} + 1) * {TILE_K}, "
+                f"{n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            )
+        return rhs_name
+
+    def _result_ref(m_i: int, n_expr: str) -> str:
+        if result_is_list:
+            rv = mm_result_tile_vars[m_i]
+            if n_sub_n > 1:
+                return f"{rv}[0:{actual_tile_m}, {n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+            return rv
+        if n_sub_n > 1:
+            return f"{mm_result}[0:{actual_tile_m}, {n_expr} * {N_sub} : ({n_expr} + 1) * {N_sub}]"
+        return mm_result
+
+    def _emit_one_m_stripe(m_i: int, n_expr: str) -> None:
+        mm_sbuf_tmp = device_fn.new_var("_dot_sbuf_tmp")
+        state.add_statement(
+            statement_from_string(
+                f"{mm_psum} = nl.ndarray([{actual_tile_m}, {N_sub}], nl.float32, buffer=nl.psum)"
+            )
+        )
+
+        def _transpose_body(k_expr: str) -> list[ast.AST]:
+            return [
+                statement_from_string(
+                    f"{lhs_t_psum} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.psum)"
+                ),
+                statement_from_string(
+                    f"nisa.nc_transpose(dst={lhs_t_psum}, data={_lhs_k_slice(m_i, k_expr)})"
+                ),
+                statement_from_string(
+                    f"{lhs_t_sbuf} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {transpose_dtype_str}, buffer=nl.sbuf)"
+                ),
+                statement_from_string(
+                    f"nisa.tensor_copy(dst={lhs_t_sbuf}, src={lhs_t_psum})"
+                ),
+                *(
+                    [
+                        statement_from_string(
+                            f"{lhs_t_cast} = nl.ndarray([{actual_tile_k}, {actual_tile_m}], {matmul_dtype_str}, buffer=nl.sbuf)"
+                        ),
+                        statement_from_string(
+                            f"nisa.tensor_copy(dst={lhs_t_cast}, src={lhs_t_sbuf})"
+                        ),
+                    ]
+                    if need_cast_after_transpose
+                    else []
+                ),
+            ]
+
+        if n_sub_k > 1 and rhs_is_list:
+            for k_i in range(n_sub_k):
+                for stmt in _transpose_body(str(k_i)):
+                    state.add_statement(stmt)
+                state.add_statement(
+                    statement_from_string(
+                        f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref(str(k_i), n_expr)})"
+                    )
+                )
+        elif n_sub_k > 1:
+            state.add_statement(
+                create(
+                    ast.For,
+                    target=create(ast.Name, id=sub_k_var, ctx=ast.Store()),
+                    iter=expr_from_string(f"nl.affine_range({n_sub_k})"),
+                    body=[
+                        *_transpose_body(sub_k_var),
+                        statement_from_string(
+                            f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref(sub_k_var, n_expr)})"
+                        ),
+                    ],
+                    orelse=[],
+                )
+            )
+        else:
+            for stmt in _transpose_body("0"):
+                state.add_statement(stmt)
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.nc_matmul(dst={mm_psum}, stationary={_stationary}, moving={_rhs_ref('0', n_expr)})"
+                )
+            )
+        if _keep_in_psum:
+            # PSUM reuse: downstream Vector/Scalar consumer reads mm_psum
+            # directly, so we skip the PSUM→SBUF copies entirely.
+            return
+        state.add_statement(
+            statement_from_string(
+                f"{mm_sbuf_tmp} = nl.ndarray([{actual_tile_m}, {N_sub}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={mm_sbuf_tmp}, src={mm_psum})"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_copy(dst={_result_ref(m_i, n_expr)}, src={mm_sbuf_tmp})"
+            )
+        )
+
+    def _emit_all_m_stripes(n_expr: str) -> None:
+        for m_i in range(n_sub_m):
+            _emit_one_m_stripe(m_i, n_expr)
+
+    if n_sub_n > 1:
+        sub_n_var = device_fn.new_var("_dot_sub_n")
+        inner_body: list[ast.AST] = []
+        orig_stmts = state.codegen.statements_stack[-1]
+        state.codegen.statements_stack[-1] = inner_body
+        _emit_all_m_stripes(sub_n_var)
+        state.codegen.statements_stack[-1] = orig_stmts
+        state.add_statement(
+            create(
+                ast.For,
+                target=create(ast.Name, id=sub_n_var, ctx=ast.Store()),
+                iter=expr_from_string(f"nl.affine_range({n_sub_n})"),
+                body=inner_body,
+                orelse=[],
+            )
+        )
+    else:
+        _emit_all_m_stripes("0")
+
+    # Register PSUM alias so downstream Vector/Scalar ops read from PSUM.
+    if _keep_in_psum:
+        device_fn._nki_psum_aliases[mm_result] = mm_psum
+        device_fn._nki_fx_matmul_vars[_fx_node.name] = mm_result
+        device_fn._nki_sbuf_shapes[mm_result] = [actual_tile_m, N_tile]
+        device_fn._nki_sbuf_shapes[mm_psum] = [actual_tile_m, N_tile]
+
+    if is_acc_none:
+        return expr_from_string(mm_result)
+
+    assert acc_proxy is not None and isinstance(acc_proxy, FakeTensor)
+    acc_name = ast.unparse(acc_ast)
+    acc_tile_vars = device_fn.get_tile_list_vars(acc_name)
+    out_result = device_fn.new_var("_nki_dot_acc_result")
+
+    if result_is_list:
+        out_tile_vars: list[str] = []
+        for i in range(n_sub_m):
+            ov = device_fn.new_var(f"{out_result}_{i}")
+            out_tile_vars.append(ov)
+            state.add_statement(
+                statement_from_string(
+                    f"{ov} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+                )
+            )
+        for i in range(n_sub_m):
+            acc_ref = acc_tile_vars[i] if acc_tile_vars else acc_name
+            state.add_statement(
+                statement_from_string(
+                    f"nisa.tensor_tensor(dst={out_tile_vars[i]}, "
+                    f"data1={mm_result_tile_vars[i]}, data2={acc_ref}, op=nl.add)"
+                )
+            )
+        device_fn.register_tile_list(out_result, out_tile_vars)
+    else:
+        state.add_statement(
+            statement_from_string(
+                f"{out_result} = nl.ndarray([{actual_tile_m}, {N_tile}], nl.float32, buffer=nl.sbuf)"
+            )
+        )
+        state.add_statement(
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={out_result}, data1={mm_result}, "
+                f"data2={{acc}}, op=nl.add)",
+                acc=acc_ast,
+            )
+        )
+    return expr_from_string(out_result)
+
+

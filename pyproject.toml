@@ -31,20 +31,24 @@ dev = [
     "pytest",
     "pytest-timeout",
     "pre-commit",
-    "hypothesis"
+    "hypothesis",
+    "tabulate",
 ]
-cute-cu12 = [
-    "nvidia-cutlass-dsl",
+# Helion integrates tightly with the cutlass DSL's internal APIs; each
+# upstream release tends to break the cute backend. The pin tracked in
+# .github/ci_commit_pins/nvidia_cutlass_dsl.txt is the single source of
+# truth — keep these extras in sync with that pin, and prefer
+# scripts/install_cute.sh in CI/dev environments.
+cute = [
+    "nvidia-cutlass-dsl[cu13]==4.5.2",
+    "apache-tvm-ffi",
 ]
-cute-cu13 = [
-    "nvidia-cutlass-dsl[cu13]",
-]
-pallas-cu12 = [
-    "jax[cuda12]",
+pallas-tpu = [
+    "jax[tpu]",
     "absl-py",
 ]
-pallas-cu13 = [
-    "jax[cuda13]",
+pallas-cpu = [
+    "jax",
     "absl-py",
 ]
 docs = [
@@ -73,6 +77,8 @@ Issues = "https://github.com/pytorch/helion/issues"
 target-version = "py310"
 line-length = 88
 src = ["helion"]
+extend-exclude = ["**/_helion_aot_*.py"]
+force-exclude = true
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -119,6 +125,7 @@ packages = ["helion"]
 include = [
   "helion/**/*.py",
   "helion/**/*.pyi",
+  "helion/**/*.json",
   "LICENSE",
 ]
 exclude = [

@@ -10,11 +10,16 @@ if TYPE_CHECKING:
     _A = TypeVar("_A", bound=ast.AST)
 
 
+HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"
+
+
 # TODO(oulgen): This visitor is extremely primitive, does not consider alpha renaming or scopes
 class _ReadWriteVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         super().__init__()
-        self.rw = ReadWrites(collections.Counter(), collections.Counter())
+        self.rw = ReadWrites(
+            collections.Counter(), collections.Counter(), collections.Counter()
+        )
 
     def _update(self, name: str, ctx: ast.expr_context) -> None:
         if isinstance(ctx, ast.Load):
@@ -28,6 +33,24 @@ class _ReadWriteVisitor(ast.NodeVisitor):
     def visit_Subscript(self, node: ast.Subscript) -> None:
         if isinstance(node.value, ast.Name):
             self._update(node.value.id, node.ctx)
+            if isinstance(node.ctx, ast.Store):
+                self.rw.inplace_writes[node.value.id] += 1
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # Detect atomic operations (hl.atomic_*) as writes to their first argument.
+        # e.g. hl.atomic_add(x, [i], value) means x is mutated in-place.
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr.startswith("atomic_")
+            and isinstance(func.value, ast.Name)
+            and node.args
+        ):
+            first_arg = node.args[0]
+            if isinstance(first_arg, ast.Name):
+                self.rw.writes[first_arg.id] += 1
+                self.rw.inplace_writes[first_arg.id] += 1
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> None:
@@ -42,6 +65,11 @@ class _ReadWriteVisitor(ast.NodeVisitor):
 class ReadWrites(typing.NamedTuple):
     reads: dict[str, int]
     writes: dict[str, int]
+    # TODO(tcombes): inplace_writes only tracks subscript stores (x[tile] = ...) and
+    # atomic ops (hl.atomic_*(x, ...)).  If Helion adds support for in-place
+    # methods inside kernels (e.g. x.copy_(), x.fill_()), the visitor should
+    # be updated to detect those as well.
+    inplace_writes: dict[str, int]
 
     def __iter__(self) -> typing.Iterator[str]:
         return iter({**self.reads, **self.writes})
@@ -52,6 +80,18 @@ class ReadWrites(typing.NamedTuple):
         for node in body:
             visitor.visit(node)
         return visitor.rw
+
+    def read_and_write_name_frozensets(self) -> tuple[frozenset[str], frozenset[str]]:
+        """Pair of (read names, write names) for inter-loop / barrier metadata.
+
+        ``_ReadWriteVisitor.visit_Subscript`` and ``visit_Call`` already
+        increment ``writes`` for both Store-context subscripts and atomic
+        first-args, so ``inplace_writes`` is a strict subset of ``writes``
+        today and adding it explicitly would be redundant.
+        """
+        reads = frozenset(self.reads.keys())
+        writes = frozenset(self.writes.keys())
+        return reads, writes
 
     @staticmethod
     def from_ast(node: ast.AST) -> ReadWrites:
@@ -132,6 +172,67 @@ def ast_delete_assignments(body: list[ast.AST], to_remove: set[str]) -> list[ast
         if new_node is not None:
             new_body.append(new_node)
     return new_body
+
+
+class _DeleteDeadLaneLoops(ast.NodeTransformer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.changed = False
+
+    def _visit_stmt_list(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        new_body: list[ast.stmt] = []
+        for stmt in body:
+            new_stmt = self.visit(stmt)
+            if isinstance(new_stmt, list):
+                new_body.extend(new_stmt)
+            elif new_stmt is not None:
+                new_body.append(new_stmt)
+        return new_body
+
+    def generic_visit(self, node: ast.AST) -> ast.AST:
+        for field in ("body", "orelse", "finalbody"):
+            old_value = getattr(node, field, None)
+            if isinstance(old_value, list) and all(
+                isinstance(stmt, ast.stmt) for stmt in old_value
+            ):
+                setattr(node, field, self._visit_stmt_list(old_value))
+        return node
+
+    def visit_For(self, node: ast.For) -> ast.For | list[ast.stmt]:
+        self.generic_visit(node)
+        lane_var = getattr(node, HELION_LANE_LOOP_VAR_ATTR, None)
+        if (
+            lane_var is None
+            or node.orelse
+            or not isinstance(node.target, ast.Name)
+            or node.target.id != lane_var
+        ):
+            return node
+        if lane_var in ReadWrites.from_list(node.body).reads:
+            return node
+        self.changed = True
+        return node.body
+
+
+def dead_lane_loop_elimination(body: list[ast.AST]) -> bool:
+    """Splice generated lane loops whose lane variable became dead.
+
+    CuTe lane loops are compiler-generated scalarization loops whose target
+    variable is expected to feed lane-dependent indices. Normal DCE can remove
+    those index assignments, leaving an invariant loop that repeats identical
+    side effects. Only loops explicitly marked by codegen are eligible here.
+    """
+    transformer = _DeleteDeadLaneLoops()
+    new_body: list[ast.AST] = []
+    for node in body:
+        new_node = transformer.visit(node)
+        if isinstance(new_node, list):
+            new_body.extend(new_node)
+        elif new_node is not None:
+            new_body.append(new_node)
+    if transformer.changed:
+        body[:] = new_body
+    return transformer.changed
 
 
 class _NotPureException(Exception):

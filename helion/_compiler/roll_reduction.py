@@ -19,8 +19,10 @@ from ..language._tracing_ops import _for_loop
 from ..language._tracing_ops import _get_symnode
 from ..language._tracing_ops import _host_tensor
 from ..language._tracing_ops import _if
+from ..language._tracing_ops import is_for_loop_target
 from ..language.matmul_ops import dot as hl_dot
 from ..language.matmul_ops import dot_scaled as hl_dot_scaled
+from ..language.memory_ops import load
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
 from ..language.view_ops import join as hl_join
@@ -102,15 +104,22 @@ class ReductionRoller:
                 "hl._reduce operations are not compatible with reduction rolling"
             )
 
-        if node.target in (_for_loop, _if):
-            if node.target is _for_loop:
+        if is_for_loop_target(node.target) or node.target is _if:
+            if is_for_loop_target(node.target):
                 graph_id, *_ = node.args
+                assert isinstance(graph_id, int)
+                infos = [self.graph_id_to_info[graph_id]]
             else:
-                _, graph_id, _ = node.args
-            assert isinstance(graph_id, int)
-            info = self.graph_id_to_info[graph_id]
-            if info.used_rdim:
-                if not info.can_be_rolled_by_caller:
+                _, if_graph_id, else_graph_id, *_ = node.args
+                assert isinstance(if_graph_id, int)
+                assert isinstance(else_graph_id, int)
+                infos = [
+                    self.graph_id_to_info[if_graph_id],
+                    self.graph_id_to_info[else_graph_id],
+                ]
+            used_infos = [info for info in infos if info.used_rdim]
+            if used_infos:
+                if not all(info.can_be_rolled_by_caller for info in used_infos):
                     raise NotImplementedError("for loop with mixed reduction dim usage")
                 return True
             return False
@@ -149,39 +158,79 @@ class ReductionRoller:
 
         if node.target is store or node.target in _ATOMIC_OPS:
             # atomic_add(target, index, value, sem)
-            _, _, value, *_ = node.args
+            target, index_arg, value, *_ = node.args
             if isinstance(value, torch.fx.Node):
-                val = value.meta["val"]
+                num_rdims = self._count_rdim_axes_in_val(value.meta["val"])
             else:
-                val = value
+                # When the stored value is a Python scalar (broadcast across
+                # the indexed slice), it carries no shape, so the LHS
+                # subscript determines whether the op covers the rdim. Wrap
+                # the op in the reduction loop so the same rdim index_var is
+                # active here as for the corresponding load; otherwise on
+                # backends with looped reductions (e.g. cute), the slice
+                # resolves to the grid block_id and only one element per
+                # iteration is written.
+                num_rdims = self._count_rdim_axes_in_subscript(target, index_arg)
         else:
             val = node.meta.get("val", None)
+            num_rdims = self._count_rdim_axes_in_val(val)
 
-        num_rdims = 0
-        if isinstance(val, torch.Tensor):
-            for size in val.size():
-                block_idx = CompileEnvironment.current().get_block_id(size)
-                num_rdims += block_idx == self.rdim.block_id
-            if num_rdims > 1:
-                raise NotImplementedError(
-                    "multiple reduction dims of same size not supported"
-                )
-        elif isinstance(val, (tuple, list)):
-            # Some operations like var_mean return tuples of tensors
-            for item in val:
-                if isinstance(item, torch.Tensor):
-                    for size in item.size():
-                        block_idx = CompileEnvironment.current().get_block_id(size)
-                        num_rdims += block_idx == self.rdim.block_id
-            if num_rdims > 1:
-                raise NotImplementedError(
-                    "multiple reduction dims of same size not supported"
-                )
-        else:
-            # For non-tensor values (e.g., scalars), they don't use reduction dims
-            num_rdims = 0
-
+        if num_rdims > 1:
+            raise NotImplementedError(
+                "multiple reduction dims of same size not supported"
+            )
         return num_rdims > 0
+
+    def _count_rdim_axes_in_val(self, val: object) -> int:
+        """Count how many tensor axes reference ``self.rdim``.
+
+        Handles single tensors and ``(tuple, list)`` of tensors (e.g. the
+        ``var_mean`` op returns two tensors). Non-tensor values (scalars)
+        contribute 0. The caller raises when the count exceeds 1, since
+        the roller's per-axis chunking only makes sense for one rdim per
+        node.
+        """
+        if not isinstance(val, (torch.Tensor, tuple, list)):
+            return 0
+        env = CompileEnvironment.current()
+        rdim_block_id = self.rdim.block_id
+
+        def count_for_tensor(t: torch.Tensor) -> int:
+            return sum(env.get_block_id(size) == rdim_block_id for size in t.size())
+
+        if isinstance(val, torch.Tensor):
+            return count_for_tensor(val)
+        return sum(
+            count_for_tensor(item) for item in val if isinstance(item, torch.Tensor)
+        )
+
+    def _count_rdim_axes_in_subscript(self, target: object, index: object) -> int:
+        """Count axes in the LHS indexing pattern that match ``self.rdim``.
+
+        Used for store/atomic ops with scalar values: their meta val carries
+        no shape, so axis counts have to come from the indexing pattern
+        itself. The shape is computed the same way as for loads, so the
+        store and load resolve their slices to the same block_id.
+        """
+        if not isinstance(target, torch.fx.Node):
+            return 0
+        target_val = target.meta.get("val")
+        if not isinstance(target_val, torch.Tensor) or not isinstance(
+            index, (list, tuple)
+        ):
+            return 0
+        from .indexing_strategy import SubscriptIndexing
+
+        # FX records traced SymInt/Tensor index args as torch.fx.Node references;
+        # compute_shape wants the underlying values, the same form it receives at
+        # register_fake time (memory_ops.load).
+        normalized = [
+            k.meta["val"] if isinstance(k, torch.fx.Node) else k for k in index
+        ]
+        shape = SubscriptIndexing.compute_shape(target_val, normalized)
+        env = CompileEnvironment.current()
+        rdim_block_id = self.rdim.block_id
+        return sum(env.get_block_id(s) == rdim_block_id for s in shape)
 
     def size_node(self, meta: dict[str, object]) -> torch.fx.Node:
         """Create a node that represents the size of the reduction dimension"""
@@ -330,16 +379,85 @@ class ReductionRoller:
                 return False
 
             # Check if any inputs to matmul have rdim
+            env = CompileEnvironment.current()
             for input_node in node.all_input_nodes:
                 val = input_node.meta.get("val", None)
                 if isinstance(val, torch.Tensor):
                     for size in val.size():
-                        block_idx = CompileEnvironment.current().get_block_id(size)
+                        block_idx = env.get_block_id(size)
                         if block_idx == self.rdim.block_id:
+                            return True
+                        # A dimension with no block_id is not tiled,
+                        # so the matmul operates on it in full and
+                        # cannot be sliced by the roller.
+                        if block_idx is None:
                             return True
             return False
 
         return any(is_matmul_with_rdim(node) for node in graph.nodes)
+
+    def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
+        """Check if a graph reduces over the rdim along a non-tile axis.
+
+        A reduction can only be rolled into a loop when the dimension being
+        reduced is indexed by a re-bindable block index var (e.g. a ``hl.tile``
+        axis or a ``[..., :]`` slice), so the producing load can be re-indexed
+        in ``_REDUCTION_BLOCK``-sized chunks inside the loop. A dimension
+        indexed by ``hl.arange(n)`` instead carries a fixed full-extent
+        ``iota`` index that cannot be re-bound per loop iteration, so rolling
+        would leave the full-extent load outside the loop and emit a shape
+        mismatch (issue #2643). Such reductions must stay persistent.
+
+        Detected by walking back from each reduction over ``self.rdim`` to the
+        loads feeding it and checking whether any is indexed by an ``iota``
+        node sized to the rdim. The output-shape of the load is not a reliable
+        signal: when the arange size coincides with another reduction of the
+        same size, ``allocate_reduction_dimension`` unifies them and the load
+        axis surfaces as the rdim symbol rather than a concrete int.
+        """
+        env = CompileEnvironment.current()
+        rdim_block_id = self.rdim.block_id
+
+        def is_rdim_iota(node: object) -> bool:
+            if not (
+                isinstance(node, torch.fx.Node)
+                and node.op == "call_function"
+                and node.target is torch.ops.prims.iota.default
+            ):
+                return False
+            val = node.meta.get("val", None)
+            return isinstance(val, torch.Tensor) and any(
+                env.resolve_block_id(size) == rdim_block_id for size in val.size()
+            )
+
+        def is_iota_indexed_load(node: torch.fx.Node) -> bool:
+            if node.target is not load:
+                return False
+            # load(tensor, index_list, ...): an iota in the index list cannot
+            # be re-indexed in chunks inside the reduction loop.
+            for arg in node.args:
+                entries = arg if isinstance(arg, (list, tuple)) else (arg,)
+                if any(is_rdim_iota(entry) for entry in entries):
+                    return True
+            return False
+
+        def depends_on_iota_indexed_load(reduction: torch.fx.Node) -> bool:
+            seen: set[torch.fx.Node] = set()
+            stack = list(reduction.all_input_nodes)
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                if node.op == "call_function" and is_iota_indexed_load(node):
+                    return True
+                stack.extend(node.all_input_nodes)
+            return False
+
+        return any(
+            self.is_reduction(node) and depends_on_iota_indexed_load(node)
+            for node in graph.nodes
+        )
 
     def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph contains stack tensors with rdim inputs."""
@@ -393,6 +511,7 @@ class ReductionRoller:
                 if (
                     not all((n in self.available) for n in node.all_input_nodes)
                     or node.op == "output"
+                    or (node.is_impure() and self.inner_count > 0)
                 ):
                     self.start_new_graph()
                 new_node = self.outer_graph.create_node(

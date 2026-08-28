@@ -19,7 +19,9 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     import helion
+    from helion.autotuner.block_id_sequence import BlockIdSequence
     from helion.autotuner.config_fragment import ConfigSpecFragment
+    from helion.autotuner.config_fragment import EnumFragment
 
 
 class UserConfigSpec(ConfigSpec):
@@ -31,7 +33,22 @@ class UserConfigSpec(ConfigSpec):
     defined, keeping the search space minimal and DSL-agnostic.
     """
 
-    def flat_config(self, fn: Callable[[ConfigSpecFragment], object]) -> helion.Config:
+    def _flat_fields(
+        self,
+    ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        return dict(self.user_defined_tunables)
+
+    def _advanced_controls_file_fragment(
+        self, advanced_controls_files: list[str] | None
+    ) -> EnumFragment | None:
+        return None
+
+    def flat_config(
+        self,
+        fn: Callable[[ConfigSpecFragment], object],
+        *,
+        advanced_controls_files: list[str] | None = None,
+    ) -> helion.Config:
         return Config.from_dict(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
         )
@@ -59,6 +76,7 @@ def create_user_config_spec(
 @dataclasses.dataclass
 class _FakeEnv:
     device: torch.device
+    process_group_name: str | None = None
 
 
 class _ExternalKernelAdapter(_AutotunableKernel):
@@ -131,6 +149,14 @@ class _ExternalKernelAdapter(_AutotunableKernel):
             self._compile_cache[config] = self._compile_fn(config)
         return self._compile_cache[config]
 
+    def bench_compile_config(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        allow_print: bool = True,
+    ) -> Callable[..., Any]:
+        return self.compile_config(config, allow_print=allow_print)
+
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
         return f"config={config!r}"
 
@@ -153,6 +179,15 @@ class _ExternalKernelAdapter(_AutotunableKernel):
         config: Config | None = None,
     ) -> None:
         pass
+
+    def extra_cache_key(self) -> str:
+        return ""
+
+    def supports_subprocess_benchmark(self) -> bool:
+        return True
+
+    def is_cacheable(self) -> bool:
+        return False
 
 
 SETTINGS_KWARGS = {
@@ -272,5 +307,5 @@ def autotune(
             **settings_kw,
         ),
         args,
-        **search_kw,
+        **search_kw,  # pyrefly: ignore[bad-argument-type]
     ).autotune()

@@ -3,9 +3,13 @@ from __future__ import annotations
 import ast
 import collections
 import contextlib
+import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+import sympy
+import torch
+from torch.utils._device import _device_constructors
 from torch.utils._ordered_set import OrderedSet
 
 from .. import exc
@@ -21,43 +25,98 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .loop_dependency_checker import LoopDependencyChecker
+from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
+from .tile_strategy import EmitPipelineLoopState
+from .tile_strategy import ForiLoopState
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
-    import sympy
+    from torch.fx.node import Node
 
     from ..runtime import Config
+    from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .loop_dependency_checker import LoopDependencyChecker
     from .tile_strategy import DeviceLoopOrGridState
-    from .type_propagation import TensorType
+    from .type_info import TensorType
 
 
 class GenerateAST(NodeVisitor, CodegenInterface):
-    def __init__(self, func: HostFunction, config: Config) -> None:
+    def __init__(
+        self,
+        func: HostFunction,
+        config: Config,
+        *,
+        store_transform: Callable[..., ast.AST] | None = None,
+        load_transform: Callable[..., ast.AST] | None = None,
+        extra_params: list[str] | None = None,
+    ) -> None:
         # Initialize NodeVisitor first
         NodeVisitor.__init__(self)
 
+        # Must be set before DeviceFunction is created so device_function.codegen._extra_params is available immediately.
+        self._extra_params: list[str] = extra_params or []
+
+        assert not (
+            collisions := {a.arg for a in func.args.args} & set(self._extra_params)
+        ), f"extra_params names collide with existing function args: {collisions}"
+
         # Initialize our attributes
         self.host_function = func
+        self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
+        self.cute_wrapper_plans: list[dict[str, object]] = []
+        self.cute_uses_matmul: bool = False
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
             collections.defaultdict(list)
         )
         self.current_grid_state: DeviceGridState | None = None
+        self.current_root_graph_info: GraphInfo | None = None
+        self.max_thread_block_dims = [1, 1, 1]
+        self.root_thread_block_dims = [1, 1, 1]
+        self.referenced_thread_block_dims = [1, 1, 1]
+        # CuTe only: synthetic per-thread axes allocated for free/unbound
+        # ``hl.arange`` index dims that are not bound to any tile/reduction/grid
+        # axis. Maps a stable per-arange key (length, start-repr, step-repr) to
+        # the launch thread axis it occupies. ``thread_axis_sizes`` records the
+        # extent of each allocated synthetic axis so the launch-dim recovery in
+        # ``backend.py`` can grow the thread block to cover those lanes.
+        self.cute_synthetic_arange_axes: dict[tuple[object, ...], int] = {}
+        self.cute_synthetic_arange_axis_sizes: dict[int, int] = {}
+        # CuTe only: stack of ``(if_node_id, branch_side)`` entries describing the
+        # mutually-exclusive control-flow branch the current codegen is inside.
+        # ``branch_side`` is 0 for the ``if`` body and 1 for the ``else`` body of
+        # a given dynamic ``_if``. Two free ``hl.arange`` dims that live in
+        # mutually-exclusive branches (their paths diverge at a common ``_if``)
+        # may reuse the same synthetic thread axis since only one branch ever
+        # runs per program instance.
+        self._cute_branch_path: list[tuple[int, int]] = []
+        # Records the branch path captured when each synthetic arange axis was
+        # allocated, so a later arange in a mutually-exclusive branch can reuse it.
+        self._cute_synthetic_arange_axis_branch_paths: dict[
+            int, list[list[tuple[int, int]]]
+        ] = {}
+        # CuTe only: free ``hl.arange`` dims whose (joint) thread count would
+        # exceed the 1024-thread budget are chunked onto a sequential lane loop
+        # instead of claiming a fresh thread axis. Maps the per-arange ``key`` to
+        # the resolved per-thread coordinate expression so a load and store over
+        # the same arange share one lane loop.
+        self.cute_synthetic_arange_lane_exprs: dict[tuple[object, ...], str] = {}
         self.next_else_block: list[ast.AST] | None = None
         # Track var=const for NKI tensor_scalar (avoids tensor_tensor when one op is scalar)
         self._var_to_constant: dict[str, int | float | bool] = {}
@@ -70,6 +129,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         )
         CodegenInterface.__init__(self, self.device_function)
 
+        # Decide once which sibling for-loops need a tl.debug_barrier()
+        # to make global writes visible to subsequent reads.
+        self._compute_inter_loop_barriers()
+
+    def get_graph(self, graph_id: int) -> GraphInfo:
+        return self.codegen_graphs[graph_id]
+
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
 
@@ -81,9 +147,341 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return loops[-1].strategy.mask_var(block_idx)
         return None
 
+    def _lower_nki_mod_assign(
+        self, target: str, value: ast.BinOp
+    ) -> list[ast.AST] | None:
+        try:
+            env = CompileEnvironment.current()
+        except Exception:
+            return None
+        if env.backend.codegen_name != "nki":
+            return None
+
+        lhs = ast.unparse(value.left)
+        rhs = ast.unparse(value.right)
+        lhs_shape = self.device_function._nki_sbuf_shapes.get(lhs)
+        if lhs_shape is None:
+            lookup = lhs
+            while "_copy" in lookup:
+                lookup = lookup[: lookup.rfind("_copy")]
+                lhs_shape = self.device_function._nki_sbuf_shapes.get(lookup)
+                if lhs_shape is not None:
+                    lhs = lookup
+                    break
+        if lhs_shape is None:
+            block_size = self.device_function._nki_iota_block_sizes.get(lhs)
+            if block_size is not None:
+                try:
+                    lhs_shape = [1, int(block_size)]
+                except ValueError:
+                    lhs_shape = None
+        if lhs_shape is None:
+            for block_id, loops in self.active_device_loops.items():
+                if not loops:
+                    continue
+                strategy = loops[-1].strategy
+                if strategy.index_var(block_id) != lhs:
+                    continue
+                try:
+                    block_size = env.block_sizes[block_id].from_config_assert(
+                        self.device_function.config
+                    )
+                    lhs_shape = [1, int(block_size)]
+                except Exception:
+                    lhs_shape = None
+                break
+        if lhs_shape is None or len(lhs_shape) < 2:
+            return None
+
+        rhs_value: int | float | None = None
+        rhs_value = self._constant_value_from_ast(value.right)
+        if rhs_value == 0:
+            return None
+
+        tmp = self.device_function.new_var("_nki_mod_div_f32", dce=True)
+        q = self.device_function.new_var("_nki_mod_div_i32", dce=True)
+        prod = self.device_function.new_var("_nki_mod_prod", dce=True)
+        self.device_function._nki_sbuf_shapes[tmp] = list(lhs_shape)
+        self.device_function._nki_sbuf_shapes[q] = list(lhs_shape)
+        self.device_function._nki_sbuf_shapes[prod] = list(lhs_shape)
+        self.device_function._nki_sbuf_shapes[target] = list(lhs_shape)
+        self.device_function._nki_sbuf_dtypes[tmp] = "nl.float32"
+        self.device_function._nki_sbuf_dtypes[q] = "nl.int32"
+        self.device_function._nki_sbuf_dtypes[prod] = "nl.int32"
+        self.device_function._nki_sbuf_dtypes[target] = "nl.int32"
+
+        shape = ", ".join(str(dim) for dim in lhs_shape)
+        if rhs_value is not None:
+            inv: object = 1.0 / float(rhs_value)
+            rhs_operand: object = (
+                int(rhs_value) if float(rhs_value).is_integer() else rhs_value
+            )
+        else:
+            inv = f"1.0 / ({rhs})"
+            rhs_operand = rhs
+
+        return [
+            statement_from_string(
+                f"{tmp} = nl.ndarray([{shape}], nl.float32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_scalar(dst={tmp}, data={lhs}, "
+                f"op0=nl.multiply, operand0={inv})"
+            ),
+            statement_from_string(
+                f"{prod} = nl.ndarray([{shape}], nl.int32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(f"{q} = nl.floor({tmp}, dtype=nl.int32)"),
+            statement_from_string(
+                f"nisa.tensor_scalar(dst={prod}, data={q}, "
+                f"op0=nl.multiply, operand0={rhs_operand})"
+            ),
+            statement_from_string(
+                f"{target} = nl.ndarray([{shape}], nl.int32, buffer=nl.sbuf)"
+            ),
+            statement_from_string(
+                f"nisa.tensor_tensor(dst={target}, data1={lhs}, data2={prod}, "
+                f"op=nl.subtract)"
+            ),
+        ]
+
     def _phase_checker(self, root_id: int) -> LoopDependencyChecker:
         phase_idx = self.host_function.device_ir.phase_for_root(root_id)
         return self.host_function.device_ir.phases[phase_idx].loop_dependency_checker
+
+    def _record_nki_sbuf_allocation(self, stmt: ast.Assign) -> None:
+        if (
+            len(stmt.targets) != 1
+            or not isinstance(stmt.targets[0], ast.Name)
+            or not isinstance(stmt.value, ast.Call)
+            or not isinstance(stmt.value.func, ast.Attribute)
+            or not isinstance(stmt.value.func.value, ast.Name)
+            or stmt.value.func.value.id != "nl"
+            or stmt.value.func.attr != "ndarray"
+        ):
+            return
+        if not any(
+            keyword.arg == "buffer"
+            and isinstance(keyword.value, ast.Attribute)
+            and isinstance(keyword.value.value, ast.Name)
+            and keyword.value.value.id == "nl"
+            and keyword.value.attr == "sbuf"
+            for keyword in stmt.value.keywords
+        ):
+            return
+        self._nki_sbuf_alloc_depth[stmt.targets[0].id] = len(self.statements_stack)
+        self._nki_sbuf_constant_values.pop(stmt.targets[0].id, None)
+
+    def _constant_value_from_ast(
+        self, expr: ast.AST
+    ) -> int | float | bool | None:
+        if isinstance(expr, ast.Constant) and isinstance(
+            expr.value, (int, float, bool)
+        ):
+            return expr.value
+        if (
+            isinstance(expr, ast.UnaryOp)
+            and isinstance(expr.operand, ast.Constant)
+            and isinstance(expr.operand.value, (int, float))
+        ):
+            if isinstance(expr.op, ast.USub):
+                return -expr.operand.value
+            if isinstance(expr.op, ast.UAdd):
+                return expr.operand.value
+        if isinstance(expr, ast.Name):
+            const = self.get_var_constant_value(expr.id)
+            if isinstance(const, (int, float, bool)):
+                return const
+            return self._nki_sbuf_constant_values.get(expr.id)
+        if isinstance(expr, ast.BinOp):
+            left = self._constant_value_from_ast(expr.left)
+            right = self._constant_value_from_ast(expr.right)
+            if not isinstance(left, (int, float, bool)) or not isinstance(
+                right, (int, float, bool)
+            ):
+                return None
+            if isinstance(expr.op, ast.Add):
+                return left + right
+            if isinstance(expr.op, ast.Sub):
+                return left - right
+            if isinstance(expr.op, ast.Mult):
+                return left * right
+            if isinstance(expr.op, ast.Div) and right != 0:
+                return left / right
+            if isinstance(expr.op, ast.FloorDiv) and right != 0:
+                return left // right
+            if isinstance(expr.op, ast.Mod) and right != 0:
+                return left % right
+        return None
+
+    def _record_nki_sbuf_write(self, stmt: ast.AST) -> None:
+        call: ast.Call | None = None
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        elif isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            call = stmt.value
+        if call is None:
+            return
+
+        written_names: list[str] = []
+        for keyword in call.keywords:
+            if keyword.arg == "dst" and isinstance(keyword.value, ast.Name):
+                written_names.append(keyword.value.id)
+        if (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "nisa"
+            and call.func.attr == "memset"
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+        ):
+            written_names.append(call.args[0].id)
+
+        for name in written_names:
+            self._nki_sbuf_constant_values.pop(name, None)
+
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "nisa"
+            and call.func.attr == "memset"
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+        ):
+            return
+
+        value_expr = next(
+            (keyword.value for keyword in call.keywords if keyword.arg == "value"),
+            None,
+        )
+        if value_expr is None:
+            return
+        value = self._constant_value_from_ast(value_expr)
+        if isinstance(value, (int, float, bool)):
+            self._nki_sbuf_constant_values[call.args[0].id] = value
+
+    def _lower_nki_sbuf_reassign(
+        self, target: str, source: str
+    ) -> list[ast.AST] | None:
+        if not self.on_device:
+            return None
+        try:
+            env = CompileEnvironment.current()
+        except Exception:
+            return None
+        if env.backend.codegen_name != "nki":
+            return None
+        if target == source or not target.startswith("_nki") or "_copy" in target:
+            return None
+
+        target_depth = self._nki_sbuf_alloc_depth.get(target)
+        if target_depth is None or target_depth > len(self.statements_stack):
+            return None
+
+        sbuf_shapes = self.device_function._nki_sbuf_shapes
+        target_shape = sbuf_shapes.get(target)
+        source_shape = sbuf_shapes.get(source)
+        if target_shape is None or source_shape is None or target_shape != source_shape:
+            return None
+
+        sbuf_dtypes = self.device_function._nki_sbuf_dtypes
+        target_dtype = sbuf_dtypes.get(target)
+        source_dtype = sbuf_dtypes.get(source)
+        if (
+            target_dtype is not None
+            and source_dtype is not None
+            and target_dtype != source_dtype
+        ):
+            return None
+
+        return [statement_from_string(f"nisa.tensor_copy(dst={target}, src={source})")]
+
+    def _compute_inter_loop_barriers(self) -> None:
+        """Walk every codegen graph; for each pair of consecutive sibling
+        ``_for_loop`` / ``_for_loop_step`` nodes, set ``needs_barrier_before``
+        on the second loop's ``ForLoopGraphInfo`` when there is a global RAW
+        dependency.
+
+        TileIR shares Triton surface syntax but ``tl.debug_barrier()`` lowers
+        to ``ttg.barrier`` which the TileIR pass pipeline does not legalize,
+        so the analysis is a no-op there.
+        """
+        from ..language._tracing_ops import _for_loop
+        from ..language._tracing_ops import _for_loop_step
+        from .device_ir import ForLoopGraphInfo
+        from .loop_dependency_checker import (
+            needs_inter_loop_debug_barrier_for_global_raw,
+        )
+
+        env = CompileEnvironment.current()
+        if env.codegen_name != "triton" or env.backend.name == "tileir":
+            return
+
+        for graph_info in self.codegen_graphs:
+            # Pending writes accumulate across ALL prior sibling for-loops
+            # since the last emitted barrier.  When a barrier is inserted
+            # before a loop, it flushes all earlier writes, so the pending set
+            # is reset and only writes from loops AFTER the barrier need to be
+            # tracked for subsequent siblings.
+            pending_global_writes: set[str] = set()
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function":
+                    continue
+                if node.target not in (_for_loop, _for_loop_step):
+                    continue
+                cur_id = node.args[0]
+                assert isinstance(cur_id, int)
+                cur_info = self.codegen_graphs[cur_id]
+                if not isinstance(cur_info, ForLoopGraphInfo):
+                    continue
+                need_barrier = needs_inter_loop_debug_barrier_for_global_raw(
+                    pending_global_writes,
+                    cur_info.host_loop_reads,
+                    global_barrier_tensor_names=self._triton_global_barrier_tensor_names,
+                )
+                cur_info.needs_barrier_before = need_barrier
+                if need_barrier:
+                    # Barrier flushes everything written before it.
+                    pending_global_writes = set()
+                # Accumulate the current loop's writes for future siblings.
+                pending_global_writes |= self._triton_global_barrier_tensor_names(
+                    cur_info.host_loop_writes
+                )
+
+    def _triton_global_barrier_tensor_names(self, names: frozenset[str]) -> set[str]:
+        """Names that may participate in cross-wavefront global (HBM) coherence.
+
+        Triton-specific: the Pallas SMEM filter is intentionally omitted here
+        because the only caller (``_compute_inter_loop_barriers``) gates on
+        Triton codegen.  The ``triton_`` prefix and the assertion below encode
+        that precondition so a future non-Triton caller fails loudly rather
+        than silently mis-classifying SMEM-only tensors as needing a global
+        barrier.
+        """
+        from .type_info import StackTensorType
+        from .type_info import TensorType
+
+        env = CompileEnvironment.current()
+        assert env.codegen_name == "triton" and env.backend.name != "tileir", (
+            "_triton_global_barrier_tensor_names called outside Triton codegen"
+        )
+
+        out: set[str] = set()
+        scratch_names = {s.name for s in self.device_function._scratch_args}
+        local_types = self.host_function.local_types
+        for name in names:
+            if name in scratch_names:
+                continue
+            if local_types is None:
+                out.add(name)
+                continue
+            ti = local_types.get(name)
+            if ti is None:
+                out.add(name)
+                continue
+            if isinstance(ti, (TensorType, StackTensorType)):
+                out.add(name)
+        return out
 
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         if stmt is None:
@@ -99,19 +497,55 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         ):
             self._var_to_constant[stmt.targets[0].id] = stmt.value.value
         self.statements_stack[-1].append(stmt)
+        self._record_statement_thread_references([stmt])
+        self._record_tcgen05_owned_statement(stmt)
+
+    def get_var_constant_value(self, var_name: str) -> int | float | bool | None:
+        """Return constant value if var was assigned a literal, else None."""
+        return self._var_to_constant.get(
+            var_name, self._nki_sbuf_constant_values.get(var_name)
+        )
+
+    def record_fx_node_ast(self, node: object, value: object) -> None:
+        if isinstance(value, ast.AST):
+            self.fx_node_to_ast[node] = value
+        elif isinstance(value, tuple) and all(isinstance(v, ast.AST) for v in value):
+            self.fx_node_to_ast[node] = value
+
+    def ast_for_fx_node(self, node: object) -> ast.AST | tuple[ast.AST, ...] | None:
+        return self.fx_node_to_ast.get(node)
+
+    def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
+        owner_node = self._statement_owner_fx_node
+        if owner_node is None:
+            return
+        cute_state = self.device_function.cute_state
+        # The generic add_statement hook stays inert unless CuTe tcgen05
+        # lowering registered this exact FX node for ownership tracking.
+        if not cute_state.is_collective_handled_load_or_dependency_node(owner_node):
+            return
+        current_statements = self.statements_stack[-1]
+        for loop_state in reversed(self._active_loop_stack()):
+            if isinstance(loop_state, DeviceLoopState):
+                if current_statements is loop_state.inner_statements:
+                    cute_state.register_tcgen05_kloop_owned_stmts(loop_state, [stmt])
+                    return
 
     def get_var_constant_value(self, var_name: str) -> int | float | bool | None:
         """Return constant value if var was assigned a literal, else None."""
         return self._var_to_constant.get(var_name)
 
     def get_rng_seed_buffer_statements(self) -> list[ast.AST]:
+        from .compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+
         import_stmt = statement_from_string(
             "from torch._inductor import inductor_prims"
         )
 
-        # Create host-side seed buffer with the required number of seeds
         seed_buffer_stmt = statement_from_string(
-            f"_rng_seed_buffer = inductor_prims.seeds({self.device_function.rng_seed_count}, torch.accelerator.current_accelerator())"
+            f"_rng_seed_buffer = {env.backend.rng_seed_buffer_expr(self.device_function.rng_seed_count)}"
         )
 
         return [import_stmt, seed_buffer_stmt]
@@ -120,6 +554,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if isinstance(expr, ast.Name):
             return expr
         assert isinstance(expr, ExtendedAST), expr
+        if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mod):
+            try:
+                env = CompileEnvironment.current()
+                if env.backend.codegen_name == "nki":
+                    from .nki_backend import NKIOpOverrides
+
+                    lhs = ast.unparse(expr.left)
+                    rhs = ast.unparse(expr.right)
+                    lowered = NKIOpOverrides.mod(lhs, rhs)
+                    if lowered != f"{lhs} % {rhs}" and lowered.isidentifier():
+                        return create(ast.Name, id=lowered, ctx=ast.Load())
+            except Exception:
+                pass
         with expr:
             varname = self.tmpvar(dce=dce, prefix=prefix)
             self.add_statement(
@@ -141,19 +588,39 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         target_statements = self.statements_stack[-1]
         env = CompileEnvironment.current()
+        from .host_function import HostFunction
+        from .variable_origin import BlockSizeOrigin
+        from .variable_origin import GridOrigin
+
         # Identify every block dimension the symbolic value depends on so we know
         # which loop nests the expression depends on.
-        dep_block_ids = {
-            block_id
-            for symbol in sym_expr.free_symbols
-            if (block_id := env.get_block_id(symbol)) is not None
-        }
+        dep_block_ids: set[int] = set()
+        active_loop_stack = self._active_loop_stack()
+        for symbol in sym_expr.free_symbols:
+            if not isinstance(symbol, sympy.Symbol):
+                continue
+            origin_info = HostFunction.current().expr_to_origin.get(symbol)
+            if origin_info is None or not isinstance(
+                origin_info.origin, GridOrigin | BlockSizeOrigin
+            ):
+                continue
+            canonical_block_id = env.canonical_block_id(origin_info.origin.block_id)
+            matching_loop_ids = {
+                block_id
+                for loop_state in active_loop_stack
+                for block_id in loop_state.block_ids
+                if env.canonical_block_id(block_id) == canonical_block_id
+            }
+            if matching_loop_ids:
+                dep_block_ids.update(matching_loop_ids)
+            else:
+                dep_block_ids.add(origin_info.origin.block_id)
 
         # Walk outward through the active device loops: as soon as we see a loop
         # whose block id appears in the dependency set we must stop, otherwise we
         # can safely hoist into that loop's outer prefix (which executes before the
         # loop body).
-        for loop_state in reversed(self._active_loop_stack()):
+        for loop_state in reversed(active_loop_stack):
             if dep_block_ids.intersection(loop_state.block_ids):
                 break
             target_statements = loop_state.outer_prefix
@@ -168,18 +635,380 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             # Reuse the temporary everywhere else in the kernel body.
             return create(ast.Name, id=varname, ctx=ast.Load())
 
-    def _active_loop_stack(self) -> list[DeviceLoopState]:
+    def _active_loop_stack(
+        self,
+    ) -> list[DeviceLoopState | EmitPipelineLoopState | ForiLoopState]:
         seen: set[int] = set()
-        stack: list[DeviceLoopState] = []
+        stack: list[DeviceLoopState | EmitPipelineLoopState | ForiLoopState] = []
         for loops in self.active_device_loops.values():
             for loop_state in loops:
-                if not isinstance(loop_state, DeviceLoopState):
+                if not isinstance(
+                    loop_state, (DeviceLoopState, EmitPipelineLoopState, ForiLoopState)
+                ):
                     continue
                 key = id(loop_state)
                 if key not in seen:
                     stack.append(loop_state)
                     seen.add(key)
         return stack
+
+    @contextlib.contextmanager
+    def statement_owner_node(self, node: Node) -> Iterator[None]:
+        prior = self._statement_owner_fx_node
+        self._statement_owner_fx_node = node
+        try:
+            yield
+        finally:
+            self._statement_owner_fx_node = prior
+
+    @contextlib.contextmanager
+    def cute_branch_scope(self, if_node_id: int, branch_side: int) -> Iterator[None]:
+        """Mark codegen as inside one branch of a dynamic ``_if`` (CuTe only).
+
+        ``branch_side`` is 0 for the ``if`` body and 1 for the ``else`` body.
+        Used so synthetic ``hl.arange`` axes allocated in mutually-exclusive
+        branches can share a single thread axis.
+        """
+        self._cute_branch_path.append((if_node_id, branch_side))
+        try:
+            yield
+        finally:
+            self._cute_branch_path.pop()
+
+    def _cute_branch_paths_mutually_exclusive(
+        self,
+        path_a: list[tuple[int, int]],
+        path_b: list[tuple[int, int]],
+    ) -> bool:
+        """True when two branch paths can never both execute."""
+        from .device_ir import DeviceIR
+
+        return DeviceIR.branch_paths_mutually_exclusive(path_a, path_b)
+
+    def _record_thread_axis_sizes(self, axis_sizes: dict[int, int]) -> None:
+        for axis, size in axis_sizes.items():
+            if 0 <= axis < 3:
+                self.max_thread_block_dims[axis] = max(
+                    self.max_thread_block_dims[axis], size
+                )
+
+    def _record_active_thread_axis_sizes(self) -> None:
+        self._record_thread_axis_sizes(self._current_active_thread_axis_sizes())
+
+    def _current_active_thread_axis_sizes(self) -> dict[int, int]:
+        seen: set[int] = set()
+        axis_sizes: dict[int, int] = {}
+        for loops in self.active_device_loops.values():
+            for loop_state in loops:
+                key = id(loop_state)
+                if key in seen:
+                    continue
+                seen.add(key)
+                for axis, size in loop_state.thread_axis_sizes.items():
+                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        # Synthetic axes for free ``hl.arange`` index dims (CuTe only) live
+        # outside the strategy loop states, so fold their extents in here too
+        # — that way ``_record_statement_thread_references`` grows the launch
+        # block to cover the lanes those arange dims address.
+        for axis, size in self.cute_synthetic_arange_axis_sizes.items():
+            axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+        return axis_sizes
+
+    def allocate_cute_synthetic_arange_coord(
+        self, key: tuple[object, ...], size: int
+    ) -> str | None:
+        """Resolve a free ``hl.arange`` dim to a per-thread coordinate expr.
+
+        Returns ``cute.arch.thread_idx()[axis]`` when the arange fits a fresh (or
+        reusable) CUDA thread axis within the 1024-thread budget. When it would
+        instead overflow the budget, the arange is chunked onto a sequential lane
+        loop (``thread_idx()[axis] * 1 + lane * 1`` collapses to ``lane``, or
+        ``thread_idx()[axis] + lane * nt`` when some thread lanes still fit) so
+        the full extent stays addressable; the lane loop wraps the grid body.
+        Returns ``None`` when no synthetic axis can be assigned (axis index >= 3).
+        """
+        lane_expr = self.cute_synthetic_arange_lane_exprs.get(key)
+        if lane_expr is not None:
+            return lane_expr
+        if (
+            key not in self.cute_synthetic_arange_axes
+            and self._cute_arange_needs_lane_loop(key, size)
+        ):
+            return self._allocate_cute_synthetic_arange_lane_loop(key, size)
+        axis = self.allocate_cute_synthetic_arange_axis(key, size)
+        if axis >= 3:
+            return None
+        return f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+
+    def _cute_arange_proposed_total(self, axis: int, size: int) -> int:
+        """Joint thread count if ``size`` were placed on a fresh ``axis``."""
+        proposed_sizes = dict(self.cute_synthetic_arange_axis_sizes)
+        proposed_sizes[axis] = size
+        strategy_threads = 1
+        for strat_axis, strat_size in self._strategy_thread_axis_sizes().items():
+            if strat_axis not in proposed_sizes:
+                strategy_threads *= strat_size
+        total = strategy_threads
+        for axis_size in proposed_sizes.values():
+            total *= axis_size
+        return total
+
+    def _cute_arange_needs_lane_loop(self, key: tuple[object, ...], size: int) -> bool:
+        # The lane loop is hosted by the grid body wrapper, so only chunk when a
+        # grid state exists to carry it; otherwise keep the (raising) thread-axis
+        # path rather than emitting an un-iterated lane variable.
+        if self.current_grid_state is None:
+            return False
+        # A mutually-exclusive branch reuse never grows the budget, so prefer it.
+        if self._mutually_exclusive_synthetic_axis() is not None:
+            return False
+        used_axes = set(self._strategy_thread_axes())
+        used_axes.update(self.cute_synthetic_arange_axes.values())
+        axis = 0
+        while axis in used_axes:
+            axis += 1
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+        if axis >= 3:
+            return True
+        return self._cute_arange_proposed_total(axis, size) > MAX_THREADS_PER_BLOCK
+
+    def _allocate_cute_synthetic_arange_lane_loop(
+        self, key: tuple[object, ...], size: int
+    ) -> str:
+        """Chunk a free ``hl.arange`` onto a sequential lane loop.
+
+        Uses ``nt`` live thread lanes on a fresh axis (``nt`` is the largest
+        power-of-2 that keeps the joint budget within 1024, possibly 1) and a
+        ``ceil(size / nt)`` sequential lane loop covering the rest. The arange's
+        per-thread coordinate is ``thread_idx()[axis] + lane * nt``.
+        """
+        from torch._inductor.runtime.runtime_utils import next_power_of_2
+
+        from .cute.thread_budget import MAX_THREADS_PER_BLOCK
+
+        used_axes = set(self._strategy_thread_axes())
+        used_axes.update(self.cute_synthetic_arange_axes.values())
+        axis = 0
+        while axis in used_axes and axis < 3:
+            axis += 1
+
+        # Threads already committed (strategy axes + other synthetic axes).
+        committed = 1
+        for strat_size in self._strategy_thread_axis_sizes().values():
+            committed *= strat_size
+        for axis_size in self.cute_synthetic_arange_axis_sizes.values():
+            committed *= axis_size
+        budget = max(1, MAX_THREADS_PER_BLOCK // max(1, committed))
+        nt = 1
+        if axis < 3:
+            nt = min(next_power_of_2(size), 1 << (budget.bit_length() - 1))
+            nt = max(1, min(nt, size))
+        lane_extent = (size + nt - 1) // nt
+
+        lane_var = self.device_function.new_var(
+            f"arange_lane_{len(self.cute_synthetic_arange_lane_exprs)}", dce=False
+        )
+        grid_state = self.current_grid_state
+        if grid_state is not None:
+            grid_state.add_lane_loop(-1, lane_var, lane_extent)
+        if nt > 1 and axis < 3:
+            self.cute_synthetic_arange_axes[key] = axis
+            self.cute_synthetic_arange_axis_sizes[axis] = max(
+                self.cute_synthetic_arange_axis_sizes.get(axis, 1), nt
+            )
+            self._record_synthetic_axis_branch_path(axis)
+            self._record_active_thread_axis_sizes()
+            coord = (
+                f"(cutlass.Int32(cute.arch.thread_idx()[{axis}])"
+                f" + cutlass.Int32({lane_var}) * {nt})"
+            )
+        else:
+            coord = f"cutlass.Int32({lane_var})"
+        self.cute_synthetic_arange_lane_exprs[key] = coord
+        return coord
+
+    def allocate_cute_synthetic_arange_axis(
+        self, key: tuple[object, ...], size: int
+    ) -> int:
+        """Allocate (or reuse) a per-thread axis for a free ``hl.arange`` dim.
+
+        A free ``hl.arange(n)`` used directly as a load/store index is not
+        bound to any tile/reduction/grid block id, so it has no strategy
+        thread axis. We map each distinct arange onto its own CUDA thread
+        axis: thread ``thread_idx()[axis]`` holds element ``axis``. Arange dims
+        that share the same ``key`` (same length/start/step) describe the same
+        logical lane and reuse the same axis so a value loaded on a lane is
+        stored back on that lane.
+
+        The chosen axis follows any thread axes already claimed by real tile
+        strategies (so an ``hl.arange`` mixed with an ``hl.tile`` index does
+        not collide with the tile's axis). The size is recorded so the
+        launch-dim recovery enlarges the thread block accordingly.
+        """
+        existing = self.cute_synthetic_arange_axes.get(key)
+        if existing is not None:
+            self.cute_synthetic_arange_axis_sizes[existing] = max(
+                self.cute_synthetic_arange_axis_sizes.get(existing, 1), size
+            )
+            self._record_synthetic_axis_branch_path(existing)
+            self._record_active_thread_axis_sizes()
+            return existing
+        # Reuse a synthetic axis from a mutually-exclusive control-flow branch:
+        # if every arange already mapped onto some axis lives in a branch that
+        # can never co-execute with the current one, the axes never need lanes
+        # at the same time, so they may share one thread axis (size = max). This
+        # keeps the joint thread budget bounded for branch-by-grid kernels whose
+        # branches each use a distinct free ``hl.arange``.
+        shared = self._mutually_exclusive_synthetic_axis()
+        if shared is not None:
+            self.cute_synthetic_arange_axes[key] = shared
+            self.cute_synthetic_arange_axis_sizes[shared] = max(
+                self.cute_synthetic_arange_axis_sizes.get(shared, 1), size
+            )
+            self._record_synthetic_axis_branch_path(shared)
+            self._record_active_thread_axis_sizes()
+            return shared
+        used_axes = set(self._strategy_thread_axes())
+        used_axes.update(self.cute_synthetic_arange_axes.values())
+        axis = 0
+        while axis in used_axes:
+            axis += 1
+        from .cute.thread_budget import check_thread_limit
+
+        # Validate the joint thread count once the new axis is added.
+        proposed_sizes = dict(self.cute_synthetic_arange_axis_sizes)
+        proposed_sizes[axis] = size
+        strategy_threads = 1
+        for strat_axis, strat_size in self._strategy_thread_axis_sizes().items():
+            if strat_axis not in proposed_sizes:
+                strategy_threads *= strat_size
+        total = strategy_threads
+        for axis_size in proposed_sizes.values():
+            total *= axis_size
+        check_thread_limit(total, context=f"free hl.arange axis size={size}")
+        self.cute_synthetic_arange_axes[key] = axis
+        self.cute_synthetic_arange_axis_sizes[axis] = size
+        self._record_synthetic_axis_branch_path(axis)
+        self._record_active_thread_axis_sizes()
+        return axis
+
+    def _record_synthetic_axis_branch_path(self, axis: int) -> None:
+        """Remember the current branch path for an arange mapped onto ``axis``."""
+        paths = self._cute_synthetic_arange_axis_branch_paths.setdefault(axis, [])
+        current = list(self._cute_branch_path)
+        if current not in paths:
+            paths.append(current)
+
+    def _mutually_exclusive_synthetic_axis(self) -> int | None:
+        """Find a synthetic axis whose every arange is in a branch that can never
+        co-execute with the current branch path, so it can be safely reused."""
+        if not self._cute_branch_path:
+            return None
+        current = list(self._cute_branch_path)
+        for axis, paths in self._cute_synthetic_arange_axis_branch_paths.items():
+            if paths and all(
+                self._cute_branch_paths_mutually_exclusive(current, path)
+                for path in paths
+            ):
+                return axis
+        return None
+
+    def _strategy_thread_axis_sizes(self) -> dict[int, int]:
+        sizes: dict[int, int] = {}
+        for loops in self.active_device_loops.values():
+            for loop_state in loops:
+                for axis, size in loop_state.thread_axis_sizes.items():
+                    sizes[axis] = max(sizes.get(axis, 1), size)
+        if self.current_grid_state is not None:
+            for axis, size in self.current_grid_state.thread_axis_sizes.items():
+                sizes[axis] = max(sizes.get(axis, 1), size)
+        # Fold in axes reserved by strategies that have not been entered yet
+        # (e.g. a matmul K-reduction on axis 0) so synthetic ``hl.arange`` dims
+        # both avoid those axes and count them toward the thread budget.
+        for axis, size in self._all_strategy_reserved_axes().items():
+            sizes[axis] = max(sizes.get(axis, 1), size)
+        return sizes
+
+    def _all_strategy_reserved_axes(self) -> dict[int, int]:
+        """Thread axes reserved by every dispatcher strategy and their extent.
+
+        Unlike ``_strategy_thread_axis_sizes`` (which only sees *active* loop
+        states), this includes strategies that have not begun codegen yet — e.g.
+        a matmul's K-reduction strategy that always claims thread axis 0. A free
+        ``hl.arange`` allocated before that reduction's loop is entered must still
+        avoid its axis, otherwise the arange's row/col lanes collide with the
+        reduction's warp lanes and silently corrupt the result.
+        """
+        sizes: dict[int, int] = {}
+        tile_strategy = getattr(self.device_function, "tile_strategy", None)
+        if tile_strategy is None:
+            return sizes
+        for strategy in getattr(tile_strategy, "strategies", []):
+            if strategy.thread_axes_used() <= 0:
+                continue
+            base_axis = tile_strategy.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                continue
+            for block_id in strategy.block_ids:
+                axis = tile_strategy.thread_axis_for_block_id(block_id)
+                extent = tile_strategy.thread_extent_for_block_id(block_id)
+                if axis is None or not isinstance(extent, int) or extent <= 1:
+                    continue
+                sizes[axis] = max(sizes.get(axis, 1), extent)
+        return sizes
+
+    def _strategy_thread_axes(self) -> set[int]:
+        axes = set(self._strategy_thread_axis_sizes())
+        axes.update(self._all_strategy_reserved_axes())
+        # A strategy can structurally occupy a thread axis even when its block
+        # size is 1 (e.g. an ``hl.grid`` whose offset is
+        # ``pid * BLOCK + thread_idx[0]`` with ``BLOCK == 1``). Such an axis is
+        # not recorded in ``thread_axis_sizes`` (which only keeps sizes > 1) but
+        # it is referenced in the already-emitted setup statements, so scan
+        # those to avoid handing a synthetic arange an axis the grid already
+        # uses (which would mis-filter most lanes via the grid's bounds mask).
+        statement_groups: list[list[ast.AST]] = list(self.statements_stack)
+        grid_state = self.current_grid_state
+        if grid_state is not None:
+            statement_groups.extend(
+                (grid_state.outer_prefix, grid_state.lane_setup_statements)
+            )
+        for loops in self.active_device_loops.values():
+            for loop_state in loops:
+                outer_prefix = getattr(loop_state, "outer_prefix", None)
+                if isinstance(outer_prefix, list):
+                    statement_groups.append(outer_prefix)
+        for statements in statement_groups:
+            for stmt in statements:
+                axes.update(
+                    int(axis_text)
+                    for axis_text in re.findall(
+                        r"cute\.arch\.thread_idx\(\)\[(\d+)\]",
+                        ast.unparse(stmt),
+                    )
+                )
+        return axes
+
+    def _record_statement_thread_references(
+        self,
+        statements: list[ast.AST],
+        axis_sizes: dict[int, int] | None = None,
+    ) -> None:
+        if axis_sizes is None:
+            axis_sizes = self._current_active_thread_axis_sizes()
+        for stmt in statements:
+            text = ast.unparse(stmt)
+            for axis_text in re.findall(
+                r"cute\.arch\.thread_idx\(\)\[(\d+)\]",
+                text,
+            ):
+                axis = int(axis_text)
+                if 0 <= axis < 3:
+                    self.referenced_thread_block_dims[axis] = max(
+                        self.referenced_thread_block_dims[axis],
+                        axis_sizes.get(axis, 1),
+                    )
 
     @contextlib.contextmanager
     def set_statements(self, new_statements: list[ast.AST] | None) -> Iterator[None]:
@@ -209,28 +1038,100 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self.host_statements = prior
 
     @contextlib.contextmanager
-    def add_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+    def add_device_loop(
+        self,
+        device_loop: DeviceLoopState,
+        *,
+        needs_barrier_before: bool = False,
+    ) -> Iterator[None]:
         with self.set_statements(device_loop.inner_statements):
             for idx in device_loop.block_ids:
                 active_loops = self.active_device_loops[idx]
                 active_loops.append(device_loop)
                 if len(active_loops) > 1:
                     raise exc.NestedDeviceLoopsConflict
+            self._record_active_thread_axis_sizes()
+            self._record_statement_thread_references(device_loop.inner_statements)
             try:
                 yield
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
+        if needs_barrier_before:
+            self.add_statement(statement_from_string("tl.debug_barrier()"))
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
 
+    @contextlib.contextmanager
+    def add_emit_pipeline_loop(
+        self, pipeline_state: EmitPipelineLoopState
+    ) -> Iterator[None]:
+        """Context manager for emit_pipeline-based loops on Pallas/TPU.
+
+        Redirects body codegen into ``pipeline_state.inner_statements``
+        and registers block_ids in ``active_device_loops``.  The caller
+        is responsible for emitting the function def and pipeline call
+        after the context exits.
+        """
+        with self.set_statements(pipeline_state.inner_statements):
+            for idx in pipeline_state.block_ids:
+                active_loops = self.active_device_loops[idx]
+                active_loops.append(pipeline_state)
+                if len(active_loops) > 1:
+                    raise exc.NestedDeviceLoopsConflict
+            try:
+                yield
+            finally:
+                for idx in pipeline_state.block_ids:
+                    self.active_device_loops[idx].pop()
+        # Flush any symnode bindings hoisted into the loop's outer_prefix
+        # (via lift_symnode) into the parent scope, so they precede the
+        # function def + pipeline call the caller is about to add.
+        self.statements_stack[-1].extend(pipeline_state.outer_prefix)
+
+    @contextlib.contextmanager
+    def add_fori_loop(self, fori_state: ForiLoopState) -> Iterator[None]:
+        """Context manager for fori_loop-based loops on Pallas/TPU.
+
+        Redirects body codegen into ``fori_state.inner_statements``
+        and registers block_ids in ``active_device_loops``.  The caller
+        is responsible for emitting the function def and fori_loop call
+        after the context exits.
+        """
+        with self.set_statements(fori_state.inner_statements):
+            for idx in fori_state.block_ids:
+                active_loops = self.active_device_loops[idx]
+                active_loops.append(fori_state)
+                if len(active_loops) > 1:
+                    raise exc.NestedDeviceLoopsConflict
+            try:
+                yield
+            finally:
+                for idx in fori_state.block_ids:
+                    self.active_device_loops[idx].pop()
+        self.statements_stack[-1].extend(fori_state.outer_prefix)
+
     def set_active_loops(self, device_grid: DeviceLoopOrGridState) -> None:
+        if isinstance(device_grid, DeviceGridState):
+            for axis, size in device_grid.thread_axis_sizes.items():
+                if 0 <= axis < 3:
+                    self.root_thread_block_dims[axis] = max(
+                        self.root_thread_block_dims[axis], size
+                    )
         self.current_grid_state = (
             device_grid if isinstance(device_grid, DeviceGridState) else None
         )
         for idx in device_grid.block_ids:
             self.active_device_loops[idx] = [device_grid]
+        self._record_active_thread_axis_sizes()
+        if isinstance(device_grid, DeviceGridState):
+            self._record_statement_thread_references(device_grid.lane_setup_statements)
+
+    def push_active_loops(self, device_loop: DeviceLoopOrGridState) -> None:
+        for idx in device_loop.block_ids:
+            self.active_device_loops[idx].append(device_loop)
+        self._record_active_thread_axis_sizes()
 
     def generic_visit(self, node: ast.AST) -> ast.AST:
         assert isinstance(node, ExtendedAST)
@@ -262,8 +1163,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             assert node._root_id is not None
             # Loop dependency checks were already run during lowering; phase checker kept for symmetry/debug.
             self._phase_checker(node._root_id)
+            env = CompileEnvironment.current()
+            is_nki = env.backend.name == "nki"
 
-            if len(self.host_function.device_ir.root_ids) == 1:
+            if len(self.host_function.device_ir.root_ids) == 1 or is_nki:
                 body = self.device_function.body
             else:
                 assert len(self.host_function.device_ir.root_ids) > 1
@@ -289,53 +1192,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 self.set_on_device(),
                 self.set_statements(body),
             ):
-                iter_node = node.iter
-                assert isinstance(iter_node, ExtendedAST)
-                with iter_node:
-                    assert isinstance(iter_node, ast.Call)
-                    args = []
-                    kwargs = {}
-                    for arg_node in iter_node.args:
-                        assert not isinstance(arg_node, ast.Starred)
-                        assert isinstance(arg_node, ExtendedAST)
-                        assert arg_node._type_info is not None
-                        args.append(arg_node._type_info.proxy())
-                    for kwarg_node in iter_node.keywords:
-                        assert kwarg_node.arg is not None
-                        assert isinstance(kwarg_node.value, ExtendedAST)
-                        assert kwarg_node.value._type_info is not None
-                        kwargs[kwarg_node.arg] = kwarg_node.value._type_info.proxy()
-                    fn_node = iter_node.func
-                    assert isinstance(fn_node, ExtendedAST)
-                    assert fn_node._type_info is not None
-                    fn = fn_node._type_info.proxy()
-                    assert is_api_func(fn)
-                    env = CompileEnvironment.current()
-                    codegen_fn = fn._codegen.get(env.codegen_name)
-                    if codegen_fn is None:
-                        codegen_fn = fn._codegen.get("common")
-                    if codegen_fn is None:
-                        raise exc.BackendImplementationMissing(
-                            env.backend_name,
-                            f"codegen for API function {fn.__qualname__}",
-                        )
-                    bound = fn._signature.bind(*args, **kwargs)
-                    bound.apply_defaults()
-
-                    from .inductor_lowering import CodegenState
-
-                    state = CodegenState(
-                        self,
-                        fx_node=None,
-                        proxy_args=[*bound.arguments.values()],
-                        # pyrefly: ignore [bad-argument-type]
-                        ast_args=None,
-                    )
-
-                    codegen_fn(state)
                 assert node._root_id is not None
-                root = self.host_function.device_ir.get_root(
-                    self.device_function.config,
+                root_graph_info = self.get_graph(
                     self.host_function.device_ir.root_ids[node._root_id],
                 )
                 grid_state = self.current_grid_state
@@ -373,7 +1231,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
                 # If we are in a multi top level loop, for all loops except for the last one
                 # emit ifthenelse blocks
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                if (
+                    not is_nki
+                    and node._root_id < len(self.host_function.device_ir.root_ids) - 1
+                ):
                     block = (
                         self.device_function.body
                         if self.next_else_block is None
@@ -397,6 +1258,54 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     if persistent_body is not None:
                         # pyrefly: ignore [bad-assignment]
                         self.device_function.body = persistent_body
+                    else:
+                        # The persistent path pulls tcgen05 post-loop cleanup to
+                        # the end of the body; the non-persistent (flat-grid)
+                        # path must do the same so a multi-store fan-out's
+                        # one-shot teardown runs after every store reads the
+                        # accumulator. No-op when there are no post-loop marks.
+                        self.device_function.body = self.device_function.cute_state.move_tcgen05_post_loop_stmts_to_end(
+                            list(self.device_function.body)
+                        )
+                # Mark extra params as placeholder args — they appear only in
+                # placeholder strings, not in the AST body, so DCE would
+                # otherwise remove them.
+                for param in self._extra_params:
+                    self.device_function.placeholder_args.add(param)
+                if CompileEnvironment.current().backend.name == "cute":
+                    from .tile_strategy import hoist_lane_invariant_chunk_recurrence
+                    from .tile_strategy import (
+                        interchange_lane_outside_serial_reductions,
+                    )
+                    from .tile_strategy import restore_unprocessed_lane_reduce_markers
+                    from .tile_strategy import split_lane_loop_reductions
+
+                    # First interchange any ``for LANE: ... for MB: ...`` nest
+                    # whose inner serial loop carries lane-reduce markers into a
+                    # lane-outside-mb accumulator nest plus a lane-inside-mb
+                    # reduction nest; then split the (now inner) lane loops into
+                    # the two-pass accumulate/finalize/consume structure.
+                    self.device_function.body = (
+                        interchange_lane_outside_serial_reductions(
+                            list(self.device_function.body)
+                        )
+                    )
+                    self.device_function.body = split_lane_loop_reductions(
+                        list(self.device_function.body)
+                    )
+                    # Safety net: revert any lane-reduce marker that neither pass
+                    # rewrote so no ``_helion_lane_reduce`` call leaks into the
+                    # emitted kernel.
+                    self.device_function.body = restore_unprocessed_lane_reduce_markers(
+                        list(self.device_function.body)
+                    )
+                    # Restructure chunked-recurrence ``for chunk: for lane:``
+                    # nests whose matmul ``dot_acc`` running-sum needs the
+                    # lane-invariant rescale / chunk-entry stores / final combine
+                    # hoisted to run once per chunk (gdn_fwd_h).
+                    self.device_function.body = hoist_lane_invariant_chunk_recurrence(
+                        list(self.device_function.body)
+                    )
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
@@ -430,9 +1339,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return node
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
-        from .type_propagation import CallableType
-        from .type_propagation import SequenceType
-        from .type_propagation import TileIndexType
+        from .type_info import CallableType
+        from .type_info import SequenceType
+        from .type_info import TileIndexType
 
         func_node = node.func
         assert isinstance(func_node, ExtendedAST)
@@ -442,34 +1351,33 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if self.on_device:
             pass
         elif isinstance(type_info := node._type_info, TileIndexType):
-            block_info = env.block_sizes[type_info.block_id]
             return expr_from_string(
                 self.host_function.literal_expr(
-                    block_info.from_config(self.device_function.config)
+                    self.device_function.resolved_block_size(type_info.block_id)
                 )
             )
         elif isinstance(type_info, SequenceType) and all(
             isinstance(x, TileIndexType) for x in type_info.unpack()
         ):
             values = type_info.unpack()
-            # pyrefly: ignore [missing-attribute]
-            block_infos = [env.block_sizes[x.block_id] for x in values]
             return expr_from_string(
                 self.host_function.literal_expr(
-                    [x.from_config(self.device_function.config) for x in block_infos]
+                    [
+                        self.device_function.resolved_block_size(x.block_id)  # pyrefly: ignore[missing-attribute]
+                        for x in values
+                    ]
                 )
             )
         elif isinstance(fn_type_info := func_node._type_info, CallableType) and (
             is_api_func(api := fn_type_info.value)
         ):
-            codegen_fn = api._codegen.get(env.codegen_name)
-            if codegen_fn is None:
-                codegen_fn = api._codegen.get("common")
-            if codegen_fn is None:
+            try:
+                codegen_fn = api._codegen[env.codegen_name]
+            except KeyError:
                 raise exc.BackendImplementationMissing(
                     env.backend_name,
                     f"codegen for API function {api.__qualname__}",
-                )
+                ) from None
             ast_args = []
             ast_kwargs = {}
             proxy_args = []
@@ -499,7 +1407,32 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     ast_args=[*ast_params.arguments.values()],
                 )
             )
+        if not self.on_device and self._needs_device_kwarg(node):
+            node = self._inject_device_kwarg(node)
         return self.generic_visit(node)
+
+    def _needs_device_kwarg(self, node: ast.Call) -> bool:
+        """Check if a host-level torch factory call is missing device=."""
+        from .type_info import CallableType
+
+        func_node = node.func
+        if not isinstance(func_node, ExtendedAST):
+            return False
+        fn_type = func_node._type_info
+        if not isinstance(fn_type, CallableType):
+            return False
+        if fn_type.value not in _device_constructors():
+            return False
+        return not any(kw.arg == "device" for kw in node.keywords)
+
+    def _inject_device_kwarg(self, node: ast.Call) -> ast.Call:
+        for name, val in self.host_function.params.arguments.items():
+            if isinstance(val, torch.Tensor):
+                device_expr = expr_from_string(f"{name}.device")
+                new_kw = create(ast.keyword, arg="device", value=device_expr)
+                node.keywords = [*node.keywords, new_kw]
+                return node
+        return node
 
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()
@@ -527,17 +1460,6 @@ class TensorReference(NamedTuple):
         return self.type_info.origin.is_host()
 
 
-class SubscriptIndexing(NamedTuple):
-    tensor_ref: TensorReference
-    index_expr: ast.AST
-    mask_expr: ast.AST
-
-    def has_mask(self) -> bool:
-        return not (
-            isinstance(self.mask_expr, ast.Constant) and self.mask_expr.value is None
-        )
-
-
 def emit_main_def() -> ast.stmt:
     return statement_from_string("""
 if __name__ == "__main__":
@@ -546,18 +1468,93 @@ if __name__ == "__main__":
 
 
 def generate_ast(
-    func: HostFunction, config: Config, emit_repro_caller: bool
-) -> ast.AST:
+    func: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: Callable[..., ast.AST] | None = None,
+    load_transform: Callable[..., ast.AST] | None = None,
+    extra_params: list[str] | None = None,
+) -> ast.Module:
     with func:
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
-        codegen = GenerateAST(func, config)
+        codegen = GenerateAST(
+            func,
+            config,
+            store_transform=store_transform,
+            load_transform=load_transform,
+            extra_params=extra_params,
+        )
         with codegen.device_function:
+            CompileEnvironment.current().backend.pre_codegen(
+                graphs=codegen.codegen_graphs,
+                config=config,
+                tile_strategy=codegen.device_function.tile_strategy,
+            )
+
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
+            codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             kernel_def = codegen.device_function.codegen_function_def()
             codegen.host_dead_code_elimination()
+
+            # Retarget output-only tensor allocations to ``device='meta'`` so
+            # the factory call produces a zero-storage metadata-only tensor
+            # instead of allocating real HBM. The launcher reassigns the
+            # variable to the real result tensor.
+            output_only_names = getattr(
+                CompileEnvironment.current().backend, "_output_only_names", []
+            )
+            if output_only_names:
+                oo_set = set(output_only_names)
+                # ``static_shapes=True``: cache the output-only meta placeholder
+                # ``torch.empty(..., device='meta')`` on the inner device
+                # function so repeat calls reuse it (shape/dtype/device are
+                # constant).  ``static_shapes=False`` keeps the per-call alloc.
+                cache_static_shapes = (
+                    CompileEnvironment.current().settings.static_shapes
+                )
+                inner_fn_name = codegen.device_function.name
+                cached_meta_index = 0
+                new_host_statements: list[ast.AST] = []
+                for stmt in codegen.host_statements:
+                    if not (
+                        isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                        and stmt.targets[0].id in oo_set
+                        and not getattr(stmt, "_is_kernel_call", False)
+                        and isinstance(stmt.value, ast.Call)
+                    ):
+                        new_host_statements.append(stmt)
+                        continue
+                    call = stmt.value
+                    call.keywords = [
+                        kw for kw in call.keywords if kw.arg != "device"
+                    ] + [ast.keyword(arg="device", value=ast.Constant(value="meta"))]
+                    if not cache_static_shapes:
+                        new_host_statements.append(stmt)
+                        continue
+                    # Read the cache slot (``getattr`` -> ``None`` on the first
+                    # call) and populate it inline on the miss.  Kept inline (no
+                    # helper/lambda) so the warm path stays a plain attr read.
+                    varname = stmt.targets[0].id
+                    cache_attr = f"_helion_output_meta_cache_{cached_meta_index}"
+                    cached_meta_index += 1
+                    get_stmt = statement_from_string(
+                        f"{varname} = getattr({inner_fn_name}, '{cache_attr}', None)"
+                    )
+                    if_stmt = statement_from_string(
+                        f"if {varname} is None:\n"
+                        f"    {varname} = {inner_fn_name}.{cache_attr} = "
+                        f"{{__orig_call__}}\n",
+                        __orig_call__=call,
+                    )
+                    new_host_statements.extend([get_stmt, if_stmt])
+                if cache_static_shapes:
+                    codegen.host_statements = new_host_statements
 
             # Inject RNG seed buffer creation if needed
             rng_statements = (
@@ -566,8 +1563,84 @@ def generate_ast(
                 else []
             )
             final_host_statements = rng_statements + codegen.host_statements
+            if codegen.cute_uses_matmul or codegen.cute_wrapper_plans:
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"
+                    ),
+                    *final_host_statements,
+                ]
+            launcher_arg_positions: dict[str, int] | None = None
 
-            host_def = func.codegen_function_def(final_host_statements)
+            def resolve_cute_plan_arg_positions(
+                plans: list[dict[str, object]],
+            ) -> list[dict[str, object]]:
+                nonlocal launcher_arg_positions
+                if launcher_arg_positions is None:
+                    launcher_arg_positions = {}
+                    for idx, arg in enumerate(
+                        [
+                            arg
+                            for arg in codegen.device_function.sorted_args()
+                            if not (
+                                isinstance(arg, ConstExprArg)
+                                and arg.host_str() != arg.name
+                            )
+                        ]
+                    ):
+                        launcher_arg_positions[arg.name] = idx
+                resolved_plans: list[dict[str, object]] = []
+                for plan in plans:
+                    resolved = dict(plan)
+                    # The ``key[:-5] + "_idx"`` substring rewrite turns each
+                    # tensor name into a positional index resolved against the
+                    # device function's sorted-arg ordering so the runtime
+                    # launcher can identify the tensor args.
+                    for key in (
+                        "lhs_name",
+                        "rhs_name",
+                        "c_name",
+                        "d_name",
+                    ):
+                        if key in resolved:
+                            resolved[key[:-5] + "_idx"] = launcher_arg_positions[
+                                str(resolved.pop(key))
+                            ]
+                    resolved_plans.append(resolved)
+                return resolved_plans
+
+            resolved_wrapper_plans: list[dict[str, object]] = []
+            if codegen.cute_wrapper_plans:
+                resolved_wrapper_plans = resolve_cute_plan_arg_positions(
+                    codegen.cute_wrapper_plans
+                )
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_wrapper_plans = {resolved_wrapper_plans!r}"
+                    ),
+                    *final_host_statements,
+                ]
+            if codegen.device_function.cute_state.cluster_shape is not None:
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_cluster_shape = {codegen.device_function.cute_state.cluster_shape!r}"
+                    ),
+                    *final_host_statements,
+                ]
+            # Assert sourceless prologue params were actually removed by DCE
+            if codegen.device_function.sourceless_prologue_params:
+                remaining = codegen.device_function.sourceless_prologue_params & {
+                    arg.name for arg in codegen.device_function.arguments
+                }
+                assert not remaining, (
+                    f"sourceless prologue params not removed by DCE: {remaining}"
+                )
+
+            host_def = func.codegen_function_def(
+                final_host_statements,
+                extra_params=codegen._extra_params,
+                removed_args=codegen.device_function.sourceless_prologue_params,
+            )
 
             call_def = []
             main_def = []
@@ -575,18 +1648,35 @@ def generate_ast(
                 call_def = [func.codegen_call_function()]
                 main_def = [emit_main_def()]
 
-            result = ast.Module(
-                [
-                    *func.codegen_imports(),
-                    *codegen.module_statements,
-                    *codegen.device_function.codegen_helper_functions(),
-                    *kernel_def,
-                    host_def,
-                    *call_def,
-                    *main_def,
-                ],
-                [],
-            )
+            module_body = [
+                *func.codegen_imports(),
+                *codegen.module_statements,
+                *codegen.device_function.codegen_helper_functions(),
+                *kernel_def,
+                host_def,
+                *call_def,
+                *main_def,
+            ]
+            result = ast.Module(module_body, [])
+            existing_imports = {
+                ast.unparse(stmt)
+                for stmt in result.body
+                if isinstance(stmt, (ast.Import, ast.ImportFrom))
+            }
+            missing_imports = [
+                line
+                for line in get_needed_import_lines(result)
+                if line not in existing_imports
+            ]
+            insert_at = 0
+            while insert_at < len(result.body):
+                stmt = result.body[insert_at]
+                if not isinstance(stmt, ast.ImportFrom) or stmt.module != "__future__":
+                    break
+                insert_at += 1
+            result.body[insert_at:insert_at] = [
+                statement_from_string(line) for line in missing_imports
+            ]
             # break circular reference for better GC
             del codegen.device_function.codegen
             return result

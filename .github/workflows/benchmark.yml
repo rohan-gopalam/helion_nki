@@ -21,6 +21,10 @@ on:
       alias:
         required: true
         type: string
+      backend:
+        required: false
+        type: string
+        default: triton
       kernels:
         required: true
         type: string
@@ -39,6 +43,11 @@ jobs:
 
     env:
       HELION_AUTOTUNE_LOG_LEVEL: INFO
+      HELION_BACKEND: ${{ inputs.backend }}
+      # Per-shape autotune convergence cutoff (90 min): healthy searches finish
+      # well under it (slowest ~69 min); non-converging runaways are stopped with
+      # best-so-far.
+      HELION_AUTOTUNE_BUDGET_SECONDS: "5400"
 
     container:
       image: ${{ inputs.image }}
@@ -60,7 +69,7 @@ jobs:
 
     steps:
       - name: Run NVIDIA command
-        if: startsWith(inputs.image, 'nvidia')
+        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
         run: |
           echo "Detected NVIDIA image"
           nvidia-smi || echo "nvidia-smi not found"
@@ -95,13 +104,43 @@ jobs:
       - name: Install PyTorch
         run: |
           source .venv/bin/activate
-          uv pip install -U "torch==2.9.*" --index-url https://download.pytorch.org/whl/${{ inputs.runtime-version }}
+
+          # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
+          PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==2.11.*" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
           source .venv/bin/activate
           SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0" uv pip install -e .'[dev]'
           python -c "import helion; print(helion.__name__)"
+
+      - name: Install CUTLASS CuTe DSL
+        if: inputs.backend == 'cute'
+        run: |
+          source .venv/bin/activate
+          ./scripts/install_cute.sh
+
+      - name: CUDA Compute Check
+        if: startsWith(inputs.image, 'nvidia') || (startsWith(inputs.image, 'pytorch') && contains(inputs.image, 'cuda'))
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import torch, sys
+
+          assert torch.cuda.is_available(), 'FATAL: CUDA not available'
+          n = torch.cuda.device_count()
+          assert n > 0, 'FATAL: No CUDA devices found'
+          print(f'CUDA devices: {n}')
+
+          for i in range(n):
+              dev = torch.device('cuda', i)
+              a = torch.randn(256, 256, device=dev)
+              b = (a @ a).sum().item()
+              print(f'  Device {i} ({torch.cuda.get_device_name(i)}): OK')
+
+          print(f'All {n} devices healthy')
+          "
 
       - name: Install Benchmark Requirements
         run: |
@@ -112,9 +151,15 @@ jobs:
           mkdir -p benchmarks/ && pushd benchmarks/
           git clone https://github.com/pytorch-labs/tritonbench/
           pushd tritonbench/
+          git checkout $(cat $GITHUB_WORKSPACE/.github/ci_commit_pins/tritonbench.txt)
           git submodule update --init --recursive
           uv pip install -r requirements.txt
           python install.py --liger
+          if [[ "${{ inputs.runtime-version }}" == cu* ]]; then
+            uv pip install einops
+            MAX_JOBS=4 uv pip install "mamba-ssm==2.3.2.post1" --no-build-isolation --no-deps
+            uv pip install "git+https://github.com/sustcsonglin/flash-linear-attention@v0.5.0" --no-deps
+          fi
           uv pip install -e . --no-deps
           popd
           popd
@@ -151,28 +196,13 @@ jobs:
             echo "Using baseline: $BASELINE"
             echo "Available implementations for $kernel: $IMPLS"
 
-            # Do autotuning but do not record the results
-            ${{ inputs.env-vars }} python benchmarks/run.py \
+            # Single pass: autotune search + codegen + compilation happen inline,
+            # so --measure-compile-time reports end-to-end user-visible compile time.
+            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 python benchmarks/run.py \
                 --op $kernel \
-                --metrics speedup,accuracy \
-                --latency-measure-mode triton_do_bench \
-                --cudagraph \
-                --only $IMPLS \
-                --only-match-mode prefix-with-baseline \
-                --baseline $BASELINE \
-                --atol 1e-2 \
-                --rtol 1e-2 \
-                --input-sample-mode equally-spaced-k \
-                --keep-going \
-                ${{ inputs.custom-args }}
-
-            # Relax the GPU
-            sleep 2m
-
-            # Run again with cache and record results
-            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 HELION_ASSERT_CACHE_HIT=1 python benchmarks/run.py \
-                --op $kernel \
-                --metrics speedup,accuracy \
+                --helion-backend "${{ inputs.backend }}" \
+                --metrics speedup,accuracy,latency \
+                --measure-compile-time \
                 --latency-measure-mode triton_do_bench \
                 --cudagraph \
                 --only $IMPLS \
@@ -215,7 +245,7 @@ jobs:
           venv: .venv/bin/activate
 
       - name: Upload the benchmark results to GitHub
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ inputs.alias }}-${{ inputs.kernels }}
           path: test/test-reports

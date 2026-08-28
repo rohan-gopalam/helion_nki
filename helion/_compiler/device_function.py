@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ast
 from collections import defaultdict
+import contextlib
 import dataclasses
+import enum
 import itertools
 import math
 import threading
@@ -18,6 +20,7 @@ from torch._dynamo.source import LocalSource
 from torch._inductor.codegen.triton import TritonPrinter
 from torch.fx.graph import _Namespace
 
+from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
 from .ast_extension import ExtendedAST
 from .ast_extension import create
@@ -28,7 +31,10 @@ from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .ast_read_writes import ast_rename
 from .ast_read_writes import dead_assignment_elimination
+from .ast_read_writes import dead_lane_loop_elimination
+from .backend_registry import all_reserved_launch_param_names
 from .compile_environment import CompileEnvironment
+from .cute.device_state import CuteDeviceFunctionState
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .output_header import reserved_names
@@ -44,6 +50,7 @@ if TYPE_CHECKING:
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from helion._compiler.pallas.plan_tiling import DimensionTiling
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -80,7 +87,7 @@ def find_block_size_symbols(
     non_block_size_symbols = set()
 
     for symbol in expr.free_symbols:
-        # pyrefly: ignore [no-matching-overload]
+        # pyrefly: ignore [no-matching-overload, bad-argument-type]
         origin_info = hf.expr_to_origin.get(symbol)
         if origin_info is None or not isinstance(origin_info.origin, BlockSizeOrigin):
             # pyrefly: ignore [bad-argument-type]
@@ -201,6 +208,20 @@ _sort_order: dict[type[Argument], int] = {
 }
 
 
+@dataclasses.dataclass
+class ScratchArg:
+    """A scratch memory buffer allocated in device memory (e.g., VMEM on TPU).
+
+    scratch_type can be "vmem" (default) for VMEM buffers or "dma_semaphore"
+    for DMA semaphores used with pltpu.make_async_copy.
+    """
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype | None  # None for semaphores
+    scratch_type: str = "vmem"  # "vmem" or "dma_semaphore"
+
+
 def _is_literal_constexpr(arg: ConstExprArg) -> bool:
     """Check if a constexpr arg has a known literal value that can be inlined at module level."""
     host_str = arg.host_str()
@@ -211,6 +232,14 @@ def _is_literal_constexpr(arg: ConstExprArg) -> bool:
         return True
     except (ValueError, SyntaxError):
         return False
+
+
+class PallasMemorySpace(enum.Enum):
+    """TPU memory space for Pallas tensors."""
+
+    HBM = "hbm"  # Pipeline body tensors (DMA)
+    SMEM = "smem"  # Scalar-only access
+    VMEM = "vmem"  # Vector/slice access (default)
 
 
 class DeviceFunction:
@@ -234,6 +263,8 @@ class DeviceFunction:
         self._expr_args: dict[sympy.Expr, SymbolArgument] = {}
         self._constexpr_args: dict[str, ConstExprArg] = {}
         self._constexpr_host_defs: set[str] = set()
+        self._scratch_args: list[ScratchArg] = []
+        self.wrapper_only_params: list[str] = []
         self._tensor_properties: dict[
             tuple[type[TensorPropertyArg], torch.Tensor, int], TensorPropertyArg
         ] = {}
@@ -243,24 +274,12 @@ class DeviceFunction:
         self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
+
+        self.namespace._used_names.update(all_reserved_launch_param_names())
         self.namespace._used_names.update(
-            # used by triton run() method
-            [
-                "grid",
-                "warmup",
-                "num_warps",
-                "num_stages",
-            ]
-            + (
-                ["num_ctas", "occupancy"]
-                if CompileEnvironment.current().backend_name == "tileir"
-                else []
-            )
-            + [
-                x.removeprefix("_triton_config_")
-                for x in config
-                if x.startswith("_triton_config_")
-            ]
+            x.removeprefix("_triton_config_")
+            for x in config
+            if x.startswith("_triton_config_")
         )
         self._variable_renames: dict[str, list[str]] = {}
         self._nki_tile_lists: dict[str, list[str]] = {}  # var → [var_0, var_1, ...]
@@ -281,9 +300,18 @@ class DeviceFunction:
         # can look up the SBUF name that _nki_dot produced.
         self._nki_fx_matmul_vars: dict[str, str] = {}
         self.dce_vars: list[str] = []
+        # Arg names referenced only by fusion placeholder strings
+        # (<STORE_OUTPUT_*>, <LOAD_INPUT_*>), not by the AST body.
+        # DCE would incorrectly strip them without this exemption.
+        self.placeholder_args: set[str] = set()
+        # Sourceless prologue params (e.g. ones_like) that are fully inlined
+        # by the prologue hook.  These should be DCE'd away and also removed
+        # from the host function signature (populated by _codegen_prologue_fusion).
+        self.sourceless_prologue_params: set[str] = set()
         self.block_size_var_cache: dict[tuple[int, ...], str] = {}
         self.expr_to_var_info: dict[sympy.Expr, VarInfo] = {}
         self.deferred_rdim_defs: list[tuple[str, sympy.Expr]] = []
+        self._cute_state = CuteDeviceFunctionState()
 
         from .helper_function import HelperFunctionManager
 
@@ -297,12 +325,42 @@ class DeviceFunction:
         self._indexing_config = config.indexing
         self.indexing_strategies: list[IndexingStrategy] = []
 
+        # Atomic indexing config (separate from load/store indexing)
+        self._atomic_indexing_config = config.atomic_indexing
+        self.atomic_indexing_strategies: list[IndexingStrategy] = []
+        self.atomic_op_index = 0
+
         self.rng_seed_count = 0
         self.device_load_index = 0
+        self.device_load_cache_modifier_index = 0
         self.device_store_index = 0
         # Single counter for both loads and stores for indexing assignment
         self.device_memory_op_index = 0
+        self.epilogue_subtile_store_indices: dict[str, int] = {}
+        self.epilogue_subtile_atomic_indices: dict[str, int] = {}
         self.rng_seed_buffer_param_name = None
+
+        # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
+        self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
+        # Pallas: id(fake_tensor) → memory space, determined during
+        # tracing (HBM for pipeline) and codegen (SMEM for scalar access).
+        # NOTE: Currently each tensor can only have one memory space.
+        # If a tensor needs both SMEM (scalar access) and VMEM (slice
+        # access), it will need tensor duplication — passing the same
+        # data as two separate args in different memory spaces. This
+        # dict would then need to support multiple entries per tensor
+        # or the tensor would get distinct arg IDs per memory space.
+        self.pallas_memory_space: dict[int, PallasMemorySpace] = {}
+        # Pallas: id(fake_tensor) → {dim: (block_id, extra_pad)} for dims
+        # using pl.ds() that may need host-side padding.
+        self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
+
+    def allocate_store_index(self) -> int:
+        """Bump store counters and return the indexing strategy slot."""
+        self.device_store_index += 1
+        idx = self.device_memory_op_index
+        self.device_memory_op_index += 1
+        return idx
 
     def get_indexing_strategy(self, index: int) -> IndexingStrategy:
         from .indexing_strategy import IndexingStrategy
@@ -333,25 +391,45 @@ class DeviceFunction:
 
         return self.indexing_strategies[index]
 
+    def get_atomic_indexing_strategy(self, index: int) -> IndexingStrategy:
+        from .indexing_strategy import IndexingStrategy
+        from .indexing_strategy import PointerIndexingStrategy
+
+        while len(self.atomic_indexing_strategies) <= index:
+            idx = len(self.atomic_indexing_strategies)
+
+            if isinstance(self._atomic_indexing_config, str):
+                if not self.atomic_indexing_strategies:
+                    strategy = IndexingStrategy.select(self._atomic_indexing_config)
+                else:
+                    strategy = self.atomic_indexing_strategies[0]
+            elif (
+                isinstance(self._atomic_indexing_config, list)
+                and self._atomic_indexing_config
+            ):
+                assert idx < len(self._atomic_indexing_config), (
+                    f"Atomic operation {idx} exceeds atomic_indexing config length "
+                    f"{len(self._atomic_indexing_config)}. Please specify atomic_indexing for all atomic ops."
+                )
+                strategy = IndexingStrategy.select(self._atomic_indexing_config[idx])
+            else:
+                strategy = PointerIndexingStrategy()
+
+            self.atomic_indexing_strategies.append(strategy)
+
+        return self.atomic_indexing_strategies[index]
+
     def has_rng_ops(self) -> bool:
         """Check if this kernel uses any RNG operations."""
         return self.rng_seed_count > 0 and self.rng_seed_buffer_param_name is not None
 
-    def allocate_rng_seed(self) -> int:
-        """Allocate a new RNG seed index and ensure buffer argument exists.
-
-        Returns:
-            The seed index for this RNG operation.
-        """
-        seed_index = self.rng_seed_count
-        self.rng_seed_count += 1
-
-        # Ensure seed buffer parameter name exists
+    def reserve_rng_seed(self, seed_index: int) -> None:
+        """Ensure the RNG seed buffer is available up to a specific index."""
+        assert seed_index >= 0
+        self.rng_seed_count = max(self.rng_seed_count, seed_index + 1)
         if self.rng_seed_buffer_param_name is None:
             # pyrefly: ignore [bad-assignment]
             self.rng_seed_buffer_param_name = self.new_var("rng_seed_buffer")
-
-        return seed_index
 
     def block_size_var(self, block_id: int) -> str | None:
         key = (block_id,)
@@ -381,6 +459,11 @@ class DeviceFunction:
                     self.constexpr_arg_with_host_def(var_name, block_value)
 
         return self.block_size_var_cache[key]
+
+    def resolved_block_size(self, block_id: int) -> int | torch.SymInt | None:
+        """Resolve a block_id to its concrete size for the current config."""
+        env = CompileEnvironment.current()
+        return env.block_sizes[block_id].from_config(self.config)
 
     def try_map_block_symbols_to_vars(self, expr: sympy.Expr) -> sympy.Expr | None:
         """Try to map all block size symbols in expression to their variable names.
@@ -429,14 +512,21 @@ class DeviceFunction:
                 self._nki_tile_lists[n] = tile_vars
 
     def set_pid(self, pid: ProgramIDs) -> None:
-        assert self.pid is None, "pid already set"
+        if self.pid is not None:
+            raise exc.InvalidAPIUsage(
+                "Multiple top-level grid loops are not supported with this config. "
+                "Try using pid_type='persistent' or combining the loops into a single "
+                "hl.tile/hl.grid call."
+            )
         self.pid = pid
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
-        expr = env.specialize_expr(env.shape_env.simplify(expr))
+        with contextlib.suppress(Exception):
+            expr = env.shape_env.simplify(expr)
+        expr = env.specialize_expr(expr)
         if not expr.free_symbols:
-            return texpr(expr)
+            return env.backend.sympy_printer_expr(expr)
         if expr in self.expr_to_var_info:
             return self.expr_to_var_info[expr].name
         expr_to_origin = HostFunction.current().expr_to_origin
@@ -455,9 +545,10 @@ class DeviceFunction:
                     self._lift_sympy_arg(sym), integer=True
                 )
         # pyrefly: ignore [bad-argument-type]
-        return texpr(expr.xreplace(replacements))
+        return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
     def _lift_sympy_arg(self, expr: sympy.Expr) -> str:
+        env = CompileEnvironment.current()
         origin = HostFunction.current().expr_to_origin[expr]
         if isinstance(origin.origin, TensorSizeOrigin):
             assert origin.fake_value is not None
@@ -467,11 +558,13 @@ class DeviceFunction:
             )
             return arg.name
         if isinstance(origin.origin, BlockSizeOrigin):
-            result = self.block_size_var(origin.origin.block_id)
+            result = self.block_size_var(env.canonical_block_id(origin.origin.block_id))
             assert result is not None
             return result
         if isinstance(origin.origin, GridOrigin):
-            return self.codegen.offset_var(origin.origin.block_id)
+            return self.codegen.offset_var(
+                env.resolve_codegen_block_id(origin.origin.block_id, self.codegen)
+            )
         return self.expr_arg(expr, origin.origin).name
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
@@ -544,8 +637,13 @@ class DeviceFunction:
     def tensor_arg(
         self, fake_value: torch.Tensor, prefer_name: str | None = None
     ) -> TensorArg:
+        host_function = HostFunction.current()
+        if fake_value not in host_function.tensor_to_origin:
+            origin = self._recover_captured_tensor_origin(fake_value, host_function)
+            if origin is not None:
+                host_function.tensor_to_origin[fake_value] = origin
         if fake_value not in self._tensor_args:
-            origin = HostFunction.current().tensor_to_origin[fake_value]
+            origin = host_function.tensor_to_origin[fake_value]
             arg = TensorArg(
                 self.new_var(prefer_name or origin.suggest_var_name()),
                 fake_value,
@@ -554,6 +652,37 @@ class DeviceFunction:
             self.arguments.append(arg)
             self._tensor_args[fake_value] = arg
         return self._tensor_args[fake_value]
+
+    @staticmethod
+    def _recover_captured_tensor_origin(
+        fake_value: torch.Tensor,
+        host_function: HostFunction,
+    ) -> Origin | None:
+        """Recover origins for tensors captured by helper function closures.
+
+        Dynamo can represent a captured tensor inside a nested helper graph as an
+        ``aten.empty_strided`` constant. That produces a tensor with matching
+        metadata but no direct entry in ``tensor_to_origin``. Restrict recovery
+        to renamed origins (globals/closures), so ordinary kernel parameters
+        continue to use the explicit ``host_tensor`` path.
+        """
+
+        candidates: dict[str, Origin] = {}
+        fake_shape = tuple(fake_value.size())
+        fake_stride = tuple(fake_value.stride())
+        for known_tensor, origin in host_function.tensor_to_origin.items():
+            if not origin.needs_rename():
+                continue
+            if known_tensor.dtype != fake_value.dtype:
+                continue
+            if tuple(known_tensor.size()) != fake_shape:
+                continue
+            if tuple(known_tensor.stride()) != fake_stride:
+                continue
+            candidates[origin.host_str()] = origin
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        return None
 
     def tensor_descriptor_arg(
         self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
@@ -567,7 +696,10 @@ class DeviceFunction:
             env = CompileEnvironment.current()
 
             # Find which dimension has stride==1
-            stride_one_dim = [*map(env.size_hint, fake_value.stride())].index(1)
+            layout_signature = env.tensor_descriptor_layout_signature(fake_value)
+            assert layout_signature is not None
+            stride_one_dim = layout_signature[0]
+            assert stride_one_dim is not None
 
             # Determine if we need permutation (stride==1 dimension is not last)
             permutation = None
@@ -593,6 +725,16 @@ class DeviceFunction:
                 block_size = [block_size[i] for i in permutation]
                 # Update block_size_expr for the permuted order
                 block_size_expr = ", ".join(map(self.literal_expr, block_size))
+
+            descriptor_dims = (
+                permutation if permutation is not None else [*range(fake_value.ndim)]
+            )
+            assert descriptor_dims[-1] == stride_one_dim
+            # The descriptor permutation above makes the last descriptor
+            # dimension the proven stride-one dimension. Triton checks this
+            # predicate at JIT time, so emit it as a literal even when other
+            # dynamic strides are runtime scalars.
+            stride_args[-1] = StaticShape(1)
 
             # Add tl.make_tensor_descriptor call to preamble
             sizes = ", ".join([arg.name for arg in size_args])
@@ -622,6 +764,10 @@ class DeviceFunction:
             )
             self.arguments.append(arg)
             self._expr_args[sym] = arg
+            # NKI: register Python-scalar kernel parameters so the
+            # NKIOpOverrides cast / binary-op paths can detect them and
+            # route to memset/tensor_scalar instead of tensor_tensor.
+            self._nki_scalar_arg_names.add(arg.name)
         return self._expr_args[sym]
 
     def constexpr_arg(self, name: str, value: object | None = None) -> bool:
@@ -653,26 +799,9 @@ class DeviceFunction:
         if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             value = value._sympy_()
 
-        # Handle sympy expressions (sanitize by replacing triton_helpers functions)
+        # Handle sympy expressions
         if isinstance(value, sympy.Expr):
-            # type: ignore [missing-attribute]
-            sanitized = value.replace(
-                lambda node: (
-                    isinstance(node, sympy.Function)
-                    and getattr(node.func, "__name__", "")
-                    == "triton_helpers.div_floor_integer"
-                ),
-                lambda node: sympy.floor(node.args[0] / node.args[1]),
-            ).replace(
-                lambda node: (
-                    isinstance(node, sympy.Function)
-                    and getattr(node.func, "__name__", "")
-                    == "triton_helpers.remainder_integer"
-                ),
-                lambda node: sympy.Mod(node.args[0], node.args[1]),
-            )
-            expr = cast("sympy.Expr", sanitized)
-            return HostFunction.current().sympy_expr(expr)
+            return HostFunction.current().sympy_expr(value)
 
         return HostFunction.current().literal_expr(value)
 
@@ -739,6 +868,7 @@ class DeviceFunction:
             )
 
         backend = CompileEnvironment.current().backend
+        self._register_nki_dynamic_tensor_size_args()
         sorted_arguments = self.sorted_args()
 
         # Separate constexpr args: inline those with known literal values at
@@ -756,10 +886,21 @@ class DeviceFunction:
         ]
 
         args = [arg.arg_def_node() for arg in param_args]
+        # Ordering invariant:
+        # [param_args, extra_params, rng_seed, scratch_args, wrapper_only_params].
+        # codegen_function_call must match this order — it builds positional args
+        # from param_args, extends with extra_params, then build_launcher_args
+        # appends rng_seed_buffer.
+        args.extend(create_arg(name) for name in self.codegen._extra_params)
         if self.has_rng_ops():
             # Add the seed buffer as a pointer parameter to kernel signature
             assert self.rng_seed_buffer_param_name is not None
             args.append(create_arg(self.rng_seed_buffer_param_name))
+
+        # Add scratch memory parameters (for emit_pipeline on Pallas/TPU)
+        for scratch_arg in self._scratch_args:
+            args.append(create_arg(scratch_arg.name))
+        args.extend(create_arg(name) for name in self.wrapper_only_params)
 
         # Generate inlined constexpr assignments at module level
         # (e.g., _BLOCK_SIZE_0 = tl.constexpr(256))
@@ -832,9 +973,11 @@ class DeviceFunction:
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()
         backend = env.backend
+        self._register_nki_dynamic_tensor_size_args()
 
         args: list[str] = []
         tensor_host_args: list[str] = []
+        arg_objects: list[Argument] = []
         for arg in self.sorted_args():
             # Skip constexpr args that are inlined at module level
             if isinstance(arg, ConstExprArg) and _is_literal_constexpr(arg):
@@ -847,17 +990,22 @@ class DeviceFunction:
                 tensor_host_args.append(host_arg)
             host_arg = backend.transform_host_arg(arg, host_arg, tensor_host_args)
             args.append(host_arg)
+            arg_objects.append(arg)
 
         pid = self.pid
         assert pid is not None
 
         call_grid_expr = pid.codegen_grid()
+        # Extra params are positional and must come before any keyword args that
+        # build_launcher_args appends (e.g. num_warps=, num_stages=).
+        args.extend(self.codegen._extra_params)
         call_args = backend.build_launcher_args(
             args,
             tensor_host_args=tensor_host_args,
             has_rng_ops=self.has_rng_ops(),
             config=self.config,
             has_barrier=env.has_barrier,
+            sorted_args=arg_objects,
         )
         bufs = getattr(self, "_nki_return_buffers", None)
         call_str = f"_launcher({self.name}, {{call_grid_expr}}, {', '.join(call_args)})"
@@ -892,8 +1040,65 @@ class DeviceFunction:
             call_str,
             call_grid_expr=call_grid_expr,
         )
+        # NKI captures the launcher's return buffer(s) back into the host output
+        # tensor(s), with the reshape/slice that maps the 2D SBUF layout back to
+        # the caller's logical shape. Populated by the NKI store codegen.
+        nki_bufs = getattr(self, "_nki_return_buffers", None)
+        if backend.name == "nki" and nki_bufs and len(nki_bufs) > 1:
+            result_var = "_nki_result"
+            call_statement = statement_from_string(
+                f"{result_var} = {launcher_call}",
+                call_grid_expr=call_grid_expr,
+            )
+            post_stmts: list[ast.stmt] = []
+            for i, info in enumerate(nki_bufs.values()):
+                host_var = info["host_var"]
+                reshape = info["host_reshape"]
+                if reshape is not None:
+                    post_stmts.append(
+                        statement_from_string(
+                            f"{host_var} = {result_var}[{i}].reshape({reshape})"
+                        )
+                    )
+                else:
+                    post_stmts.append(
+                        statement_from_string(f"{host_var} = {result_var}[{i}]")
+                    )
+            self._nki_post_call_stmts = post_stmts
+        elif backend.name == "nki" and (
+            (return_host_var := getattr(self, "_nki_return_host_var", None)) is not None
+        ):
+            return_host_reshape = getattr(self, "_nki_return_host_reshape", None)
+            return_host_slice = getattr(self, "_nki_return_host_slice", None)
+            if return_host_slice is not None:
+                # Padding was applied to the HBM buffer; clip with a slice.
+                call_str = f"{return_host_var} = {launcher_call}{return_host_slice}"
+            elif return_host_reshape is not None:
+                call_str = (
+                    f"{return_host_var} = {launcher_call}.reshape({return_host_reshape})"
+                )
+            else:
+                call_str = f"{return_host_var} = {launcher_call}"
+            call_statement = statement_from_string(
+                call_str,
+                call_grid_expr=call_grid_expr,
+            )
+        elif output_only_names:
+            if len(output_only_names) == 1:
+                assign_target = output_only_names[0]
+            else:
+                assign_target = ", ".join(output_only_names)
+            call_statement = statement_from_string(
+                f"{assign_target} = {launcher_call}",
+                call_grid_expr=call_grid_expr,
+            )
+        else:
+            call_statement = statement_from_string(
+                launcher_call,
+                call_grid_expr=call_grid_expr,
+            )
         assert isinstance(call_statement, ExtendedAST)
-        # Mark the kernel call we can find it in codegen_precompile_def
+        # Mark the kernel call so we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
         return call_statement
 
@@ -906,13 +1111,19 @@ class DeviceFunction:
             rw = ReadWrites.from_list([*self.preamble, *self.body])
             dead_assignment_elimination(self.body, self.dce_vars, 1, rw)
             dead_assignment_elimination(self.preamble, self.dce_vars, 1, rw)
+            dead_lane_loop_elimination(self.body)
+            dead_lane_loop_elimination(self.preamble)
+        rw = ReadWrites.from_list([*self.preamble, *self.body])
 
-        # drop any unused args
+        # Drop unused args, but keep placeholder_args (fusion-injected tensor
+        # pointers referenced only by placeholder strings, not the AST body).
+        # sourceless_prologue_params are intentionally NOT exempted — they are
+        # fully inlined by the prologue hook and should be removed by DCE.
         args_to_remove = {
             arg.name
             for arg in self.arguments
             # pyrefly: ignore [unbound-name]
-            if arg.name not in rw.reads
+            if arg.name not in rw.reads and arg.name not in self.placeholder_args
         }
         if args_to_remove:
             self.arguments = [
@@ -948,10 +1159,83 @@ class DeviceFunction:
         for var_name, expr in self.deferred_rdim_defs:
             expr_str = HostFunction.current().sympy_expr(expr)
             stmt = statement_from_string(
-                f"{var_name} = {backend.next_power_of_2_host_expr(expr_str)}"
+                f"{var_name} = {backend.dynamic_rdim_size_expr(expr_str)}"
             )
             codegen.host_statements.append(stmt)
         self.deferred_rdim_defs.clear()
+
+    def register_scratch(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype | None,
+        name_hint: str = "scratch",
+        scratch_type: str = "vmem",
+    ) -> str:
+        """Register a scratch memory buffer and return its variable name."""
+        if CompileEnvironment.current().backend_name != "pallas":
+            raise NotImplementedError(
+                "register_scratch is only supported by the Pallas backend"
+            )
+        name = self.new_var(name_hint)
+        self._scratch_args.append(ScratchArg(name, shape, dtype, scratch_type))
+        return name
+
+    def scratch_read_slice(self, name: str) -> str | None:
+        """Return the index expression for reading logical data from a padded scratch.
+
+        Returns None if no padding was applied.
+        """
+        return None
+
+    def register_dma_semaphore(self, name_hint: str = "sem") -> str:
+        """Register a DMA semaphore scratch buffer and return its variable name."""
+        return self.register_scratch(
+            (), None, name_hint=name_hint, scratch_type="dma_semaphore"
+        )
+
+    def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
+        """Returns AST names of read and written tensors"""
+        from helion.language import memory_ops
+        from helion.language import tile_index
+        from helion.language.atomic_ops import ATOMIC_OPS
+
+        read_names: set[str] = set()
+        write_names: set[str] = set()
+        for graph in self.codegen.codegen_graphs:
+            for node in graph.graph.nodes:
+                if node.op != "call_function":
+                    continue
+
+                def _get_tensor_name(node: torch.fx.Node) -> str | None:
+                    tensor_arg = node.args[0]
+                    assert isinstance(tensor_arg, torch.fx.Node)
+                    # tile.index loads operate on a synthesized FakeTensor
+                    # that is not registered in ``tensor_to_origin``; they
+                    # are materialized inline by the load codegen rather
+                    # than referencing a kernel-arg tensor.
+                    if (
+                        tensor_arg.op == "call_function"
+                        and tensor_arg.target == tile_index
+                    ):
+                        return None
+                    tensor_val = tensor_arg.meta.get("val")
+                    assert isinstance(tensor_val, torch.Tensor)
+                    return self.tensor_arg(tensor_val).name
+
+                if node.target is memory_ops.load:
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        read_names.add(name)
+                elif node.target is memory_ops.store:
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        write_names.add(name)
+                elif node.target in ATOMIC_OPS:
+                    name = _get_tensor_name(node)
+                    if name is not None:
+                        read_names.add(name)
+                        write_names.add(name)
+        return read_names, write_names
 
     def __enter__(self) -> None:
         try:
@@ -971,11 +1255,19 @@ class DeviceFunction:
 
 
 class HelionTritonPrinter(TritonPrinter):
-    """Custom Triton printer that avoids wrapping float literals in tl.full().
+    """Custom Triton printer that does the following:
 
-    Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
-    via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
-    literal, letting downstream type promotion and casts handle dtype.
+    - Avoids wrapping float literals in tl.full().
+     Inductor's default TritonPrinter prints SymPy Float as a 0-D Triton value
+     via tl.full([], <val>, tl.float64). We override this to emit the raw numeric
+     literal, letting downstream type promotion and casts handle dtype.
+
+    - Avoids triton_helpers.div_floor_integer(...) calls when both operands are
+      provably non-negative integers. TritonPrinter by default converts
+      floor(u1/2) to triton_helpers.div_floor_integer(...). We override this to
+      emit u1 // 2 only when the numerator is known to be non-negative and the
+      denominator is a positive integer, so that we keep helper calls for cases
+      that rely on floor semantics with mixed signs.
     """
 
     def _print_Float(self, expr: sympy.Expr) -> str:
@@ -986,6 +1278,109 @@ class HelionTritonPrinter(TritonPrinter):
         # pyrefly: ignore [missing-attribute]
         return f"{self._print(expr.args[0])} + 0.0"
 
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # Only use // operator when:
+        # 1. RHS is an integer constant
+        # 2. LHS is a constexpr argument (autotune parameter like block size)
+        # This ensures TMA descriptors get compile-time constants while preserving
+        if (
+            isinstance(rhs, sympy.Integer)
+            and getattr(lhs, "name", None) in DeviceFunction.current()._constexpr_args
+        ):
+            # pyrefly: ignore [missing-attribute]
+            lhs_str = self._print(lhs)
+            # pyrefly: ignore [missing-attribute]
+            rhs_str = self._print(rhs)
+            if not (lhs.is_Integer or lhs.is_Symbol):
+                lhs_str = f"({lhs_str})"
+            return f"{lhs_str} // {rhs_str}"
+        return super()._print_FloorDiv(expr)
+
 
 def texpr(expr: sympy.Expr) -> str:
     return HelionTritonPrinter().doprint(expr)
+
+
+class HelionNKIPrinter(HelionTritonPrinter):
+    """Python-only expression printer for the NKI backend.
+
+    TritonPrinter emits ``triton_helpers.div_floor_integer`` and
+    ``triton_helpers.remainder_integer`` for FloorDiv / Mod on runtime
+    integer expressions, both of which are unresolvable inside a
+    @nki.jit kernel. We override to emit plain ``(a) // (b)`` and
+    ``(a) % (b)`` which evaluate the same way on host-Python integers
+    and are accepted by the NKI parser.
+    """
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        x, y = expr.args
+        return f"({self._print(x)} // {self._print(y)})"
+
+    def _print_Mod(self, expr: sympy.Expr) -> str:
+        x, y = expr.args
+        return f"({self._print(x)} % {self._print(y)})"
+
+    # sympy.floor(a / b) over int-valued args maps to a floordiv too.
+    def _print_floor(self, expr: sympy.Expr) -> str:
+        (arg,) = expr.args
+        if arg.is_Rational or (
+            isinstance(arg, sympy.Mul)
+            and len(arg.args) == 2
+            and arg.args[1].is_Pow
+        ):
+            # a / b style — fall through to default, which may still
+            # produce a helper. We keep this guard conservative.
+            pass
+        return super()._print_floor(expr)  # type: ignore[misc]
+
+
+def nki_texpr(expr: sympy.Expr) -> str:
+    return HelionNKIPrinter().doprint(expr)
+
+
+class HelionCutePrinter(HelionTritonPrinter):
+    """CuTe printer that avoids Triton runtime helpers in device expressions."""
+
+    def _print_basic_expr(self, expr: sympy.Basic) -> str:
+        return self.doprint(cast("sympy.Expr", expr))
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
+
+    def _print_CleanDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        return f"({self._print_basic_expr(lhs)} // {self._print_basic_expr(rhs)})"
+
+    def _print_CeilDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        lhs_printed = self._print_basic_expr(lhs)
+        rhs_printed = self._print_basic_expr(rhs)
+        return f"(({lhs_printed} + {rhs_printed} - 1) // {rhs_printed})"
+
+    def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        return f"({self._print_basic_expr(lhs)} % {self._print_basic_expr(rhs)})"
+
+
+def cute_texpr(expr: sympy.Expr) -> str:
+    return HelionCutePrinter().doprint(expr)
+
+
+class HelionPallasPrinter(HelionTritonPrinter):
+    """Pallas printer that emits plain Python operators instead of Triton runtime helpers."""
+
+    def _print_FloorDiv(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # pyrefly: ignore [missing-attribute]
+        return f"({self._print(lhs)} // {self._print(rhs)})"
+
+    def _print_PythonMod(self, expr: sympy.Expr) -> str:
+        lhs, rhs = expr.args
+        # pyrefly: ignore [missing-attribute]
+        return f"({self._print(lhs)} % {self._print(rhs)})"
+
+
+def pallas_texpr(expr: sympy.Expr) -> str:
+    return HelionPallasPrinter().doprint(expr)
